@@ -1,0 +1,167 @@
+# ======================================================================
+# Cyber range definition — multi-student edition
+# Run: python generator/generate.py generator/range.example.yaml
+# Outputs: envs/azure/terraform.tfvars.json (and envs/aws/... when AWS stub is filled)
+# ======================================================================
+
+range_name: ctf-redteam-01
+provider: azure          # azure | aws | both   (AWS module currently a stub)
+azure_region: eastus
+region: us-east-1        # used when provider includes aws
+
+# ----------------------------------------------------------------------
+# Multi-tenant student model.
+# tenancy=shared:  ONE hub (Guacamole+ELK) serves every student. Each
+#   student gets their own VNet, RG, DC, target VMs, attacker boxes, C2.
+#   Guacamole has a connection-group per student and a per-student
+#   user that only sees their own group.
+# tenancy=isolated: each student is a fully separate stack with its own
+#   Guacamole+ELK. Way more cost. Useful for grading where you don't want
+#   any shared component.
+# ----------------------------------------------------------------------
+students:
+  count: 20
+  tenancy: shared
+  name_format: "s{n:02d}"  # produces s01..s20
+
+# ----------------------------------------------------------------------
+# Lockdown toggle.
+# false  -> NAT egress enabled in target/attacker subnets (build-time)
+# true   -> NAT route removed; ZERO internet for targets/attacker
+# Deploy with false, wait ~15 min for cloud-init/CSE to finish, then
+# `terraform apply -var=lockdown=true`.
+# ----------------------------------------------------------------------
+lockdown: false
+
+# Allowed source CIDRs that can reach the public Guacamole web UI.
+guacamole_ingress_cidrs:
+  - 0.0.0.0/0
+
+# Active Directory. When students.count > 1, each student gets their own
+# DC inside their own VNet — same FQDN is fine because the VNets don't
+# route to each other.
+domain:
+  enabled: true
+  fqdn: corp.local
+  netbios: CORP
+  admin_user: rangeadmin
+  admin_password: "P@ssw0rd!RangeAdmin1"
+  safemode_password: "P@ssw0rd!SafeMode1"
+
+default_credentials:
+  windows_local_admin: rangeadmin
+  windows_local_password: "P@ssw0rd!Local1"
+  linux_user: ranger
+  linux_password: "P@ssw0rd!Linux1"
+
+# ----------------------------------------------------------------------
+# Machine template. Every student gets one of each entry, prefixed with
+# their student id. Up to 100 machines per student.
+#
+# Roles:
+#   windows-dc            domain controller (auto-promotes; one allowed)
+#   windows-member        domain-joinable Windows Server
+#   windows-workstation   Windows 10/11 client
+#   linux-target          Linux practice target
+#   attacker              operator workstation (Kali default)
+#   c2-server             Adaptix teamserver (auto-install, SSH-key access)
+#   c2-redirector         nginx redirector fronting the c2-server
+# ----------------------------------------------------------------------
+machines:
+  # ----- target estate -----
+  - { name: dc01,    role: windows-dc,          os: windows-server-2022, size: medium, static_ip: "10" }
+  - { name: srv01,   role: windows-member,      os: windows-server-2019, size: small,  domain_join: true }
+  - { name: srv02,   role: windows-member,      os: windows-server-2025, size: small,  domain_join: true }
+  - { name: ws01,    role: windows-workstation, os: windows-11,          size: small,  domain_join: true }
+  - { name: ws02,    role: windows-workstation, os: windows-10,          size: small,  domain_join: true }
+  - { name: linux01, role: linux-target,        os: ubuntu-22,           size: small }
+  - { name: linux02, role: linux-target,        os: debian-12,           size: small }
+
+  # Themed/persona example: a linux-target with `persona: <name>` runs
+  # the script at personas/<name>.sh during cloud-init and auto-cleans
+  # build artefacts afterward. Only valid for role=linux-target.
+  # - { name: starky, role: linux-target, os: debian-12, size: medium, persona: starky }
+
+  # ----- attacker side (2-5 typical) -----
+  - { name: kali01,  role: attacker,            os: kali,                size: medium }
+  - { name: c2,      role: c2-server,           os: debian-12,           size: medium }
+  - { name: redir,   role: c2-redirector,       os: debian-12,           size: small }
+
+# static_ip rules:
+#   single-student mode (students.count == 1):
+#     full IPv4 in the targets/attacker subnet, e.g. "10.50.20.10"
+#   multi-student mode (students.count > 1):
+#     last octet only as a string, e.g. "10". The generator places the
+#     machine at 10.<N>.0.<octet> for student N.
+#   omit -> DHCP
+
+services:
+  guacamole:
+    enabled: true
+    admin_user: guacadmin
+    admin_password: "ChangeMe!Guac1"
+    autoregister: true
+    student_user_prefix: student-
+    student_password_template: "Student!{n:02d}"   # student-s01 -> Student!01
+
+  elk:
+    enabled: true
+    kibana_user: elastic
+    kibana_password: "ChangeMe!Elk1"
+    deploy_agents: true
+
+  adaptix:
+    # Install script for any machine with role=c2-server. Teamserver
+    # listens on the uniform :9000 commander port (Kali-only via NSG)
+    # and :8443–:8447 per-CDN HTTPS listener ports (redirector-only).
+    # Per-student operator passwords are random; see `student_credentials`
+    # output after apply.
+    enabled: true
+    ssh_pubkey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEXAMPLEEXAMPLEEXAMPLEEXAMPLE operator@range"
+
+  redirector:
+    # Install script for any machine with role=c2-redirector. nginx on :443
+    # validates the per-CDN X-Api-<Random>: <UUID> header (5 CDNs:
+    # azure / cloudfront / workers / fastly / other) and routes to
+    # 8443–8447 on the matching teamserver.
+    enabled: true
+
+# ----------------------------------------------------------------------
+# Shared red-team infrastructure (deployed ONCE in the hub, not per
+# student). Use this for tooling the whole class shares.
+#
+# Allowed roles:
+#   ghostwriter      GhostManager/Ghostwriter (engagement + reporting)
+#   stepping-stones  nccgroup/SteppingStones (operator activity tracker)
+#   redelk           outflanknl/RedELK (red-team SIEM)
+#
+# Each box is registered in Guacamole as an SSH connection for shell
+# access, and gets a public IP gated by guacamole_ingress_cidrs for
+# the web UI.
+# ----------------------------------------------------------------------
+shared_infrastructure:
+  - { name: ghostwriter,     role: ghostwriter,     os: debian-12, size: medium }
+  - { name: stepping-stones, role: stepping-stones, os: debian-12, size: medium }
+  - { name: redelk,          role: redelk,          os: debian-12, size: large  }
+
+# ----------------------------------------------------------------------
+# Advanced C2 setup. When enabled, each student's c2-redirector is
+# fronted by Azure Front Door, using subdomains of the configured domain.
+#
+# Architecture (per student):
+#   Internet -> AFD (s<NN>.enterprisestudio.com) -> redirector -> c2-server
+#
+# Requirements:
+#   - The DNS zone for `domain` already exists in Azure DNS in
+#     `dns_zone_resource_group` (or set to "" to skip DNS automation
+#     and configure CNAMEs manually).
+#   - DNS validation TXT records and CNAMEs are created automatically
+#     when the zone is in Azure DNS.
+# ----------------------------------------------------------------------
+advanced_c2:
+  enabled: false
+  domain: enterprisestudio.com
+  dns_zone_resource_group: ""           # set to the RG holding the DNS zone
+  cover_url: "https://www.microsoft.com" # redirector returns 302 here for non-C2 paths
+  fdid_header_required: true             # nginx rejects requests without matching X-Azure-FDID
+  student_subdomain_format: "{sid}"      # s01.enterprisestudio.com, s02.enterprisestudio.com, ...

@@ -1,0 +1,22 @@
+{
+    "admin_list": {
+        "admin": "password"
+    },
+    "user_list": {
+        "ratel": "ratel"
+    },
+    "validate_useragent": true,
+    "file_upload_chunk": 4194304,
+    "c2_handler": "0.0.0.0:8443",
+    "comm_enc_key": "test@123",
+    "credentials": [
+        {
+            "creddomain": "darkvortex.corp",
+            "crednote": "Domain Admin Password",
+            "credpass": "admin@123",
+            "creduser": "administrator"
+        }
+    ],
+    "ssl_cert": "cert.pem",
+    "ssl_key": "key.pem"
+}

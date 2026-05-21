@@ -1,0 +1,24 @@
+---
+galaxy_info:
+  role_name: adaptix_payload
+  author: terra-range
+  description: >-
+    Authenticate to an AdaptixC2 teamserver, build agent payloads via
+    the REST API for every registered listener, and save them to
+    ~/Desktop/payloads/adaptix on the target Kali host. Designed to run
+    as the LAST play in modules/azure/ansible/playbook.yml — depends on
+    the adaptix and kali roles having completed.
+  license: MIT
+  min_ansible_version: "2.14"
+  platforms:
+    - name: Debian
+      versions:
+        - all
+  galaxy_tags:
+    - security
+    - redteam
+    - adaptix
+    - c2
+    - kali
+
+dependencies: []

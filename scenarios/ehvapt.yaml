@@ -1,0 +1,69 @@
+# Scenario: ehvapt
+# Purpose: eHVAPT exam-style range. 2 Windows + 3 Linux per candidate +
+#          a Kali attacker box. Mixed-OS network where the candidate
+#          has to chain compromises across Linux and Windows to reach
+#          Domain Admin.
+# Cost   : ~$1.5-2k/mo for 20 candidates
+# Boxes  : 6 per candidate × students.count
+#
+# No ELK, no shared red-team infra, no advanced C2 — exam candidates
+# bring their own tooling from Kali.
+
+range_name: ehvapt-2026
+provider: azure
+azure_region: eastus
+
+students:
+  count: 20
+  tenancy: shared
+  name_format: "ex{n:02d}"          # ex01..ex20
+
+lockdown: false
+guacamole_ingress_cidrs:
+  - "203.0.113.0/24"                # exam proctoring source
+
+domain:
+  enabled: true
+  fqdn: corp.local
+  netbios: CORP
+  admin_user: rangeadmin
+  admin_password: "Exam!RangeAdmin1"
+  safemode_password: "Exam!SafeMode1"
+
+default_credentials:
+  windows_local_admin: rangeadmin
+  windows_local_password: "Exam!Local1"
+  linux_user: examiner
+  linux_password: "Exam!Linux1"
+
+machines:
+  # ---- Windows (2) ----
+  - { name: dc01,    role: windows-dc,     os: windows-server-2022, size: medium, static_ip: "10" }
+  - { name: srv01,   role: windows-member, os: windows-server-2019, size: small,  domain_join: true }
+
+  # ---- Linux (3) ----
+  - { name: web01,   role: linux-target,   os: ubuntu-22,           size: small }   # web app entry point
+  - { name: app01,   role: linux-target,   os: debian-12,           size: small }   # internal service
+  - { name: db01,    role: linux-target,   os: ubuntu-22,           size: small }   # DB / pivot box
+
+  # ---- Attacker ----
+  - { name: kali01,  role: attacker,       os: kali,                size: medium }
+
+services:
+  guacamole:
+    enabled: true
+    admin_user: guacadmin
+    admin_password: "Exam!Guac1"
+    autoregister: true
+    student_user_prefix: candidate-
+    student_password_template: "Cand!{n:02d}!Exam"
+  elk:
+    enabled: false                  # no SOC tooling in candidate view
+    kibana_user: elastic
+    kibana_password: "unused"
+    deploy_agents: false
+  adaptix:
+    enabled: false                  # candidates bring their own
+    ssh_pubkey: ""
+  redirector:
+    enabled: false

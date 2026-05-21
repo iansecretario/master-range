@@ -1,0 +1,22 @@
+---
+galaxy_info:
+  role_name: brc4_payload
+  author: terra-range
+  description: >-
+    STUB role for Brute Ratel C4 payloads. Documents the manual
+    Windows-GUI procedure into ~/Desktop/payloads/brc4/README.txt.
+    Has no build logic because BRC4 has no headless build API.
+  license: MIT
+  min_ansible_version: "2.14"
+  platforms:
+    - name: Debian
+      versions:
+        - all
+  galaxy_tags:
+    - security
+    - redteam
+    - brc4
+    - c2
+    - kali
+
+dependencies: []

@@ -1,0 +1,120 @@
+# Purpose: Integration / end-to-end test scenario. Spins up the full
+#          operator stack (Adaptix + Mythic + BRC4, each per-student
+#          with its own AFD-fronted redirector, plus RedELK +
+#          Ghostwriter + SteppingStones + ELK + Guacamole) alongside a
+#          small AD lab with mixed-OS Linux for testing realm join,
+#          network reachability, and tooling-against-tooling validation.
+# Cost   : ~$1.7k/mo running 24/7 — tear down between tests
+# Boxes  : 13 student VMs + 3 shared infra
+# Note   : BRC4 is license-gated; ./range apply will prompt for
+#          License ID + Activation Key + Email + Blob SAS URL.
+#          Press Enter to skip BRC4 install and deploy the rest.
+#          BRC4 license caps the range at one teamserver — students.count
+#          MUST be 1 in any scenario that includes c2-brc4.
+#
+# Single student because this is a debug/test scenario. Operator gets
+# everything visible in Guacamole for verification.
+#
+# Prereqs (advanced C2 with AFD):
+#   - Azure DNS zone for `enterprisestudio.com` exists in RG `dns-rg`
+#     (or change `dns_zone_resource_group` to your RG name)
+#   - Marketplace terms accepted: kali, win10, win11
+
+range_name: integration
+provider: azure
+azure_region: eastus
+
+students:
+  count: 1
+  tenancy: shared
+  name_format: "test"
+
+lockdown: false
+guacamole_ingress_cidrs:
+  - "0.0.0.0/0"   # restrict to your operator IP before deploy
+
+domain:
+  enabled: true
+  fqdn: corp-test.local         # override at runtime: ./range apply integration --domain my.lab
+  netbios: CORP
+  admin_user: rangeadmin
+  admin_password: "Integration!Admin1"   # placeholder — random per-student value used at deploy
+  safemode_password: "Integration!SafeMode1"
+
+default_credentials:
+  windows_local_admin: rangeadmin
+  windows_local_password: "Integration!Local1"
+  linux_user: ranger
+  linux_password: "Integration!Linux1"
+
+machines:
+  # ---- Small AD lab ----
+  - { name: dc01,         role: windows-dc,          os: windows-server-2022, size: medium, static_ip: "10.1.0.10" }
+  - { name: srv01,        role: windows-member,      os: windows-server-2019, size: small,  domain_join: true }
+  - { name: ws01,         role: windows-workstation, os: windows-11,          size: small,  domain_join: true }
+
+  # ---- Mixed-OS Linux for testing ----
+  # linux-joined: Ubuntu 22.04, realm-joined to corp-test.local via the
+  # realm-joined persona. Tests Linux-side AD authentication + Kerberos.
+  - { name: linux-joined, role: linux-target,        os: ubuntu-22,           size: small, persona: realm-joined }
+  # linux-ubuntu: Ubuntu 24.04 (latest LTS), network-accessible, not joined.
+  - { name: linux-ubuntu, role: linux-target,        os: ubuntu-24,           size: small }
+  # linux-debian: Debian 12, network-accessible, not joined.
+  - { name: linux-debian, role: linux-target,        os: debian-12,           size: small }
+
+  # ---- Operator-side red-team infrastructure ----
+  - { name: kali,         role: attacker,            os: kali,                size: medium }
+
+  # Adaptix teamserver + its AFD-fronted redirector (subdomain auto-picked
+  # from curated pool; operator can override via callsign:)
+  - { name: adaptix,        role: c2-server,         os: debian-12,           size: medium }
+  - { name: adaptix-redir,  role: c2-redirector,     os: debian-12,           size: small,  fronts: c2-server }
+
+  # Mythic teamserver + its AFD-fronted redirector
+  - { name: mythic,         role: c2-mythic,         os: debian-12,           size: medium }
+  - { name: mythic-redir,   role: c2-redirector,     os: debian-12,           size: small,  fronts: c2-mythic }
+
+  # BRC4 teamserver + its AFD-fronted redirector. License gates this VM —
+  # ./range apply prompts for credentials; empty input skips it cleanly.
+  - { name: brc4,           role: c2-brc4,           os: debian-12,           size: medium }
+  - { name: brc4-redir,     role: c2-redirector,     os: debian-12,           size: small,  fronts: c2-brc4 }
+
+# ---- Shared red-team infra (deployed once at hub level) ----
+shared_infrastructure:
+  - { name: ghostwriter,     role: ghostwriter,     os: debian-12, size: medium }
+  - { name: stepping-stones, role: stepping-stones, os: debian-12, size: medium }
+  - { name: redelk,          role: redelk,          os: debian-12, size: large  }
+
+# Both redirectors go behind one Front Door profile with subdomains
+# from the curated pool. After apply:
+#   terraform output -json advanced_c2
+# shows which subdomain is bound to which redirector.
+advanced_c2:
+  enabled: true
+  domain: enterprisestudio.com
+  dns_zone_resource_group: dns-rg
+  cover_url: "https://www.microsoft.com"
+  fdid_header_required: true
+  # endpoint_name and profile_name auto-pick from the curated pool with
+  # numeric suffix for global uniqueness. Set explicit values to override.
+  endpoint_name: ""
+  profile_name: ""
+
+services:
+  guacamole:
+    enabled: true
+    admin_user: guacadmin
+    admin_password: "Integration!Guac1"
+    autoregister: true
+    student_user_prefix: tester-
+    student_password_template: "Tester!{n:02d}"
+  elk:
+    enabled: true
+    kibana_user: elastic
+    kibana_password: "Integration!Elastic1"
+    deploy_agents: true
+  adaptix:
+    enabled: true
+    ssh_pubkey: "ssh-ed25519 AAAA... operator@you"
+  redirector:
+    enabled: true

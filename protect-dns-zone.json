@@ -1,0 +1,23 @@
+{
+  "if": {
+    "allOf": [
+      {
+        "field": "type",
+        "equals": "Microsoft.Network/dnsZones"
+      },
+      {
+        "field": "name",
+        "equals": "cyberwarrange.com"
+      }
+    ]
+  },
+  "then": {
+    "effect": "denyAction",
+    "details": {
+      "actionNames": ["delete"],
+      "cascadeBehaviors": {
+        "resourceGroup": "deny"
+      }
+    }
+  }
+}

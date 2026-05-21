@@ -1,0 +1,58 @@
+# Scenario: smoke
+# Purpose: smallest possible end-to-end test of the pipeline.
+#          One student, one of each role. Use this for the FIRST apply
+#          before scaling up.
+# Cost   : ~$30/day while running
+# Boxes  : 7
+
+range_name: smoke-01
+provider: azure
+azure_region: eastus
+
+students:
+  count: 1
+  tenancy: shared
+  name_format: ""
+
+lockdown: false
+guacamole_ingress_cidrs: ["YOUR.OFFICE.IP/32"]   # ← restrict before deploy
+
+domain:
+  enabled: true
+  fqdn: corp.local
+  netbios: CORP
+  admin_user: rangeadmin
+  admin_password: "P@ssw0rd!RangeAdmin1"
+  safemode_password: "P@ssw0rd!SafeMode1"
+
+default_credentials:
+  windows_local_admin: rangeadmin
+  windows_local_password: "P@ssw0rd!Local1"
+  linux_user: ranger
+  linux_password: "P@ssw0rd!Linux1"
+
+machines:
+  - { name: dc01,    role: windows-dc,          os: windows-server-2022, size: medium, static_ip: "10.50.0.10" }
+  - { name: srv01,   role: windows-member,      os: windows-server-2019, size: small,  domain_join: true }
+  - { name: ws01,    role: windows-workstation, os: windows-11,          size: small,  domain_join: true }
+  - { name: linux01, role: linux-target,        os: ubuntu-22,           size: small }
+  - { name: kali01,  role: attacker,            os: kali,                size: medium }
+  - { name: c2,      role: c2-server,           os: debian-12,           size: medium, static_ip: "10.50.1.5" }
+  - { name: redir,   role: c2-redirector, fronts: c2-server,       os: debian-12,           size: small,  static_ip: "10.50.1.6" }
+
+services:
+  guacamole:
+    enabled: true
+    admin_user: guacadmin
+    admin_password: "ChangeMe!Guac1"
+    autoregister: true
+  elk:
+    enabled: true
+    kibana_user: elastic
+    kibana_password: "ChangeMe!Elk1AbCd"
+    deploy_agents: true
+  adaptix:
+    enabled: true
+    ssh_pubkey: "ssh-ed25519 AAAA... operator@you"
+  redirector:
+    enabled: true

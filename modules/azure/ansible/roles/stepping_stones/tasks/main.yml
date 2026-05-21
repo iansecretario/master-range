@@ -1,0 +1,128 @@
+---
+# =============================================================================
+# Stepping Stones — verify the cloud-init-deployed Django app is healthy.
+# =============================================================================
+# Stepping Stones is deployed by `modules/azure/userdata/stepping-stones.sh`
+# at first boot using the cyberveiligheid fork:
+#   - git clone /opt/stepping-stones
+#   - python3 -m venv /opt/stepping-stones/.venv
+#   - pip install -r requirements.txt
+#   - manage.py migrate + createsuperuser
+#   - install /opt/stepping-stones/systemd/steppingstones.service →
+#     /etc/systemd/system/stepping-stones.service
+#   - nginx reverse proxy on :80 → gunicorn on :8000
+#
+# This role is the IDEMPOTENT REPAIR LAYER on top of that:
+#   - Verify the systemd unit is loaded + active; restart if not.
+#   - Probe gunicorn on :8000 and nginx on :80.
+#   - Report URL + admin login so the operator can hit it.
+#
+# We deliberately do NOT re-clone / re-pip-install / re-migrate. Those
+# are deploy-once operations owned by cloud-init. A repair pass should
+# converge a healthy box quickly (~5 seconds), not re-do bootstrap work
+# every time. If the userdata path failed entirely, `./range repair`
+# isn't the right tool — operator needs to inspect cloud-init logs or
+# re-create the VM.
+
+- name: Probe Stepping Stones systemd unit
+  ansible.builtin.systemd:
+    name: stepping-stones.service
+  register: ss_unit_state
+  become: true
+  tags: [stepping_stones, ss_health]
+
+- name: Decide whether unit needs (re)starting
+  ansible.builtin.set_fact:
+    ss_needs_restart: >-
+      {{
+        ss_unit_state.status is not defined
+        or ss_unit_state.status.ActiveState | default('') != 'active'
+        or ss_unit_state.status.SubState   | default('') != 'running'
+      }}
+  tags: [stepping_stones, ss_health]
+
+- name: Report current unit state
+  ansible.builtin.debug:
+    msg:
+      - "ActiveState : {{ ss_unit_state.status.ActiveState | default('unknown') }}"
+      - "SubState    : {{ ss_unit_state.status.SubState    | default('unknown') }}"
+      - "needs_restart : {{ ss_needs_restart }}"
+  tags: [stepping_stones, ss_health]
+
+# If the unit is dead OR not enabled, fix both at once. Enable is
+# safe-to-repeat; start with daemon-reload covers the case where the
+# unit file on disk drifted from systemd's loaded copy.
+- name: Ensure stepping-stones.service is enabled + active (restart if not)
+  ansible.builtin.systemd:
+    name: stepping-stones.service
+    enabled: true
+    state: started
+    daemon_reload: true
+  become: true
+  when: ss_needs_restart
+  register: ss_restart
+  tags: [stepping_stones, ss_health]
+
+# nginx may not be running on a freshly-bounced box even if the
+# stepping-stones unit IS — separate concern, separate check.
+- name: Ensure nginx is enabled + active
+  ansible.builtin.systemd:
+    name: nginx
+    enabled: true
+    state: started
+  become: true
+  failed_when: false
+  tags: [stepping_stones, ss_health]
+
+- name: Wait for gunicorn on :{{ stepping_stones_listen_port }} to respond
+  ansible.builtin.wait_for:
+    host: 127.0.0.1
+    port: "{{ stepping_stones_listen_port }}"
+    timeout: 60
+  become: true
+  tags: [stepping_stones, ss_health]
+
+- name: Wait for nginx on :80 to respond
+  ansible.builtin.wait_for:
+    host: 127.0.0.1
+    port: 80
+    timeout: 60
+  become: true
+  failed_when: false
+  tags: [stepping_stones, ss_health]
+
+- name: HTTP probe gunicorn (expect 200 / 302)
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ stepping_stones_listen_port }}/"
+    status_code: [200, 301, 302, 401, 403]
+    timeout: 10
+  register: ss_http_probe
+  failed_when: false
+  tags: [stepping_stones, ss_health]
+
+# Sentinel — `.deployed` is whatever cloud-init left at deploy time.
+# We re-touch on each successful run so the file's mtime tracks the
+# last successful repair (useful for "when did this last get checked?"
+# from outside).
+- name: Touch /opt/stepping-stones/.deployed sentinel (last-checked timestamp)
+  ansible.builtin.file:
+    path: /opt/stepping-stones/.deployed
+    state: touch
+    owner: root
+    group: root
+    mode: "0644"
+  become: true
+  changed_when: false
+  tags: [stepping_stones, ss_health]
+
+- name: Report — Stepping Stones access info
+  ansible.builtin.debug:
+    msg:
+      - "---- Stepping Stones ----"
+      - "URL (via nginx)        : http://{{ terra_private_ip | default('<host>') }}/"
+      - "URL (via gunicorn)     : http://{{ terra_private_ip | default('<host>') }}:{{ stepping_stones_listen_port }}/"
+      - "Admin user             : {{ stepping_stones_admin_user }}"
+      - "Admin password         : (set at first-boot by userdata — see /opt/stepping-stones/.admin-password if cloud-init wrote it)"
+      - "Service                : systemctl status stepping-stones"
+      - "Probe                  : HTTP {{ ss_http_probe.status | default('n/a') }} from gunicorn"
+  tags: [stepping_stones, ss_health]

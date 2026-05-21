@@ -1,0 +1,168 @@
+# Scenario: goad
+# Purpose: Game of Active Directory — three-domain forest playground
+# Cost   : ~$300/student/mo for 5 Windows + 1 Kali on B-series
+# Mirrors: Ludus "Game of Active Directory (GOAD)" guide.
+#          Upstream: https://github.com/Orange-Cyberdefense/GOAD
+#
+# Topology (per student):
+#
+#   sevenkingdoms.local  ◄──parent-child trust──►  north.sevenkingdoms.local
+#         (kingslanding DC)                              (winterfell DC)
+#                                                              ▲
+#                                                       member: castelblack
+#                                                              ▲
+#                                                              │
+#               cross-forest trust  ◄────────►  essos.local (meereen DC)
+#
+# We stand up the **topology** in Azure with our generator (5 Windows
+# VMs + 1 Kali, named to match the GOAD hostnames). We then run the
+# upstream Orange-Cyberdefense/GOAD ansible playbook against the
+# resulting VMs via:
+#
+#   ./scripts/goad-ansible-bridge.sh
+#
+# That script reads `terraform output`, builds a GOAD-compatible
+# inventory + globals.yml, and runs `ansible-playbook` for you.
+#
+# ----------------------------------------------------------------------
+# Customisation
+# ----------------------------------------------------------------------
+# Override the goad: block to rename ANY identifier — domain FQDN,
+# DC/member hostname, domain admin, the entire user roster, the
+# service-account roster. The scenario YAML is the single source of
+# truth: the bridge script generates a custom globals.yml from it so
+# the upstream playbook deploys YOUR identities, not Orange-Cyberdefense's.
+
+range_name: goad-lab
+provider: azure
+azure_region: eastus
+
+students:
+  count: 5
+  tenancy: shared
+  name_format: "g{n:02d}"
+
+lockdown: false                  # GOAD setup needs internet — leave open till done
+guacamole_ingress_cidrs:
+  - "203.0.113.0/24"
+
+# Wrapper's domain handling is OFF — the upstream GOAD playbook owns
+# all AD setup. The fields below are placeholders so the variable type
+# stays populated; they're not actually used while domain.enabled=false.
+domain:
+  enabled: false
+  fqdn: placeholder.local
+  netbios: PLACEHOLDER
+  admin_user: rangeadmin
+  admin_password: "Placeholder!Pw1"
+  safemode_password: "Placeholder!Safe1"
+
+default_credentials:
+  windows_local_admin: rangeadmin
+  windows_local_password: "G04D!Local1"
+  linux_user: ranger
+  linux_password: "G04D!Linux1"
+
+# ----------------------------------------------------------------------
+# GOAD configuration. EVERY field below can be customised. The bridge
+# script renders these into globals.yml + group_vars/all.yml for the
+# upstream playbook.
+# ----------------------------------------------------------------------
+goad:
+  enabled: true
+
+  # Domain identities — change these to make the lab match a client
+  # narrative (e.g. "fabrikam.corp" / "ny.fabrikam.corp" / "eu.fabrikam.corp").
+  root_domain:            sevenkingdoms.local
+  child_domain:           north.sevenkingdoms.local
+  separate_forest_domain: essos.local
+
+  # NetBIOS-safe hostnames (≤15 chars). Match these to the names: in the
+  # machines: list below — the validator checks alignment.
+  root_dc_name:     kingslanding
+  child_dc_name:    winterfell
+  separate_dc_name: meereen
+  member_name:      castelblack
+
+  # Domain Admin per domain.
+  root_admin_user:         robb.stark
+  root_admin_password:     "Sevenkingdoms2024!"
+  child_admin_user:        eddard.stark
+  child_admin_password:    "Winterfell2024!"
+  separate_admin_user:     daenerys.targaryen
+  separate_admin_password: "Targaryen2024!"
+
+  # User roster. Each entry creates a regular AD user in the target domain.
+  # Override entirely to rename everyone for a custom client narrative.
+  users:
+    # sevenkingdoms.local
+    - { name: brandon.stark,    password: iseedeadpeople,     domain: root,     groups: [Domain Users] }
+    - { name: rickon.stark,     password: WinterfellLittle1,  domain: root,     groups: [Domain Users] }
+    - { name: hodor,            password: hodor,              domain: root,     groups: [Domain Users] }
+    - { name: jeor.mormont,     password: _L0rdC0mander_,     domain: root,     groups: [Domain Users] }
+    - { name: sansa.stark,      password: "Sansa2024!",       domain: root,     groups: [Domain Users] }
+    # north.sevenkingdoms.local
+    - { name: arya.stark,       password: "Needle1!",         domain: child,    groups: [Domain Users] }
+    - { name: jon.snow,         password: iknownothing,       domain: child,    groups: [Domain Users] }
+    - { name: samwell.tarly,    password: Heartsbane,         domain: child,    groups: [Domain Users] }
+    - { name: sql_svc,          password: "Tyene2024!",       domain: child,    groups: [Domain Users] }
+    # essos.local
+    - { name: khal.drogo,       password: horse,              domain: separate, groups: [Domain Users] }
+    - { name: viserys.targaryen, password: "_Begg@r_",         domain: separate, groups: [Domain Users] }
+    - { name: jorah.mormont,    password: _L0rdC0mander_,     domain: separate, groups: [Domain Users] }
+
+  # Service accounts driving the Kerberoast / ASREPRoast paths.
+  service_accounts:
+    - { name: sqlservice,       password: "Sword123!",         domain: root,
+        kerberoastable: true,   asreproastable: false,
+        spn: "MSSQLSvc/kingslanding.sevenkingdoms.local:1433" }
+    - { name: jaime.lannister,  password: "GoldenHand2024!",   domain: root,
+        kerberoastable: false,  asreproastable: true,  spn: "" }
+    - { name: vagrant,          password: vagrant,             domain: root,
+        kerberoastable: true,   asreproastable: true,
+        spn: "HTTP/kingslanding.sevenkingdoms.local" }
+
+  # Optional services + vuln-config toggles. Disable any to make the
+  # lab harder for advanced students (or to remove specific paths).
+  install_mssql_on_root:    true
+  install_mssql_on_member:  true
+  install_iis_on_root:      true
+  seed_kerberoast:          true
+  seed_asreproast:          true
+  seed_acl_misconfigs:      true
+  seed_unconstrained_deleg: true
+  seed_constrained_deleg:   true
+  seed_dnsadmins:           true
+  seed_smbv1:               true
+
+machines:
+  # GOAD DCs are deployed as windows-member with domain_join: false —
+  # i.e. blank Windows Server boxes. The UPSTREAM GOAD ansible playbook
+  # promotes them, sets up the trusts, and seeds users. If we used
+  # role=windows-dc here our windows-dc.ps1 would race the ansible by
+  # promoting kingslanding to a SEPARATE forest. Names MUST match the
+  # goad.<dc>_name fields above; the validator checks alignment.
+  - { name: kingslanding, role: windows-member, os: windows-server-2019, size: medium, domain_join: false, static_ip: "10" }
+  - { name: winterfell,   role: windows-member, os: windows-server-2019, size: medium, domain_join: false, static_ip: "20" }
+  - { name: meereen,      role: windows-member, os: windows-server-2019, size: medium, domain_join: false, static_ip: "30" }
+  - { name: castelblack,  role: windows-member, os: windows-server-2019, size: small,  domain_join: false, static_ip: "25" }
+  - { name: kali,         role: attacker,       os: kali,                size: medium }
+
+services:
+  guacamole:
+    enabled: true
+    admin_user: guacadmin
+    admin_password: "G04D!Guac1"
+    autoregister: true
+    student_user_prefix: g-
+    student_password_template: "GOAD!{n:02d}"
+  elk:
+    enabled: false
+    kibana_user: elastic
+    kibana_password: "unused"
+    deploy_agents: false
+  adaptix:
+    enabled: false
+    ssh_pubkey: ""
+  redirector:
+    enabled: false

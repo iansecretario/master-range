@@ -1,0 +1,60 @@
+# Scenario: vulhub
+# Purpose: Ludus-equivalent. See LUDUS-COVERAGE.md.
+# Cost   : ~$200-500/mo depending on student count
+# Mirrors: Ludus "Vulhub" environment guide.
+# Source : https://docs.ludus.cloud/docs/environment-guides/vulhub
+#
+# A box per student running the Vulhub CVE lab catalogue (Log4Shell,
+# Spring4Shell, Struts2, Joomla, WebLogic, etc.) plus a Kali for
+# attacking from. Edit personas/vulhub.sh's LABS_TO_START list to
+# change which CVEs are spun up at boot.
+
+range_name: vulhub-lab
+provider: azure
+azure_region: eastus
+
+students:
+  count: 10
+  tenancy: shared
+  name_format: "v{n:02d}"
+
+lockdown: false
+guacamole_ingress_cidrs:
+  - "203.0.113.0/24"
+
+domain:
+  enabled: false
+  fqdn: corp.local
+  netbios: CORP
+  admin_user: rangeadmin
+  admin_password: "Vh!RangeAdmin1"
+  safemode_password: "Vh!SafeMode1"
+
+default_credentials:
+  windows_local_admin: rangeadmin
+  windows_local_password: "Vh!Local1"
+  linux_user: ranger
+  linux_password: "Vh!Linux1"
+
+machines:
+  - { name: vulhub, role: linux-target, os: ubuntu-22, size: large, persona: vulhub }
+  - { name: kali,   role: attacker,     os: kali,      size: medium }
+
+services:
+  guacamole:
+    enabled: true
+    admin_user: guacadmin
+    admin_password: "Vh!Guac1"
+    autoregister: true
+    student_user_prefix: vh-
+    student_password_template: "Vh!{n:02d}"
+  elk:
+    enabled: false
+    kibana_user: elastic
+    kibana_password: "unused"
+    deploy_agents: false
+  adaptix:
+    enabled: false
+    ssh_pubkey: ""
+  redirector:
+    enabled: false

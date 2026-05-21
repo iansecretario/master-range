@@ -1,0 +1,136 @@
+---
+# =============================================================================
+# Brute Ratel C4 (BRC4) teamserver — post-boot configuration layer
+# =============================================================================
+# The c2-brc4.sh cloud-init userdata does the boot-time heavy lifting:
+# downloads the licensed BRC4 archive, activates the teamserver, drops
+# the per-student c2.profile, installs brc4.service, and serves the
+# commander binary to Kali in a 10-minute window. The license creds are
+# consumed + shredded at boot and are NOT recoverable here.
+#
+# This role is the idempotent `./range repair` layer — it does NOT
+# re-install BRC4 (a licensed archive + one-shot activation can't be
+# replayed from inside the range). It VERIFIES the install, keeps the
+# c2.profile in sync with terraform's per-student render, ensures the
+# service is healthy, and confirms the commander + 5 HTTPS listener
+# ports are bound. Mirrors what the adaptix / mythic / sliver roles do
+# for their stacks so BRC4 reaches the same repair-time parity.
+
+# ---------- Phase 1: verify the licensed install ----------
+- name: Probe BRC4 teamserver binary
+  ansible.builtin.stat:
+    path: /opt/bruteratel/brute-ratel-linx64
+  register: brc4_bin
+  become: true
+
+# If the binary is missing, the box booted without a usable license
+# (or the blob download / activation failed). This role can't recover
+# that — surface a clear, actionable failure instead of letting the
+# service/port tasks below cascade into confusing errors.
+- name: Fail clearly when BRC4 was never installed (license-gated boot)
+  ansible.builtin.fail:
+    msg: >-
+      /opt/bruteratel/brute-ratel-linx64 is missing — the c2-brc4.sh
+      bootstrap did not complete on this host. Check
+      /var/log/brc4-bootstrap.log and /var/log/brc4-activate.log on the
+      teamserver. Most common cause: brc4_license_id / brc4_activation_key
+      / brc4_email / brc4_blob_url were not supplied (or were invalid) at
+      deploy time. Re-supply them and rebuild the c2-brc4 VM — a licensed
+      install + one-shot activation cannot be replayed by this role.
+  when: not brc4_bin.stat.exists or brc4_bin.stat.size == 0
+
+# ---------- Phase 2: keep c2.profile in sync with terraform ----------
+# terraform's listeners.tf renders a per-student c2.profile (5 HTTPS
+# listeners on :8443-:8447 + commander on :9000). inventory.py surfaces
+# it as terra_brc4_profile. Re-drop it at both paths BRC4 reads:
+#   profiles/c2.profile  — canonical source-of-truth copy
+#   autosave.profile     — what the systemd unit actually loads (`-r`)
+# If the rendered profile drifted from what's on disk, the restart task
+# below picks it up. When terra_brc4_profile isn't plumbed (e.g. an
+# inventory that predates the outputs.tf change) the sync is skipped
+# cleanly and the boot-time profile is left as-is.
+- name: Ensure /opt/bruteratel/profiles exists
+  ansible.builtin.file:
+    path: /opt/bruteratel/profiles
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+  become: true
+
+- name: Sync per-student c2.profile (canonical + autosave)
+  ansible.builtin.copy:
+    content: "{{ terra_brc4_profile }}"
+    dest: "{{ item }}"
+    owner: root
+    group: root
+    mode: "0600"
+  loop:
+    - /opt/bruteratel/profiles/c2.profile
+    - /opt/bruteratel/autosave.profile
+  become: true
+  register: brc4_profile_sync
+  when: terra_brc4_profile is defined and terra_brc4_profile
+
+# ---------- Phase 3: service ----------
+- name: Ensure brc4.service is enabled + running
+  ansible.builtin.systemd:
+    name: brc4
+    enabled: true
+    state: started
+    daemon_reload: true
+  become: true
+
+- name: Restart brc4.service when the c2.profile changed
+  ansible.builtin.systemd:
+    name: brc4
+    state: restarted
+  become: true
+  when: brc4_profile_sync is defined and brc4_profile_sync is changed
+
+# ---------- Phase 4: health — commander + listener ports ----------
+# Commander handler binds locally (c2.profile c2_handler = 127.0.0.1:9000);
+# the :8443-:8447 HTTPS listeners bind all interfaces so the paired
+# redirector can reach them.
+- name: Wait for the BRC4 commander port {{ brc4_commander_port }}
+  ansible.builtin.wait_for:
+    port: "{{ brc4_commander_port }}"
+    host: 127.0.0.1
+    timeout: 90
+
+- name: Verify each HTTPS listener port is bound
+  ansible.builtin.wait_for:
+    port: "{{ item }}"
+    host: 0.0.0.0
+    timeout: 30
+  loop: "{{ c2_listener_ports }}"
+
+# ---------- Phase 5: diagnostics (always-run) ----------
+- name: Always dump quick diagnostics
+  block:
+    - name: Diagnostic marker
+      ansible.builtin.debug:
+        msg: "Emitting diagnostic dump (always-run)"
+      changed_when: false
+  always:
+    - name: Snapshot listening ports
+      ansible.builtin.command: ss -lntp
+      register: ss_dump
+      changed_when: false
+      become: true
+    - name: Snapshot brc4 journal
+      ansible.builtin.command: journalctl -u brc4 --no-pager -n 40
+      register: brc4_journal
+      changed_when: false
+      failed_when: false
+      become: true
+    # List-form msg renders each entry on its own line; block-scalar
+    # `msg: |` would collapse into one JSON-escaped string.
+    - name: Report — listening ports
+      ansible.builtin.debug:
+        msg: "{{ ['---- brc4 listening ports ----'] +
+                 (ss_dump.stdout_lines | select('search', ':(9000|844[3-7])') | list) }}"
+    - name: Report — brc4 journal (last 40)
+      ansible.builtin.debug:
+        msg: "{{ ['---- brc4 journal (last 40) ----'] +
+                 (brc4_journal.stdout_lines | default(['(empty)'])) }}"

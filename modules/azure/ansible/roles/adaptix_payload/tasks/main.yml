@@ -1,0 +1,895 @@
+---
+# =============================================================================
+# adaptix_payload — generate Adaptix agent payloads via REST and save to
+# ~/Desktop/payloads/adaptix on the target Kali host.
+# =============================================================================
+# Runs as the LAST play in modules/azure/ansible/playbook.yml. By the time
+# this role fires, the `adaptix` role has built the teamserver + registered
+# the five HTTPS listeners, and the `kali` role has finished its (async)
+# AdaptixClient build + created ~/Desktop/payloads/adaptix.
+#
+# We deliberately do EVERYTHING inside a single Python `shell:` task instead
+# of an Ansible `loop:` over `uri:`. Two reasons:
+#   1. AdaptixServer's access_token JWT TTL is sub-minute (see comment in
+#      roles/adaptix/tasks/main.yml:442-449). 25 builds via separate
+#      `uri:` calls would blow the token mid-loop and surface as opaque
+#      "404 Not Found" from default404Middleware.
+#   2. A single HTTPS keep-alive session is materially faster than 25
+#      cold TLS handshakes plus per-task Ansible overhead.
+
+# ---------- Phase 0: skip cleanly on scenarios without Adaptix ----------
+# scenarios/vulhub.yaml has a Kali but no c2-server, so groups['adaptix']
+# is empty. Skip the whole role with a friendly debug message rather
+# than failing the play with "list is empty" Jinja errors.
+- name: Skip — no Adaptix teamserver in this range
+  ansible.builtin.debug:
+    msg: >-
+      No Adaptix teamserver in this range (groups['adaptix'] is empty);
+      skipping payload generation. This is expected for scenarios like
+      vulhub that don't deploy Adaptix.
+  when: (groups['adaptix'] | default([]) | length) == 0
+
+- name: End play for this host when Adaptix is absent
+  ansible.builtin.meta: end_host
+  when: (groups['adaptix'] | default([]) | length) == 0
+
+# ---------- Phase 1: pick THIS Kali's teamserver ----------
+# Per-student match: kali-N talks to c2-N (same terra_student_id tag on
+# both VMs in vms.tf). Falls back to the first adaptix host so single-
+# tenant ranges keep working.
+- name: Pick teamserver hostname (match by terra_student_id, else first)
+  ansible.builtin.set_fact:
+    adaptix_teamserver_name: >-
+      {%- set sid = terra_student_id | default('') -%}
+      {%- set matches = [] -%}
+      {%- for h in groups['adaptix'] -%}
+      {%- if (hostvars[h].terra_student_id | default('')) == sid -%}
+      {%- set _ = matches.append(h) -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {{ (matches | first) | default(groups['adaptix'] | first, true) }}
+
+- name: Resolve teamserver private IP
+  ansible.builtin.set_fact:
+    adaptix_teamserver_host: "{{ hostvars[adaptix_teamserver_name].terra_private_ip }}"
+
+- name: Build base URL (port from group_vars/all.yml, endpoint baked in c2-server.sh)
+  ansible.builtin.set_fact:
+    adaptix_url: "https://{{ adaptix_teamserver_host }}:{{ adaptix_commander_port }}/endpoint"
+
+# ---------- Phase 2: read operator password from teamserver ----------
+# Same pattern as roles/adaptix/tasks/main.yml:376-389: /opt/adaptix/profile.yaml
+# is the single source of truth. We `delegate_to` the teamserver so the
+# slurp uses the controller's existing SSH config for that host.
+- name: Slurp /opt/adaptix/profile.yaml from teamserver
+  ansible.builtin.slurp:
+    src: /opt/adaptix/profile.yaml
+  delegate_to: "{{ adaptix_teamserver_name }}"
+  become: true
+  register: adaptix_profile_b64
+  no_log: true
+
+- name: Parse profile.yaml + extract operator password
+  ansible.builtin.set_fact:
+    adaptix_profile_parsed: "{{ adaptix_profile_b64.content | b64decode | from_yaml }}"
+  no_log: true
+
+- name: Compute login credentials
+  ansible.builtin.set_fact:
+    adaptix_username: "{{ adaptix_payload_operator_username }}"
+    adaptix_password: >-
+      {{ (adaptix_profile_parsed.Teamserver.operators[adaptix_payload_operator_username]
+          | default(adaptix_profile_parsed.Teamserver.password, true))
+         | string }}
+  no_log: true
+
+- name: Fail fast if no password could be extracted
+  ansible.builtin.fail:
+    msg: >-
+      Could not read operator password from
+      {{ adaptix_teamserver_name }}:/opt/adaptix/profile.yaml.
+      Check the teamserver's profile.yaml structure.
+  when: (adaptix_password | default('')) == ''
+
+# ---------- Phase 3: ensure base + per-run output dirs + Python HTTP libs ----------
+# Each invocation drops binaries into a NEW timestamped subdirectory
+# under the base output dir, e.g.
+#   ~/Desktop/payloads/adaptix/20260515T045824Z/
+# so the operator can tell which run produced which file. A `latest`
+# symlink at the base points at the freshest run for convenience.
+#
+# kali/tasks/main.yml:805-817 already creates the BASE output dir tree;
+# the `file:` task here is defensive.
+- name: Compute UTC build timestamp
+  ansible.builtin.set_fact:
+    adaptix_payload_build_timestamp: "{{ lookup('pipe', 'date -u +%Y%m%dT%H%M%SZ') }}"
+
+- name: Compute per-run output directory
+  ansible.builtin.set_fact:
+    adaptix_payload_run_dir: "{{ adaptix_payload_output_dir }}/{{ adaptix_payload_build_timestamp }}"
+
+- name: Ensure base + per-run output directories exist
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: "0755"
+  loop:
+    - "{{ adaptix_payload_output_dir }}"
+    - "{{ adaptix_payload_run_dir }}"
+  become: true
+
+# The build script imports `requests` + `urllib3`. Kali ships python3,
+# but not always the python3-requests apt package on a minimal image —
+# c2-server.sh installs it explicitly on the teamserver side, we mirror
+# that here for the Kali side. Idempotent / cheap (~150 KB cached).
+- name: Ensure python3-requests + python3-urllib3 are installed (for the build script)
+  ansible.builtin.apt:
+    name:
+      - python3-requests
+      - python3-urllib3
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+    # Match the kali role's convention: wait up to 10 min on dpkg-lock
+    # contention (unattended-upgrades may still be running on a fresh boot).
+    lock_timeout: 600
+  become: true
+
+# ---------- Phase 4: single Python build script (atomic) ----------
+# Login retry → /listener/list discovery → resolve `via:` + filter by
+# listener type per agent → matrix expansion → /agent/generate per
+# entry with per-build retries → atomic decode-and-write.
+# One process, one keep-alive session, one access_token.
+- name: "Adaptix — log in (curl)"
+  ansible.builtin.command:
+    argv:
+      - curl
+      - -sk
+      - --fail-with-body
+      - -X
+      - POST
+      - "{{ adaptix_url }}/login"
+      - -H
+      - "Content-Type: application/json"
+      - -d
+      - "{{ {'username': adaptix_username, 'password': adaptix_password} | to_json }}"
+  register: adaptix_reconcile_login_raw
+  changed_when: false
+  no_log: true
+
+- name: "Adaptix — extract bearer token"
+  ansible.builtin.set_fact:
+    adaptix_reconcile_token: "{{ (adaptix_reconcile_login_raw.stdout | from_json).access_token }}"
+  no_log: true
+
+- name: "Adaptix — list existing listeners (curl)"
+  ansible.builtin.command:
+    argv:
+      - curl
+      - -sk
+      - --fail-with-body
+      - "{{ adaptix_url }}/listener/list"
+      - -H
+      - "Authorization: Bearer {{ adaptix_reconcile_token }}"
+  register: adaptix_reconcile_list_raw
+  changed_when: false
+
+- name: "Adaptix — parse existing listeners"
+  ansible.builtin.set_fact:
+    adaptix_existing_rows: "{{ adaptix_reconcile_list_raw.stdout | from_json | default([], true) }}"
+    adaptix_existing_names: >-
+      {{ (adaptix_reconcile_list_raw.stdout | from_json | default([], true))
+         | map(attribute='l_name') | list }}
+
+- name: "Adaptix — set declared listener roster"
+  ansible.builtin.set_fact:
+    adaptix_required_listeners:
+      - name: "gopher_GopherTCP"
+        type: "GopherTCP"
+        config:
+          host_bind: "0.0.0.0"
+          port_bind: 8448
+          callback_addresses: >-
+            {{ (adaptix_existing_rows
+                | selectattr('l_name','equalto','azure_HTTPS')
+                | map(attribute='l_agent_addr')
+                | map('regex_replace',':[0-9]+$','')
+                | first
+                | default('CHANGEME-azure'))
+              ~ ':8448' }}
+          encrypt_key: >-
+            {{ (adaptix_existing_rows
+                | selectattr('l_name','equalto','azure_HTTPS')
+                | map(attribute='l_data')
+                | map('from_json')
+                | map(attribute='encrypt_key')
+                | first) }}
+          ssl: false
+          tcp_banner: ""
+          error_answer: "<!doctype html><title>404</title>"
+          timeout: 30
+      # Second GopherTCP listener on port 8449. Distinct name prefix
+      # (`alt_`) so the role's via prefix-matcher resolves it cleanly
+      # — `name.startswith("alt")` matches only this listener, not the
+      # 8448 one. Gives the operator two failover GopherTCP transports
+      # without needing mTLS / cert plumbing. NSG rule below opens
+      # 8449/tcp from the adaptix redirector (sibling to the existing
+      # 8448 rule).
+      - name: "alt_GopherTCP"
+        type: "GopherTCP"
+        config:
+          host_bind: "0.0.0.0"
+          port_bind: 8449
+          callback_addresses: >-
+            {{ (adaptix_existing_rows
+                | selectattr('l_name','equalto','azure_HTTPS')
+                | map(attribute='l_agent_addr')
+                | map('regex_replace',':[0-9]+$','')
+                | first
+                | default('CHANGEME-azure'))
+              ~ ':8449' }}
+          encrypt_key: >-
+            {{ (adaptix_existing_rows
+                | selectattr('l_name','equalto','azure_HTTPS')
+                | map(attribute='l_data')
+                | map('from_json')
+                | map(attribute='encrypt_key')
+                | first) }}
+          ssl: false
+          tcp_banner: ""
+          error_answer: "<!doctype html><title>404</title>"
+          timeout: 30
+
+- name: "Adaptix — create missing listeners (curl)"
+  ansible.builtin.command:
+    argv:
+      - curl
+      - -sk
+      - --fail-with-body
+      - -X
+      - POST
+      - "{{ adaptix_url }}/listener/create"
+      - -H
+      - "Authorization: Bearer {{ adaptix_reconcile_token }}"
+      - -H
+      - "Content-Type: application/json"
+      - -d
+      - "{{ {'name': item.name, 'type': item.type, 'config': item.config | to_json} | to_json }}"
+  loop: "{{ adaptix_required_listeners }}"
+  loop_control:
+    label: "{{ item.name }} ({{ item.type }})"
+  when: item.name not in adaptix_existing_names
+  register: adaptix_reconcile_creates
+  changed_when: "'\"ok\":true' in (adaptix_reconcile_creates.stdout | default(''))"
+
+# ---- /listener/start any required listener that's still Stopped ----
+# Adaptix's /listener/create persists the listener config but doesn't
+# always succeed in starting it (the per-kind Start() can return an
+# error — e.g. BeaconDNS port 53 conflicts with systemd-resolved, or a
+# placeholder host fails host validation). When that happens the
+# listener stays at l_status=Stopped, AdaptixClient's GUI listener-
+# picker filters Stopped listeners out, and the operator sees an empty
+# "Click to select listeners…" picker when generating a gopher payload.
+# Calling /listener/start explicitly is idempotent: already-running
+# listeners return ok:true with no side effect; failed-to-start ones
+# return ok:false and the real bind error message we can act on.
+- name: "Adaptix — re-list listeners to get fresh status after create"
+  ansible.builtin.command:
+    argv:
+      - curl
+      - -sk
+      - --fail-with-body
+      - "{{ adaptix_url }}/listener/list"
+      - -H
+      - "Authorization: Bearer {{ adaptix_reconcile_token }}"
+  register: adaptix_post_create_list
+  changed_when: false
+
+- name: "Adaptix — parse current listener statuses"
+  ansible.builtin.set_fact:
+    adaptix_listener_status: >-
+      {{ dict((adaptix_post_create_list.stdout | from_json | default([], true))
+            | map(attribute='l_name')
+            | zip((adaptix_post_create_list.stdout | from_json | default([], true))
+                  | map(attribute='l_status'))) }}
+
+- name: "Adaptix — start any required listener that isn't Listen"
+  ansible.builtin.command:
+    argv:
+      - curl
+      - -sk
+      - --fail-with-body
+      - -X
+      - POST
+      - "{{ adaptix_url }}/listener/start"
+      - -H
+      - "Authorization: Bearer {{ adaptix_reconcile_token }}"
+      - -H
+      - "Content-Type: application/json"
+      - -d
+      - "{{ {'name': item.name, 'type': item.type} | to_json }}"
+  loop: "{{ adaptix_required_listeners }}"
+  loop_control:
+    label: "{{ item.name }} (current status={{ adaptix_listener_status.get(item.name, '<missing>') }})"
+  when: adaptix_listener_status.get(item.name, '') != 'Listen'
+  register: adaptix_reconcile_starts
+  changed_when: "'\"ok\":true' in (adaptix_reconcile_starts.stdout | default(''))"
+  failed_when: false
+
+- name: "Adaptix — report reconcile result"
+  ansible.builtin.debug:
+    msg: >-
+      {% set created = adaptix_reconcile_creates.results
+            | default([])
+            | rejectattr('skipped','defined')
+            | list %}
+      {% set started = adaptix_reconcile_starts.results
+            | default([])
+            | rejectattr('skipped','defined')
+            | list %}
+      {% if created %}created {{ created | length }} listener(s):
+      {{ created | map(attribute='item.name') | list | join(', ') }}.
+      {% endif %}{% if started %}started {{ started | length }} listener(s):
+      {{ started | map(attribute='item.name') | list | join(', ') }}.
+      Per-listener API response:
+      {% for s in started %}
+        - {{ s.item.name }}: {{ (s.stdout | default('<no stdout>'))[:200] }}
+      {% endfor %}{% endif %}{% if not created and not started %}all required listeners already present + running
+      {% endif %}
+
+- name: Build all matrix payloads in one process (login + multi-agent build)
+  ansible.builtin.shell:
+    cmd: |
+      python3 - <<'PY'
+      import base64, json, os, sys, tempfile, time, traceback
+      import urllib3, requests
+      urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+      BASE         = os.environ["ADAPTIX_URL"]
+      USER         = os.environ["ADAPTIX_USER"]
+      PASS         = os.environ["ADAPTIX_PASS"]
+      OUT_DIR      = os.environ["ADAPTIX_OUT_DIR"]
+      OUT_MODE     = int(os.environ["ADAPTIX_OUT_MODE"], 8)
+      MATRIX       = json.loads(os.environ["ADAPTIX_MATRIX"])
+      LISTENER_VIAS= json.loads(os.environ["ADAPTIX_LISTENER_VIAS"])
+      EXT_MAP      = json.loads(os.environ["ADAPTIX_EXT_MAP"])
+      LOGIN_RETRY  = int(os.environ["ADAPTIX_LOGIN_RETRIES"])
+      LOGIN_DELAY  = int(os.environ["ADAPTIX_LOGIN_DELAY"])
+      BUILD_TO     = int(os.environ["ADAPTIX_BUILD_TIMEOUT"])
+      BUILD_RETRY  = int(os.environ["ADAPTIX_BUILD_RETRIES"])
+      BUILD_RDELAY = int(os.environ["ADAPTIX_BUILD_RETRY_DELAY"])
+
+      # Verbose error classification. NON_RETRYABLE_SUBSTRINGS appearing
+      # anywhere in the error body mean "this build is config-broken,
+      # retrying won't help" — skip immediately, log clearly, move on.
+      NON_RETRYABLE_SUBSTRINGS = (
+          "unknown file format",
+          "protocol unknown",
+          "agent not found",
+          "listener not found",
+          "invalid date format",
+      )
+
+      def log(*a):
+          print(*a, flush=True)
+
+      def is_non_retryable(msg):
+          ml = (msg or "").lower()
+          return any(s in ml for s in NON_RETRYABLE_SUBSTRINGS)
+
+      def short(s, n=400):
+          """Trim long strings for log lines. Keeps debug output readable."""
+          if s is None: return ""
+          s = str(s)
+          return s if len(s) <= n else s[:n] + "...[truncated %d]" % (len(s) - n)
+
+      # AdaptixServer's access_token JWT TTL is sub-minute (see comment
+      # in modules/azure/ansible/roles/adaptix/tasks/main.yml:442-449).
+      # With many builds at 3-15 sec mingw cross-compile each, the total
+      # build phase runs minutes — token WILL expire mid-loop. Refresh
+      # whenever > TOKEN_MAX_AGE seconds have elapsed since last /login,
+      # and on any 401/403/404 from /agent/generate (belt-and-suspenders).
+      TOKEN_MAX_AGE = 30
+      auth_state = {"tok": "", "ts": 0.0}
+      H = {"Authorization": "", "Content-Type": "application/json"}
+
+      def do_login():
+          """Try /login up to LOGIN_RETRY times; update auth_state + H on success."""
+          last = None
+          for attempt in range(1, LOGIN_RETRY + 1):
+              try:
+                  r = requests.post(
+                      BASE + "/login",
+                      json={"username": USER, "password": PASS, "version": "1.0"},
+                      verify=False, timeout=10)
+                  if r.status_code != 200:
+                      last = "HTTP %d: %s" % (r.status_code, short(r.text))
+                      log("[!] /login attempt %d/%d: %s" % (attempt, LOGIN_RETRY, last))
+                  else:
+                      t = (r.json() or {}).get("access_token", "")
+                      if t:
+                          auth_state["tok"] = t
+                          auth_state["ts"]  = time.time()
+                          H["Authorization"] = "Bearer " + t
+                          if attempt > 1:
+                              log("[+] /login succeeded on attempt %d" % attempt)
+                          return True
+                      last = "login returned no access_token, body=%s" % short(r.text)
+                      log("[!] /login attempt %d/%d: %s" % (attempt, LOGIN_RETRY, last))
+              except (requests.exceptions.ConnectionError,
+                      requests.exceptions.Timeout,
+                      requests.exceptions.HTTPError) as e:
+                  last = type(e).__name__ + ": " + short(str(e), 200)
+                  log("[!] /login attempt %d/%d: %s" % (attempt, LOGIN_RETRY, last))
+              time.sleep(LOGIN_DELAY)
+          sys.exit("adaptix /login failed after %d retries: %s" % (LOGIN_RETRY, last))
+
+      def maybe_refresh():
+          """Re-login if more than TOKEN_MAX_AGE seconds have elapsed."""
+          if (time.time() - auth_state["ts"]) > TOKEN_MAX_AGE:
+              do_login()
+
+      # ---- Initial login (with the cold-boot retry budget) ----
+      do_login()
+      log("[+] logged in to " + BASE)
+
+      # ---- Discover live listeners (name + type) ----
+      try:
+          r = requests.get(BASE + "/listener/list", headers=H, verify=False, timeout=15)
+      except Exception as e:
+          sys.exit("GET /listener/list failed: %s: %s" % (type(e).__name__, e))
+      if r.status_code != 200:
+          sys.exit("GET /listener/list HTTP %d: %s" % (r.status_code, short(r.text)))
+      try:
+          rows = r.json() or []
+      except ValueError as e:
+          sys.exit("GET /listener/list returned non-JSON: %s: body=%s"
+                   % (e, short(r.text)))
+
+      # Normalize listener rows. Adaptix's /listener/list returns:
+      #   - `l_name`         e.g. "azure_HTTPS"
+      #   - `l_type`         category: "external" OR "internal" — too
+      #                      coarse for our agent-compatibility filter
+      #                      (per https://adaptix-framework.gitbook.io/
+      #                      adaptix-framework/extenders, beacon-http +
+      #                      beacon-dns + gopher-tcp are ALL "external";
+      #                      filtering by this would let gopher try to
+      #                      build against a BeaconHTTP listener and
+      #                      get back the "protocol unknown" we just
+      #                      spent hours debugging).
+      #   - `l_reg_name`     listener KIND e.g. "BeaconHTTP" / "GopherTCP"
+      #                      (database column `ListenerRegName`)
+      #
+      # Strategy: prefer the kind-class fields (`l_reg_name` etc.). Only
+      # treat `l_type` values as authoritative when they're NOT one of
+      # the known too-coarse category strings. If everything fails, fall
+      # back to a name-suffix heuristic that matches the names we
+      # ourselves register in configure_listeners.py (azure_HTTPS, etc.).
+
+      # Listener kind-class fields, in order of preference. The value
+      # in these is expected to be a registration name like BeaconHTTP.
+      KIND_FIELDS = (
+          "l_reg_name", "l_reg", "reg_name", "regname",
+          "l_kind", "kind",
+          "l_protocol", "protocol",
+      )
+      # Values we know are too coarse to use directly — they're
+      # listener categories, not kinds. Seen on real ranges.
+      COARSE_CATEGORIES = {"external", "internal"}
+      # Last-resort fallback: filename suffix → kind. Matches what
+      # configure_listeners.py creates (`<region>_HTTPS` BeaconHTTP
+      # listeners) and what an operator would name future listeners.
+      NAME_SUFFIX_TO_TYPE = (
+          ("_HTTPS",  "BeaconHTTP"),
+          ("_HTTP",   "BeaconHTTP"),
+          ("_DNS",    "BeaconDNS"),
+          ("_SMB",    "BeaconSMB"),
+          ("_TCP",    "BeaconTCP"),
+          ("_GOPHER", "GopherTCP"),
+      )
+
+      def guess_type_from_name(name):
+          up = name.upper()
+          for suf, t in NAME_SUFFIX_TO_TYPE:
+              if up.endswith(suf.upper()) or suf.lstrip("_").upper() in up:
+                  return t
+          return ""
+
+      def extract_listener_kind(row):
+          """Return (kind, source_label) for a /listener/list row.
+
+          Tries kind-class fields first, ignores too-coarse category
+          values ("external"/"internal"), and only then falls back to
+          name-suffix heuristic.
+          """
+          # 1. Kind-class fields.
+          for k in KIND_FIELDS:
+              v = row.get(k)
+              if v and str(v).strip() and str(v).strip().lower() not in COARSE_CATEGORIES:
+                  return str(v).strip(), "api:" + k
+          # 2. Generic type/l_type fields — only if the value looks like
+          #    a kind, not a category.
+          for k in ("l_type", "type"):
+              v = row.get(k)
+              if v and str(v).strip() and str(v).strip().lower() not in COARSE_CATEGORIES:
+                  return str(v).strip(), "api:" + k
+          # 3. Name-suffix heuristic.
+          name = row.get("l_name", "")
+          guess = guess_type_from_name(name)
+          if guess:
+              return guess, "name-heuristic"
+          # 4. Last resort: return the coarse value with a tag noting it.
+          for k in ("l_type", "type"):
+              v = row.get(k)
+              if v:
+                  return str(v).strip(), "api-coarse:" + k
+          return "", "unknown"
+
+      # Dump the raw first row to the log — makes future field-name
+      # surprises a one-grep diagnosis.
+      if rows:
+          log("[*] sample /listener/list row keys: %r"
+              % sorted(list((rows[0] or {}).keys())))
+          log("[*] sample /listener/list row body: %s"
+              % short(json.dumps(rows[0]), 400))
+
+      listeners = []
+      for row in rows:
+          name = row.get("l_name")
+          if not name:
+              continue
+          t, source = extract_listener_kind(row)
+          listeners.append({"name": name, "type": t, "type_source": source})
+      if not listeners:
+          sys.exit("teamserver reports zero registered listeners; "
+                   "is the adaptix role's listener-reconcile complete?")
+      log("[+] live listeners (%d):" % len(listeners))
+      for ln in listeners:
+          log("      %s  (kind=%s via=%s)"
+              % (ln["name"], ln["type"] or "<unknown>", ln["type_source"]))
+
+      # ---- Resolve each via -> a real listener name (prefix match) ----
+      listener_for = {}
+      missing = []
+      for via in LISTENER_VIAS:
+          match = next((ln for ln in listeners if ln["name"].startswith(via)), None)
+          if match is None:
+              missing.append(via)
+          else:
+              listener_for[via] = match
+      if missing:
+          # Not fatal anymore: missing vias are reported but we proceed
+          # with whatever resolved. A scenario may legitimately omit one.
+          log("[!] WARNING: could not resolve vias %r against live listeners. "
+              "Builds for these vias will be skipped." % missing)
+      if not listener_for:
+          sys.exit("None of the configured vias %r matched any live listener."
+                   % LISTENER_VIAS)
+
+      def do_build(label, body):
+          """POST /agent/generate with retries on transient errors.
+
+          Returns (content_bytes, None) on success, or (None, err_msg)
+          on terminal failure. Non-retryable build errors ("unknown
+          file format", "protocol unknown", etc.) return immediately
+          without burning retries.
+          """
+          last_err = None
+          for attempt in range(1, BUILD_RETRY + 1):
+              # Refresh BEFORE every attempt (covers normal expiry).
+              maybe_refresh()
+              try:
+                  r = requests.post(BASE + "/agent/generate",
+                                    headers=H, json=body,
+                                    verify=False, timeout=BUILD_TO)
+              except Exception as e:
+                  last_err = "%s: %s" % (type(e).__name__, short(str(e), 200))
+                  log("[!] %s attempt %d/%d: %s"
+                      % (label, attempt, BUILD_RETRY, last_err))
+                  time.sleep(BUILD_RDELAY)
+                  continue
+              # Auth-class HTTP codes -> force re-login then retry.
+              # 404 is Adaptix's default404Middleware cover for
+              # unauthenticated requests — looks like a routing error
+              # but it's actually "token expired".
+              if r.status_code in (401, 403, 404):
+                  log("[~] %s attempt %d/%d: HTTP %d (auth-class) → refreshing token"
+                      % (label, attempt, BUILD_RETRY, r.status_code))
+                  do_login()
+                  continue  # use a fresh attempt budget slot
+              if r.status_code >= 500:
+                  last_err = "HTTP %d (server-side): %s" % (r.status_code, short(r.text))
+                  log("[!] %s attempt %d/%d: %s"
+                      % (label, attempt, BUILD_RETRY, last_err))
+                  time.sleep(BUILD_RDELAY)
+                  continue
+              if r.status_code != 200:
+                  last_err = "HTTP %d: %s" % (r.status_code, short(r.text))
+                  log("[!] %s: %s (non-retryable HTTP)" % (label, last_err))
+                  return None, last_err
+              # 200 — unpack envelope.
+              try:
+                  data = r.json() or {}
+              except ValueError as e:
+                  last_err = "non-JSON body: %s: %s" % (e, short(r.text))
+                  log("[!] %s: %s" % (label, last_err))
+                  return None, last_err
+              if not data.get("ok"):
+                  msg = data.get("message", "?")
+                  last_err = "ok:false message=%r full=%s" % (msg, short(json.dumps(data)))
+                  if is_non_retryable(msg):
+                      log("[!] %s: %s (config error, not retrying)" % (label, last_err))
+                      return None, last_err
+                  log("[!] %s attempt %d/%d: %s"
+                      % (label, attempt, BUILD_RETRY, last_err))
+                  time.sleep(BUILD_RDELAY)
+                  continue
+              msg = data.get("message", "")
+              if ":" not in msg:
+                  last_err = "malformed message (no ':'), got=%s" % short(msg)
+                  log("[!] %s: %s" % (label, last_err))
+                  return None, last_err
+              _fname_b64, content_b64 = msg.split(":", 1)
+              try:
+                  return base64.b64decode(content_b64), None
+              except Exception as e:
+                  last_err = "b64 decode failed: %s" % e
+                  log("[!] %s: %s" % (label, last_err))
+                  return None, last_err
+          return None, last_err or "exhausted %d retries" % BUILD_RETRY
+
+      # ---- Matrix expansion + build loop ----
+      # Per-agent / per-via counts so the operator sees how many of each
+      # variant landed (e.g. "32 beacon, 12 gopher") rather than a single
+      # rolled-up total. Keyed by the matrix's agent name and the via
+      # alias from group_vars (azure/cloudfront/workers/fastly/other/...).
+      os.makedirs(OUT_DIR, exist_ok=True)
+      built, failed = [], []
+      per_agent_built = {agent: 0 for agent in MATRIX.keys()}
+      per_via_built   = {via: 0 for via in listener_for.keys()}
+
+      def expand_builds(spec):
+          """Yield (os, arch, format) tuples for an agent's matrix entry.
+
+          Two schemas supported so beacon's existing flat config keeps
+          working while gopher can declare per-variant os+arch:
+
+            Rich (preferred for cross-platform agents):
+              builds:
+                - { os: linux,   arch: amd64, format: elf }
+                - { os: windows, arch: arm64, format: exe }
+                ...
+
+            Flat (legacy; beacon still uses this):
+              arch: x64
+              formats: ["Exe", "DLL", "Shellcode", "Service Exe"]
+              → os derived from format heuristic
+                  (elf -> linux, else windows).
+          """
+          rich = spec.get("builds")
+          if rich:
+              for b in rich:
+                  yield (
+                      b.get("os", "windows"),
+                      b.get("arch", "amd64"),
+                      b.get("format", "exe"),
+                  )
+              return
+          flat_arch    = spec.get("arch", "x64")
+          flat_formats = spec.get("formats", []) or []
+          for fmt in flat_formats:
+              flat_os = "linux" if fmt == "elf" else "windows"
+              yield (flat_os, flat_arch, fmt)
+
+      for agent, spec in MATRIX.items():
+          extra         = spec.get("config_extra", {}) or {}
+          compat_types  = spec.get("compatible_listener_types", []) or []
+          variants      = list(expand_builds(spec))
+          log("")
+          log("==== agent=%s variants=%d compat=%r ===="
+              % (agent, len(variants), compat_types or "<any>"))
+
+          # Silently filter incompatible (agent, listener) pairs.
+          # Structural protocol mismatches (beacon×GopherTCP,
+          # gopher×BeaconHTTP/DNS/SMB/TCP) get dropped without report.
+          # An operator who declared a via that resolves to NO listener
+          # at all still sees a warning earlier via the `missing` list.
+          eligible = [
+              (via, ln)
+              for via, ln in listener_for.items()
+              if not (compat_types and ln["type"] and ln["type"] not in compat_types)
+          ]
+          if not eligible:
+              log("[—] agent=%s has no eligible listeners in this range; skipping all variants" % agent)
+              continue
+
+          for via, ln in eligible:
+              listener_name = ln["name"]
+              for os_kind, arch, fmt in variants:
+                  cfg = {"os": os_kind, "arch": arch, "format": fmt}
+                  cfg.update(extra)
+                  body = {
+                      "agent":         agent,
+                      "listener_name": [listener_name],
+                      "config":        json.dumps(cfg),
+                  }
+                  ext     = EXT_MAP.get(fmt, "." + str(fmt).lower())
+                  # Sanitize the filename: "Service Exe" → "Service-Exe"
+                  # avoids spaces in on-disk names while preserving the
+                  # extender-required string in the request body. Include
+                  # os in the stem too — gopher's amd64/elf vs amd64/exe
+                  # (linux vs windows) would otherwise collide.
+                  fmt_slug = str(fmt).replace(" ", "-")
+                  outname  = "%s-%s-%s-%s-%s%s" % (
+                      listener_name, agent, os_kind, arch, fmt_slug, ext)
+                  outpath  = os.path.join(OUT_DIR, outname)
+                  label    = "%s/%s/%s-%s/%s" % (agent, via, os_kind, arch, fmt)
+                  log("[*] build %s → %s (cfg=%s)"
+                      % (label, outpath, short(json.dumps(cfg), 200)))
+                  try:
+                      blob, err = do_build(label, body)
+                      if err is not None:
+                          failed.append("%s: %s" % (label, err))
+                          continue
+                      # Atomic decode-and-write: tmp file in the same dir
+                      # (so os.replace is atomic across the same FS), then
+                      # rename onto outpath. A mid-decode crash leaves the
+                      # previous binary intact.
+                      fd, tmpname = tempfile.mkstemp(prefix=".ax-", suffix=".tmp", dir=OUT_DIR)
+                      try:
+                          with os.fdopen(fd, "wb") as f:
+                              f.write(blob)
+                          os.chmod(tmpname, OUT_MODE)
+                          os.replace(tmpname, outpath)
+                      except Exception:
+                          try: os.unlink(tmpname)
+                          except OSError: pass
+                          raise
+                      built.append(outpath)
+                      per_agent_built[agent] = per_agent_built.get(agent, 0) + 1
+                      per_via_built[via]     = per_via_built.get(via, 0) + 1
+                      log("[+] %s -> %s (%d bytes)" % (label, outpath, len(blob)))
+                  except Exception as e:
+                      tb = traceback.format_exc()
+                      failed.append("%s: %s: %s"
+                                    % (label, type(e).__name__, short(str(e), 200)))
+                      log("[!] %s: %s: %s"
+                          % (label, type(e).__name__, short(str(e), 200)))
+                      log("      traceback: %s" % short(tb, 600))
+
+      def human_bytes(n):
+          """Format byte counts like '1.2 MB' for the summary line."""
+          for unit in ("B", "KB", "MB", "GB"):
+              if n < 1024 or unit == "GB":
+                  return "%.1f %s" % (n, unit) if unit != "B" else "%d B" % n
+              n /= 1024.0
+
+      total_bytes = 0
+      for outpath in built:
+          try:    total_bytes += os.path.getsize(outpath)
+          except OSError: pass
+
+      log("")
+      log("---- summary ----")
+      log("[+] %d built total, %d failed" % (len(built), len(failed)))
+      log("[+] total size on disk : %s across %d file(s)"
+          % (human_bytes(total_bytes), len(built)))
+      log("[+] per-agent breakdown:")
+      for agent in MATRIX.keys():
+          log("      %-12s %3d built" % (agent, per_agent_built.get(agent, 0)))
+      log("[+] per-via breakdown:")
+      for via in sorted(listener_for.keys()):
+          log("      %-12s %3d built" % (via, per_via_built.get(via, 0)))
+      if built:
+          log("[+] built files (sorted by name):")
+          for outpath in sorted(built):
+              try:    sz = os.path.getsize(outpath)
+              except OSError: sz = 0
+              log("      %-50s %s"
+                  % (os.path.basename(outpath), human_bytes(sz)))
+      if failed:
+          log("---- failed builds ----")
+          for f in failed:
+              log("  - " + f)
+      # Exit non-zero only if we got nothing AND there were real failures.
+      # No-eligible-listeners scenarios are handled by the per-agent
+      # "agent=X has no eligible listeners" log line above; we don't
+      # treat them as failures.
+      if not built and failed:
+          sys.exit("0 payloads built, %d failures — see [!] / failed list above" % len(failed))
+      if not built and not failed:
+          log("[—] no compatible listeners for any agent; nothing to build")
+      PY
+    executable: /bin/bash
+  environment:
+    ADAPTIX_URL:                 "{{ adaptix_url }}"
+    ADAPTIX_USER:                "{{ adaptix_username }}"
+    ADAPTIX_PASS:                "{{ adaptix_password }}"
+    ADAPTIX_OUT_DIR:             "{{ adaptix_payload_run_dir }}"
+    ADAPTIX_OUT_MODE:            "{{ adaptix_payload_output_mode }}"
+    ADAPTIX_MATRIX:              "{{ adaptix_payload_matrix | to_json }}"
+    ADAPTIX_LISTENER_VIAS:       "{{ adaptix_payload_listener_vias | to_json }}"
+    ADAPTIX_EXT_MAP:             "{{ adaptix_payload_ext_for_format | to_json }}"
+    ADAPTIX_LOGIN_RETRIES:       "{{ adaptix_payload_login_retries }}"
+    ADAPTIX_LOGIN_DELAY:         "{{ adaptix_payload_login_delay_seconds }}"
+    ADAPTIX_BUILD_TIMEOUT:       "{{ adaptix_payload_build_timeout_seconds }}"
+    ADAPTIX_BUILD_RETRIES:       "{{ adaptix_payload_build_retries }}"
+    ADAPTIX_BUILD_RETRY_DELAY:   "{{ adaptix_payload_build_retry_delay_seconds }}"
+  become: true
+  become_user: "{{ ansible_user }}"
+  register: adaptix_build
+  # The script's own [!] lines surface per-build failures; we only fail
+  # the task when zero binaries were built AND there were real failures
+  # (i.e. don't fail when everything was filtered out as incompatible).
+  changed_when: "'built,' in (adaptix_build.stdout | default(''))"
+  no_log: false
+
+# ---------- Phase 5: update `latest` symlink + surface the summary ----------
+# Symlink target is a RELATIVE name (timestamp only, not the full path)
+# so the symlink still resolves correctly after the operator moves the
+# whole base dir somewhere else.
+- name: Update `latest` symlink to point at this run
+  ansible.builtin.file:
+    src: "{{ adaptix_payload_build_timestamp }}"
+    dest: "{{ adaptix_payload_output_dir }}/latest"
+    state: link
+    force: true
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+  become: true
+
+# ---------- Phase 6: retention sweep (keep latest N run dirs) ----------
+# Each run is a self-contained timestamped subdir. Prune older ones so
+# disk usage stays bounded. `find` with file_type=directory + recurse=false
+# lists only immediate subdirs of the base output dir; the `latest`
+# symlink is excluded by file_type AND by the explicit name reject below
+# (belt-and-suspenders against future ansible find behavior changes).
+- name: Retention sweep — list existing run directories
+  ansible.builtin.find:
+    paths: "{{ adaptix_payload_output_dir }}"
+    file_type: directory
+    recurse: false
+  register: adaptix_payload_existing_runs
+
+- name: Retention sweep — compute prune list (keep latest {{ adaptix_payload_retention_runs }})
+  ansible.builtin.set_fact:
+    # Lexicographic sort over YYYYMMDDTHHMMSSZ stems is identical to
+    # chronological sort. `[:-N]` is "everything except the last N";
+    # combined with ascending sort that's "everything older than the
+    # newest N" — exactly the prune set.
+    adaptix_payload_runs_to_prune: >-
+      {{ (adaptix_payload_existing_runs.files
+          | map(attribute='path')
+          | reject('search', '/latest$')
+          | sort
+          | list)[:-(adaptix_payload_retention_runs | int)] }}
+
+- name: Retention sweep — report plan
+  ansible.builtin.debug:
+    msg: "{{
+      [
+        '---- adaptix_payload retention ----',
+        'keep latest : ' ~ (adaptix_payload_retention_runs | string) ~ ' run(s)',
+        'total runs  : ' ~ (adaptix_payload_existing_runs.files | length | string),
+        'to prune    : ' ~ (adaptix_payload_runs_to_prune | length | string),
+      ] + (adaptix_payload_runs_to_prune | map('basename') | list)
+    }}"
+
+- name: Retention sweep — prune old run directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop: "{{ adaptix_payload_runs_to_prune }}"
+  loop_control:
+    label: "{{ item | basename }}"
+  become: true
+
+- name: Report build summary
+  ansible.builtin.debug:
+    msg: "{{ [
+      '---- adaptix_payload build summary ----',
+      'run dir : ' + adaptix_payload_run_dir,
+      'latest  : ' + adaptix_payload_output_dir + '/latest -> ' + adaptix_payload_build_timestamp,
+    ] + (adaptix_build.stdout_lines | default([])) }}"

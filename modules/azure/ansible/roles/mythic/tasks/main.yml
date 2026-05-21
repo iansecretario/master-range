@@ -1,0 +1,622 @@
+---
+# =============================================================================
+# Mythic teamserver: docker + mythic-cli + httpx C2 profile listeners
+# =============================================================================
+# This role replaces the `mythic.sh` repair script and the cloud-init
+# build path. Idempotent: every check is "is this already in the
+# desired state, if so skip; if not, fix it."
+
+# ---------- Phase 1: docker ----------
+- name: Probe for docker
+  ansible.builtin.command: docker --version
+  register: docker_probe
+  changed_when: false
+  failed_when: false
+
+- name: Install Docker Engine via get.docker.com
+  block:
+    - name: Download docker install script
+      ansible.builtin.get_url:
+        url: https://get.docker.com
+        dest: /tmp/get-docker.sh
+        mode: "0755"
+        timeout: 120
+    - name: Run docker install script
+      ansible.builtin.command: sh /tmp/get-docker.sh
+      register: docker_install
+      changed_when: "'already the newest version' not in (docker_install.stdout | default(''))"
+    - name: Enable docker.service
+      ansible.builtin.systemd:
+        name: docker
+        enabled: true
+        state: started
+  become: true
+  when: docker_probe.rc != 0
+
+# ---------- Phase 2: Mythic source tree ----------
+- name: Clone Mythic if missing
+  ansible.builtin.git:
+    repo: https://github.com/its-a-feature/Mythic.git
+    dest: /opt/mythic
+    update: false
+    depth: 1
+  become: true
+
+# ---------- Phase 3: mythic-cli ----------
+- name: Build mythic-cli (only if binary missing)
+  ansible.builtin.command:
+    cmd: make
+    chdir: /opt/mythic
+    creates: /opt/mythic/mythic-cli
+  become: true
+  register: mythic_cli_build
+
+- name: Ensure mythic-cli is executable
+  ansible.builtin.file:
+    path: /opt/mythic/mythic-cli
+    mode: "0755"
+  become: true
+
+# ---------- Phase 4: Mythic core containers ----------
+- name: Probe running mythic containers
+  ansible.builtin.command: docker ps --format '{% raw %}{{.Names}}{% endraw %}'
+  register: docker_ps
+  changed_when: false
+  become: true
+
+- name: Start mythic core (mythic-cli start)
+  ansible.builtin.command:
+    cmd: /opt/mythic/mythic-cli start
+    chdir: /opt/mythic
+  become: true
+  when: docker_ps.stdout_lines | select('match', '^mythic_') | list | length < 3
+  register: mythic_start
+
+- name: Wait for mythic_server container to come up
+  ansible.builtin.shell: |
+    for i in $(seq 1 30); do
+      docker ps --format '{% raw %}{{.Names}}{% endraw %}' | grep -q mythic_server && exit 0
+      sleep 5
+    done
+    exit 1
+  args:
+    executable: /bin/bash
+  changed_when: false
+  become: true
+  when: mythic_start is changed
+
+# ---------- Phase 5: httpx C2 profile ----------
+- name: Probe whether httpx profile is installed
+  ansible.builtin.stat:
+    path: /opt/mythic/InstalledServices/httpx
+  register: httpx_dir
+  become: true
+
+- name: Install httpx C2 profile
+  ansible.builtin.command:
+    cmd: /opt/mythic/mythic-cli install github https://github.com/MythicC2Profiles/httpx
+    chdir: /opt/mythic
+  become: true
+  when: not httpx_dir.stat.exists
+
+# ---------- Phase 5b: extra payload types + C2 profiles ----------
+# Install the agents/C2 profiles listed in `mythic_extra_services`
+# (default set in roles/mythic/defaults/main.yml — apfell, apollo,
+# poseidon, http, websocket) so they show up in the Mythic UI's "Create
+# Payload" dropdown. Each install clones the repo + builds a Docker
+# image; budget 2-10 min per service the first time, near-instant after.
+#
+# Idempotency: skip if /opt/mythic/InstalledServices/<name> already
+# exists. mythic-cli writes that directory on a successful install and
+# leaves it in place even when the service is stopped.
+- name: Probe installed Mythic services
+  ansible.builtin.stat:
+    path: "/opt/mythic/InstalledServices/{{ item.name }}"
+  register: mythic_service_probe
+  loop: "{{ mythic_extra_services }}"
+  loop_control:
+    label: "{{ item.name }}"
+  become: true
+
+- name: Install extra payload types + C2 profiles via mythic-cli
+  ansible.builtin.command:
+    # `mythic-cli install github <url>` clones into InstalledServices/,
+    # appends the service to the dynamic compose, and brings it up.
+    # No --force flag: a re-run on an already-installed service would
+    # nuke the existing dir, so we gate on the stat probe above.
+    cmd: "/opt/mythic/mythic-cli install github {{ item.item.repo }}"
+    chdir: /opt/mythic
+  become: true
+  loop: "{{ mythic_service_probe.results }}"
+  loop_control:
+    label: "{{ item.item.name }}"
+  when: not item.stat.exists
+  register: mythic_extra_install
+  # `mythic-cli install` emits "[+] Successfully installed ..." on
+  # success. Treat any successful invocation as changed; failed ones
+  # fall through to the normal task failure path.
+  changed_when: "'successfully installed' in (mythic_extra_install.stdout | default('') | lower)"
+  # Each install can run a docker build; bump the async window to 30 min
+  # so slow agents (poseidon's Go cross-compile) don't trip the default
+  # SSH idle timeout. poll: 30 means ansible blocks but checks the
+  # async result every 30s rather than holding one long-running ssh.
+  async: 1800
+  poll: 30
+
+# ---------- Phase 5b-extra: pre-fill http C2 profile defaults ----------
+# Pre-populate the http C2 profile's default parameter values so that
+# operators clicking through Create Payload → Include http Profile see
+# the right callback_host/port/etc. pre-filled — no need to type the
+# AFD-fronted redirector URL manually every build.
+#
+# Implementation: update Mythic's Postgres c2profileparameters table
+# via the Hasura GraphQL admin API. The `default_value` column is
+# locked behind the admin secret (the operator-role permission set
+# doesn't allow `_set` on it), so we re-read the secret from the
+# mythic_graphql container env (same trick we use for the "promote
+# ian to admin" mutation earlier in this role).
+- name: Resolve Mythic http-profile callback host
+  ansible.builtin.set_fact:
+    # Precedence: explicit ansible extra-var > terraform inventory
+    # var > derived-from-host fallback. The fallback uses ansible_host
+    # which is the private IP — fine for local testing, won't be
+    # internet-reachable for actual beacons.
+    mythic_http_callback: >-
+      {{ mythic_payload_callback_host
+         | default(terra_mythic_callback_host
+         | default('https://' ~ (ansible_host | default('127.0.0.1')))) }}
+
+# Hasura's mutation requires the admin secret; rest of the role already
+# reads it later, but we need it earlier here.
+- name: Read Hasura admin secret (for http profile defaults update)
+  ansible.builtin.shell:
+    cmd: |
+      docker exec mythic_graphql env 2>/dev/null \
+        | grep ^HASURA_GRAPHQL_ADMIN_SECRET= \
+        | cut -d= -f2-
+  register: mythic_hasura_secret_early
+  changed_when: false
+  failed_when: false
+  become: true
+
+# The `http` profile and `httpx` profile have DIFFERENT parameter
+# schemas. They both back the same operator UX (HTTPS beacons) but the
+# Mythic guys reworked the field set when httpx came in:
+#
+#   http profile params   : callback_host, callback_port, callback_interval,
+#                            callback_jitter, get_uri, post_uri, ...
+#   httpx profile params  : callback_domains (JSON array),
+#                            raw_c2_config (TOML/JSON blob),
+#                            domain_rotation, failover_threshold,
+#                            callback_interval, callback_jitter,
+#                            encrypted_exchange_check, AESPSK, killdate
+#
+# Payloads built against httpx with an EMPTY raw_c2_config and the
+# placeholder callback_domains ([\"https://example.com:443\"]) fail with
+# the red "!" in the operator's "Recently Created Payloads" panel —
+# raw_c2_config is `required` per the profile schema. That's the
+# critical seed for httpx.
+#
+# We update both profiles in sequence so operators picking either one
+# in the payload-builder dropdown get a build that callbacks to our
+# AFD-fronted redirector instead of CHANGEME / example.com.
+
+- name: Update `http` profile defaults (legacy single-listener)
+  ansible.builtin.uri:
+    url: "https://127.0.0.1:{{ mythic_web_port }}/graphql/"
+    method: POST
+    headers:
+      X-Hasura-Admin-Secret: "{{ mythic_hasura_secret_early.stdout | trim }}"
+      Content-Type: application/json
+    body_format: json
+    body:
+      query: >
+        mutation {
+          update_c2profileparameters(
+            where: {
+              c2profile: { name: { _eq: "http" } },
+              name: { _eq: "{{ item.name }}" }
+            },
+            _set: { default_value: {{ item.value | to_json }} }
+          ) { affected_rows }
+        }
+    validate_certs: false
+    status_code: [200]
+    return_content: true
+  loop:
+    - { name: "callback_host",     value: "{{ mythic_http_callback }}" }
+    - { name: "callback_port",     value: "443" }
+    - { name: "callback_interval", value: "10" }
+    - { name: "callback_jitter",   value: "23" }
+    # get_uri / post_uri — the agent calls GET /<get_uri> and POST
+    # /<post_uri>, and the http C2 container serves exactly those paths.
+    # NO leading slash (Mythic prepends it). We use realistic API-style
+    # paths so the lab's C2 traffic blends into normal-looking requests
+    # for the blue-team detection exercise (rather than the obvious
+    # default "index"/"data" or an "endpoint" giveaway). AFD routes /*
+    # and the c2-redirector is a catch-all passthrough, so any path
+    # works end-to-end — get_uri/post_uri just have to be consistent
+    # between the built payload and the http container, which they are
+    # (both read this same DB param). Matches the /api/auth/* scheme
+    # used by the Adaptix + BRC4 listener configs in listeners.tf.
+    - { name: "get_uri",           value: "api/auth/session" }
+    - { name: "post_uri",          value: "api/auth/token" }
+  loop_control:
+    label: "{{ item.name }}={{ item.value }}"
+  register: mythic_http_default_updates
+  failed_when: false
+  when: (mythic_hasura_secret_early.stdout | default('') | trim) | length > 0
+
+# Minimal valid raw_c2_config for httpx, mirroring the upstream
+# "HTTP-DEFAULT" example from
+# https://github.com/MythicC2Profiles/httpx/blob/main/documentation-c2/httpx/examples/_index.md
+# Operators can override per-payload in the UI; this just gives them a
+# starting point that actually BUILDS. Beacon URIs use the same
+# realistic /api/auth/* scheme as the http profile + the Adaptix/BRC4
+# listener configs (see listeners.tf): GET polls /api/auth/session with
+# the message in a base64url query param `q`; POST submits to
+# /api/auth/token with the message in the body. httpx's raw_c2_config
+# is self-contained — the httpx container and the agent both read it,
+# so they always agree on the URIs. AFD routes /* and the c2-redirector
+# is a catch-all passthrough, so any path works end-to-end.
+- name: Compute httpx default raw_c2_config (TOML blob)
+  ansible.builtin.set_fact:
+    mythic_httpx_raw_c2_config: |
+      name = "default"
+
+      [get]
+      verb = "GET"
+      uris = ["/api/auth/session"]
+      [get.client.headers]
+      "User-Agent" = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+      [get.client.message]
+      location = "query"
+      name = "q"
+      [[get.client.transforms]]
+      action = "base64url"
+      [get.server.headers]
+      "Server" = "Server"
+
+      [post]
+      verb = "POST"
+      uris = ["/api/auth/token"]
+      [post.client.headers]
+      "User-Agent" = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+      [post.client.message]
+      location = "body"
+      [[post.client.transforms]]
+      action = "base64url"
+      [post.server.headers]
+      "Keep-Alive" = "true"
+
+- name: Update `httpx` profile defaults (5-instance multi-listener)
+  ansible.builtin.uri:
+    url: "https://127.0.0.1:{{ mythic_web_port }}/graphql/"
+    method: POST
+    headers:
+      X-Hasura-Admin-Secret: "{{ mythic_hasura_secret_early.stdout | trim }}"
+      Content-Type: application/json
+    body_format: json
+    body:
+      query: >
+        mutation {
+          update_c2profileparameters(
+            where: {
+              c2profile: { name: { _eq: "httpx" } },
+              name: { _eq: "{{ item.name }}" }
+            },
+            _set: { default_value: {{ item.value | to_json }} }
+          ) { affected_rows }
+        }
+    validate_certs: false
+    status_code: [200]
+    return_content: true
+  loop:
+    - name: "callback_domains"
+      # JSON-array-as-string (Mythic stores this as a string param whose
+      # contents are themselves a JSON array of callback URLs).
+      value: '["{{ mythic_http_callback }}:443"]'
+    - name: "raw_c2_config"
+      value: "{{ mythic_httpx_raw_c2_config }}"
+    - name: "callback_interval"
+      value: "10"
+    - name: "callback_jitter"
+      value: "23"
+    - name: "domain_rotation"
+      value: "fail-over"
+    - name: "failover_threshold"
+      value: "5"
+  loop_control:
+    label: "{{ item.name }}"
+  register: mythic_httpx_default_updates
+  failed_when: false
+  when: (mythic_hasura_secret_early.stdout | default('') | trim) | length > 0
+
+- name: Report — http C2 profile default-value updates
+  ansible.builtin.debug:
+    msg: "{{ ['---- http C2 profile defaults pre-filled ----',
+              'callback_host = ' ~ mythic_http_callback,
+              'callback_port = 443',
+              'callback_interval = 10',
+              'callback_jitter = 23',
+              '(Operator: click Create Payload → http profile → ' ~
+              'parameters are now pre-populated.)'] }}"
+  when: mythic_http_default_updates is defined and not mythic_http_default_updates is skipped
+
+# ---------- Phase 5c: httpx port-mapping override ----------
+# Modern Mythic uses a SINGLE root docker-compose.yml at /opt/mythic/
+# with httpx defined as one service inside it (no per-c2-profile compose
+# anymore). Drop a docker-compose.override.yml next to it that maps
+# the 5 CDN ports through to the httpx container.
+- name: Write /opt/mythic/docker-compose.override.yml (port mapping for httpx)
+  ansible.builtin.copy:
+    dest: /opt/mythic/docker-compose.override.yml
+    mode: "0644"
+    content: |
+      services:
+        httpx:
+          ports:
+            - "8443:8443"
+            - "8444:8444"
+            - "8445:8445"
+            - "8446:8446"
+            - "8447:8447"
+  become: true
+  register: override_written
+
+# The httpx C2 profile container reads `config.json` from its c2_code
+# volume on startup and spawns one listener per entry in `instances`.
+# The default config has a single instance on port 82 (HTTP, no SSL) —
+# that's what we saw bound when our overlay was missing. Replace it
+# with the 5-instance multi-CDN layout (ports 8443-8447, all on
+# 0.0.0.0, all HTTPS with a shared self-signed cert).
+- name: Seed httpx multi-instance config.json (5 listeners, ports 8443-8447)
+  ansible.builtin.copy:
+    dest: /opt/mythic/InstalledServices/httpx/httpx/c2_code/config.json
+    mode: "0644"
+    content: |
+      {
+        "instances": [
+          {"port": 8443, "bind_ip": "0.0.0.0", "use_ssl": true,
+           "key_path": "privkey.pem", "cert_path": "fullchain.pem",
+           "debug": false, "payloads": {}},
+          {"port": 8444, "bind_ip": "0.0.0.0", "use_ssl": true,
+           "key_path": "privkey.pem", "cert_path": "fullchain.pem",
+           "debug": false, "payloads": {}},
+          {"port": 8445, "bind_ip": "0.0.0.0", "use_ssl": true,
+           "key_path": "privkey.pem", "cert_path": "fullchain.pem",
+           "debug": false, "payloads": {}},
+          {"port": 8446, "bind_ip": "0.0.0.0", "use_ssl": true,
+           "key_path": "privkey.pem", "cert_path": "fullchain.pem",
+           "debug": false, "payloads": {}},
+          {"port": 8447, "bind_ip": "0.0.0.0", "use_ssl": true,
+           "key_path": "privkey.pem", "cert_path": "fullchain.pem",
+           "debug": false, "payloads": {}}
+        ]
+      }
+  become: true
+  register: httpx_config_written
+
+# Self-signed cert/key in the same c2_code dir, paths relative to it.
+# The redirector terminates real TLS to beacon clients; this cert is
+# only ever seen by nginx during its back-channel proxy_pass.
+- name: Ensure httpx self-signed cert exists
+  ansible.builtin.command:
+    cmd: >
+      openssl req -x509 -newkey rsa:2048 -nodes -days 825
+        -keyout /opt/mythic/InstalledServices/httpx/httpx/c2_code/privkey.pem
+        -out    /opt/mythic/InstalledServices/httpx/httpx/c2_code/fullchain.pem
+        -subj   "/CN=httpx.local"
+    creates: /opt/mythic/InstalledServices/httpx/httpx/c2_code/privkey.pem
+  become: true
+  register: cert_generated
+
+- name: Lock httpx privkey permissions
+  ansible.builtin.file:
+    path: /opt/mythic/InstalledServices/httpx/httpx/c2_code/privkey.pem
+    mode: "0600"
+  become: true
+
+# NOTE on (re)starting: mythic-cli's `start <container>` only loads
+# the BASE docker-compose.yml. It does NOT load docker-compose.override.yml,
+# so when we drop in a port-mapping override and `mythic-cli start` it,
+# the container comes back without our ports mapped. Calling
+# `docker compose -f <base> -f <override> up -d` directly fixes this.
+- name: Recreate httpx via docker-compose (applies override + new config.json)
+  # Fires when ANY of: docker-compose.override.yml is newly written,
+  # httpx config.json is newly written, or self-signed cert is newly
+  # generated. Force-recreate so the container actually picks up new
+  # files (docker compose up -d alone won't recreate if image+config
+  # hashes match).
+  ansible.builtin.command:
+    cmd: >
+      docker compose
+      -f /opt/mythic/docker-compose.yml
+      -f /opt/mythic/docker-compose.override.yml
+      up -d --force-recreate httpx
+    chdir: /opt/mythic
+  become: true
+  when: >
+    override_written is changed
+    or httpx_config_written is changed
+    or cert_generated is changed
+  register: httpx_recreate
+
+- name: Ensure httpx is running (idempotent — no-op if recreate already did it)
+  ansible.builtin.command:
+    cmd: >
+      docker compose
+      -f /opt/mythic/docker-compose.yml
+      -f /opt/mythic/docker-compose.override.yml
+      up -d httpx
+    chdir: /opt/mythic
+  become: true
+  when: httpx_recreate is skipped
+  register: httpx_start
+  changed_when: "'Started' in (httpx_start.stderr | default(''))
+                 or 'Creating' in (httpx_start.stderr | default(''))"
+
+# ---------- Phase 6: verify ports ----------
+- name: Verify Mythic web UI port {{ mythic_web_port }}
+  ansible.builtin.wait_for:
+    port: "{{ mythic_web_port }}"
+    host: 0.0.0.0
+    timeout: 60
+
+- name: Verify httpx listener ports
+  ansible.builtin.wait_for:
+    port: "{{ item }}"
+    host: 0.0.0.0
+    timeout: 60
+  loop: "{{ c2_listener_ports }}"
+
+# ---------- Phase 6b: extra operator "ian" via Mythic GraphQL ----------
+# Mythic exposes a `createOperator` Hasura Action at /graphql/. We
+# authenticate AS mythic_admin (reading the live password from
+# /opt/mythic/.env — that's the authoritative value), then POST the
+# mutation. createOperator enforces password length >= 12 chars;
+# terraform's random_password is 24 chars, so this is fine.
+# Idempotent: if the operator already exists, createOperator returns
+# status:"error" + error:"username already exists" — we ignore that.
+- name: Read mythic admin password from .env (for API auth)
+  ansible.builtin.shell:
+    cmd: |
+      grep ^MYTHIC_ADMIN_PASSWORD /opt/mythic/.env | cut -d= -f2 | tr -d '"'
+  register: mythic_admin_pw_raw
+  changed_when: false
+  become: true
+
+- name: Login to Mythic and get a JWT
+  ansible.builtin.uri:
+    url: "https://127.0.0.1:{{ mythic_web_port }}/auth"
+    method: POST
+    body_format: json
+    body:
+      username: mythic_admin
+      password: "{{ mythic_admin_pw_raw.stdout | trim }}"
+    validate_certs: false
+    status_code: [200]
+    return_content: true
+  register: mythic_login
+  when: terra_operator_ian_mythic_password | length > 0
+
+- name: Create operator "{{ terra_operator_ian_username }}" via createOperator
+  ansible.builtin.uri:
+    url: "https://127.0.0.1:{{ mythic_web_port }}/graphql/"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ mythic_login.json.access_token }}"
+      Content-Type: application/json
+    body_format: json
+    body:
+      query: "mutation { createOperator(input: {username: \"{{ terra_operator_ian_username }}\", password: \"{{ terra_operator_ian_mythic_password }}\"}) { status error } }"
+    validate_certs: false
+    status_code: [200]
+    return_content: true
+  register: mythic_create_op
+  failed_when: false   # idempotent: "username already exists" is fine
+  when:
+    - terra_operator_ian_mythic_password | length > 0
+    - mythic_login.json is defined
+    - mythic_login.json.access_token is defined
+
+# Mythic's createOperator action does NOT accept admin/active fields.
+# To make ian an admin we need a separate update_operator mutation, and
+# the `admin` column is locked behind Hasura's admin-secret (the `user`
+# role's _set permissions don't include `admin`). So we:
+#   1. Read HASURA_GRAPHQL_ADMIN_SECRET out of the mythic_graphql
+#      container's env (set by mythic-cli on first init).
+#   2. POST update_operator with X-Hasura-Admin-Secret instead of JWT.
+- name: Read Hasura admin secret from the mythic_graphql container
+  ansible.builtin.shell:
+    cmd: |
+      docker exec mythic_graphql env 2>/dev/null \
+        | grep ^HASURA_GRAPHQL_ADMIN_SECRET= \
+        | cut -d= -f2-
+  register: hasura_secret_raw
+  changed_when: false
+  failed_when: false
+  become: true
+
+- name: Promote "{{ terra_operator_ian_username }}" to admin
+  ansible.builtin.uri:
+    url: "https://127.0.0.1:{{ mythic_web_port }}/graphql/"
+    method: POST
+    headers:
+      X-Hasura-Admin-Secret: "{{ hasura_secret_raw.stdout | trim }}"
+      Content-Type: application/json
+    body_format: json
+    body:
+      query: "mutation { update_operator(where: {username: {_eq: \"{{ terra_operator_ian_username }}\"}}, _set: {admin: true, active: true}) { affected_rows returning { username admin active } } }"
+    validate_certs: false
+    status_code: [200]
+    return_content: true
+  register: mythic_promote_op
+  failed_when: false
+  when:
+    - (hasura_secret_raw.stdout | default('') | trim) | length > 0
+    - mythic_create_op is defined
+
+- name: Report — createOperator + promote result
+  ansible.builtin.debug:
+    msg:
+      - "createOperator: {{ (mythic_create_op.json.data.createOperator | default({})).status | default('skipped') }} / {{ (mythic_create_op.json.data.createOperator | default({})).error | default('') }}"
+      - "promote-admin: {{ (mythic_promote_op.json.data.update_operator | default({})).returning | default('(skipped)') }}"
+  when: mythic_create_op is defined
+
+# ---------- Phase 7: diagnostic dump ----------
+- name: Always dump quick diagnostics
+  block:
+    - name: Diagnostic marker
+      ansible.builtin.debug:
+        msg: "Emitting diagnostic dump (always-run)"
+      changed_when: false
+  always:
+    - name: Snapshot docker ps + ports
+      ansible.builtin.command: docker ps --format 'table {% raw %}{{.Names}}\t{{.Status}}\t{{.Ports}}{% endraw %}'
+      register: docker_ps_dump
+      changed_when: false
+      become: true
+    # Mythic's admin password lives in /opt/mythic/.env. mythic-cli
+    # generates that file on first init with a random password if it
+    # didn't already exist, which races our cloud-init's write. So
+    # `terraform output student_credentials` is sometimes WRONG —
+    # the truth is on the VM. Slurp it and parse out the two lines.
+    # (Previously used `shell:` with `set -o pipefail` + grep|cut|tr,
+    #  but that returned empty stdout under become — probably because
+    #  the default executable is /bin/sh, not /bin/bash. slurp is
+    #  module-native, no shell quoting/pipeline issues.)
+    - name: Slurp /opt/mythic/.env
+      ansible.builtin.slurp:
+        src: /opt/mythic/.env
+      register: mythic_env_b64
+      failed_when: false
+      become: true
+    - name: Extract MYTHIC_ADMIN_USER + MYTHIC_ADMIN_PASSWORD
+      ansible.builtin.set_fact:
+        mythic_admin_user: >-
+          {{ (mythic_env_b64.content | default('') | b64decode)
+             | regex_search('MYTHIC_ADMIN_USER="?([^"\n]+)"?', '\1', multiline=True)
+             | first | default('?') }}
+        mythic_admin_password_live: >-
+          {{ (mythic_env_b64.content | default('') | b64decode)
+             | regex_search('MYTHIC_ADMIN_PASSWORD="?([^"\n]+)"?', '\1', multiline=True)
+             | first | default('?') }}
+    - name: Report — Mythic LIVE credentials (these override terraform's student_credentials)
+      ansible.builtin.debug:
+        msg:
+          - "---- Mythic admin (the values that actually log in) ----"
+          - "URL  : https://{{ terra_private_ip | default('127.0.0.1') }}:{{ mythic_web_port }}"
+          - "user : {{ mythic_admin_user }}"
+          - "pass : {{ mythic_admin_password_live }}"
+          - ""
+          - "---- Extra operator 'ian' (admin, created by Ansible) ----"
+          - "user : {{ terra_operator_ian_username | default('ian') }}"
+          - "pass : {{ terra_operator_ian_mythic_password | default('(not set — terraform apply pending?)') }}"
+    - name: Report — docker ps
+      # List-form msg renders each entry on its own line in the default
+      # callback. Block-scalar `msg: |` would collapse into a single
+      # JSON-escaped string with literal "\n" — ugly to read.
+      ansible.builtin.debug:
+        msg: "{{ ['---- mythic docker ps ----'] +
+                 (docker_ps_dump.stdout_lines | default(['(empty)'])) }}"

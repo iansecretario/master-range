@@ -1,0 +1,20 @@
+---
+# terra-range — ansible collection dependencies.
+#
+# Installed on the from-guac controller by `./range repair` (see the
+# guac-side bootstrap step that does `ansible-galaxy collection
+# install -r requirements.yml`). The collections themselves are
+# pure-Python, so installing once on the guac VM is enough; the
+# operator's local laptop doesn't need them unless they're running
+# ansible directly (rare — the from-guac path is canonical).
+collections:
+  # Windows host management (WinRM-based). Adds win_copy, win_file,
+  # win_regedit, win_powershell, win_shell, etc. Required for the
+  # `windows-base` role + any future Windows configuration plays.
+  - name: ansible.windows
+    version: ">=2.0.0"
+  # Extra community modules for Windows (win_say, win_user_right,
+  # win_share, etc.). Not strictly required for the wallpaper, but
+  # cheap to add up-front so future Windows tasks have it available.
+  - name: community.windows
+    version: ">=2.0.0"

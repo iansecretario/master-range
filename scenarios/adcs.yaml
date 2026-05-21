@@ -1,0 +1,65 @@
+# Scenario: adcs
+# Purpose: Ludus-equivalent. See LUDUS-COVERAGE.md.
+# Cost   : ~$200-500/mo depending on student count
+# Mirrors: Ludus "ADCS" environment guide.
+# Source : https://docs.ludus.cloud/docs/environment-guides/adcs
+#
+# DC + a domain-joined member that runs the adcs.ps1 persona to install
+# Enterprise CA + intentionally vulnerable certificate templates
+# covering Certified Pre-Owned ESC1/ESC2 paths.
+#
+# Goal for students: enumerate ADCS via Certify/certipy, identify the
+# misconfigured templates, request a cert as a low-priv user, and use
+# it to authenticate as Domain Admin.
+
+range_name: adcs-lab
+provider: azure
+azure_region: eastus
+
+students:
+  count: 10
+  tenancy: shared
+  name_format: "a{n:02d}"
+
+lockdown: false
+guacamole_ingress_cidrs:
+  - "203.0.113.0/24"
+
+domain:
+  enabled: true
+  fqdn: corp.local
+  netbios: CORP
+  admin_user: rangeadmin
+  admin_password: "ADCS!Admin1"
+  safemode_password: "ADCS!SafeMode1"
+
+default_credentials:
+  windows_local_admin: rangeadmin
+  windows_local_password: "ADCS!Local1"
+  linux_user: ranger
+  linux_password: "ADCS!Linux1"
+
+machines:
+  - { name: dc01,   role: windows-dc,     os: windows-server-2022, size: medium, static_ip: "10" }
+  - { name: ca01,   role: windows-member, os: windows-server-2022, size: medium, domain_join: true, persona: adcs }
+  - { name: ws01,   role: windows-workstation, os: windows-11,     size: small,  domain_join: true }
+  - { name: kali01, role: attacker,       os: kali,                size: medium }
+
+services:
+  guacamole:
+    enabled: true
+    admin_user: guacadmin
+    admin_password: "ADCS!Guac1"
+    autoregister: true
+    student_user_prefix: a-
+    student_password_template: "ADCS!{n:02d}"
+  elk:
+    enabled: false
+    kibana_user: elastic
+    kibana_password: "unused"
+    deploy_agents: false
+  adaptix:
+    enabled: false
+    ssh_pubkey: ""
+  redirector:
+    enabled: false

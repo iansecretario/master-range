@@ -1,0 +1,79 @@
+# Scenario: engagement
+# Purpose: 5-operator red-team engagement. Each operator gets their own
+#          stack with AFD-fronted C2 chain at op<NN>.enterprisestudio.com.
+# Cost   : ~$800/mo (AFD Standard + 5 stacks + shared hub)
+# Boxes  : 35 per-operator + 2 shared
+#
+# Prereqs:
+#   - Azure DNS zone for enterprisestudio.com exists in RG "dns-rg"
+#   - Registrar nameservers point at the Azure DNS NS records
+#   - Marketplace terms accepted (kali, win10, win11)
+#       az vm image terms accept --urn kali-linux:kali:kali-2024-4:latest
+#       az vm image terms accept --urn microsoftwindowsdesktop:windows-11:win11-23h2-pro:latest
+
+range_name: redteam-eng-acme
+provider: azure
+azure_region: westus2
+
+students:
+  count: 5
+  tenancy: shared
+  name_format: "op{n:02d}"
+
+lockdown: false
+guacamole_ingress_cidrs:
+  - "203.0.113.10/32"             # red-team VPN egress
+
+domain:
+  enabled: true
+  fqdn: corp.local
+  netbios: CORP
+  admin_user: rangeadmin
+  admin_password: "Engagement!Admin1"
+  safemode_password: "Engagement!SafeMode"
+
+default_credentials:
+  windows_local_admin: rangeadmin
+  windows_local_password: "Engagement!Local"
+  linux_user: operator
+  linux_password: "Engagement!Linux"
+
+machines:
+  - { name: dc01,    role: windows-dc,          os: windows-server-2022, size: medium, static_ip: "10" }
+  - { name: srv01,   role: windows-member,      os: windows-server-2022, size: small,  domain_join: true }
+  - { name: ws01,    role: windows-workstation, os: windows-11,          size: small,  domain_join: true }
+  - { name: linux01, role: linux-target,        os: ubuntu-22,           size: small }
+  - { name: kali01,  role: attacker,            os: kali,                size: medium }
+  - { name: c2,      role: c2-server,           os: debian-12,           size: medium }
+  - { name: redir,   role: c2-redirector, fronts: c2-server,       os: debian-12,           size: small }
+
+shared_infrastructure:
+  - { name: ghostwriter, role: ghostwriter, os: debian-12, size: medium }
+  - { name: redelk,      role: redelk,      os: debian-12, size: large }
+
+advanced_c2:
+  enabled: true
+  domain: enterprisestudio.com
+  dns_zone_resource_group: dns-rg
+  cover_url: "https://www.microsoft.com"
+  fdid_header_required: true
+  student_subdomain_format: "{sid}"   # op01.enterprisestudio.com, op02..., op05...
+
+services:
+  guacamole:
+    enabled: true
+    admin_user: guacadmin
+    admin_password: "Engagement!Guac"
+    autoregister: true
+    student_user_prefix: operator-
+    student_password_template: "Op!{n:02d}!Strong"
+  elk:
+    enabled: true
+    kibana_user: elastic
+    kibana_password: "Engagement!Elastic"
+    deploy_agents: true
+  adaptix:
+    enabled: true
+    ssh_pubkey: "ssh-ed25519 AAAA... lead@redteam"
+  redirector:
+    enabled: true

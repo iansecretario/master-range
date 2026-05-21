@@ -1,0 +1,67 @@
+---
+# =============================================================================
+# RedELK role — overridable defaults
+# =============================================================================
+# RedELK is Outflank's red-team telemetry / SIEM distribution
+# (https://github.com/outflanknl/RedELK). It's a docker-compose stack
+# (Elasticsearch + Logstash + Kibana + nginx + custom RedELK images)
+# that ingests logs from C2 teamservers, redirectors, and beacons via
+# filebeat over port 5044.
+#
+# For the lab the operator hits Kibana directly on port 5601 (via
+# Guacamole or Kali browser); RedELK's nginx-on-443 layer is bypassed
+# because we don't have public DNS / LE certs inside the range.
+
+# ---------- Credentials ----------
+# RedELK's installer normally GENERATES random passwords for every ES
+# user (kibana_system, logstash_system, redelk_ingest, redelk, elastic)
+# and writes them to elkserver/redelk_passwords.cfg. For a lab where
+# every student gets the same range, we want a known, operator-supplied
+# password so the demo/grading script can log in deterministically.
+#
+# Override these via vault or extra-vars at deploy time:
+#   ansible-playbook ... -e vault_redelk_admin_password=...
+#                        -e vault_redelk_es_password=...
+redelk_admin_user: redelkadmin
+redelk_admin_password: "{{ vault_redelk_admin_password | default('CWRLab2026!') }}"
+redelk_es_password:    "{{ vault_redelk_es_password    | default('changeme-es-cwr-2026') }}"
+
+# ---------- Networking / ports ----------
+# Kibana — operator UI. Lab links point at http://<redelk-ip>:5601/.
+# RedELK's docker-compose maps it on the host already; we just wait
+# for it to come up.
+redelk_kibana_port: 5601
+# Elasticsearch — internal API. NOT typically exposed publicly; we
+# only use it for the role's health probe.
+redelk_es_port: 9200
+# Logstash beats input — filebeat from C2 teamservers and redirectors
+# ships to this port (see modules/azure/hub.tf NSG `from-range-logs`).
+redelk_logstash_beats_port: 5044
+
+# ---------- Install paths ----------
+redelk_install_dir: /opt/redelk
+redelk_elkserver_dir: /opt/redelk/elkserver
+
+# ---------- Compose profile ----------
+# RedELK ships three profiles:
+#   full     — ES + Kibana + Logstash + nginx + BloodHound + Neo4j + Jupyter
+#   limited  — ES + Kibana + Logstash + nginx only (lab-appropriate)
+#   dev      — development; not for deploys
+# `limited` cuts memory ~50% and startup time ~40%, which is what we
+# want for a single-VM lab. Override to `full` if a scenario needs
+# BloodHound/Jupyter in the stack.
+redelk_profile: limited
+
+# ---------- Memory tuning ----------
+# install-elkserver.sh refuses to run on < 8 GB RAM unless `fixedmemory`
+# is passed. Our shared VM SKU is comfortably above that, but pass the
+# flag anyway so a smaller dev SKU doesn't surprise-fail.
+redelk_pass_fixedmemory: true
+
+# ---------- External domain (for the nginx fronting layer) ----------
+# RedELK normally needs an external DNS name + LE certs for its nginx
+# (Jupyter, BloodHound proxying). For the lab we operate purely on
+# internal IPs and let the installer fall back to self-signed certs.
+# Leave empty to skip LE configuration.
+redelk_external_domain: ""
+redelk_le_email: ""

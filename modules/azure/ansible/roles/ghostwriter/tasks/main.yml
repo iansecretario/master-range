@@ -1,0 +1,560 @@
+---
+# =============================================================================
+# Ghostwriter reporting + oplog ingestion server
+# =============================================================================
+# Idempotent role for the Ghostwriter VM. Same shape as the Mythic role:
+# probe baked markers → heavy install only if missing → ensure stack is
+# up → seed operator account + API token.
+#
+# The user's oplog pipeline initiative depends on the API token output
+# at the end of this role — that's the single highest-value artifact.
+#
+# Stack layout (after install):
+#   - django           : Ghostwriter Django app
+#   - postgres         : Database
+#   - nginx            : TLS termination + reverse proxy (port 443)
+#   - graphql_engine   : Hasura GraphQL API
+#   - redis            : Cache / queue
+#   - queue            : Django-Q worker (shares django image)
+#   - collab-server    : Real-time report editing (websockets)
+#
+# All container images are LOCALLY BUILT (no upstream registry pulls
+# except base FROMs). The bake handles the build; deploy-time `install`
+# just renders .env + brings the stack up.
+
+# ----- vars (set early so they're available everywhere) -------------------
+- name: Locate ghostwriter-cli binary
+  ansible.builtin.set_fact:
+    # Ghostwriter ships both names depending on cwd / how it was
+    # downloaded; the Linux build is `ghostwriter-cli-linux`, but some
+    # older docs reference `ghostwriter-cli`. Prefer the canonical name
+    # and fall back. We resolve once and use the resolved path everywhere.
+    ghostwriter_cli: /opt/ghostwriter/ghostwriter-cli-linux
+
+- name: Probe ghostwriter-cli (canonical name)
+  ansible.builtin.stat:
+    path: "{{ ghostwriter_cli }}"
+  register: gw_cli_canonical
+  become: true
+
+- name: Fall back to bare ghostwriter-cli if -linux missing
+  ansible.builtin.set_fact:
+    ghostwriter_cli: /opt/ghostwriter/ghostwriter-cli
+  when: not gw_cli_canonical.stat.exists
+
+# ---------- Phase 0: detect baked-image state ----------
+- name: Probe for /opt/ghostwriter/.baked
+  ansible.builtin.stat:
+    path: /opt/ghostwriter/.baked
+  register: ghostwriter_baked
+
+- name: Probe for /opt/ghostwriter/.deployed (install already ran)
+  ansible.builtin.stat:
+    path: /opt/ghostwriter/.deployed
+  register: ghostwriter_deployed
+
+- name: Report bake/deploy state
+  ansible.builtin.debug:
+    msg:
+      - "baked    = {{ ghostwriter_baked.stat.exists }}"
+      - "deployed = {{ ghostwriter_deployed.stat.exists }}"
+
+# ---------- Phase 1: docker (skip if baked) ----------
+- name: Probe for docker
+  ansible.builtin.command: docker --version
+  register: docker_probe
+  changed_when: false
+  failed_when: false
+
+- name: Install Docker Engine via get.docker.com
+  block:
+    - name: Download docker install script
+      ansible.builtin.get_url:
+        url: https://get.docker.com
+        dest: /tmp/get-docker.sh
+        mode: "0755"
+        timeout: 120
+    - name: Run docker install script
+      ansible.builtin.command: sh /tmp/get-docker.sh
+      register: docker_install
+      changed_when: "'already the newest version' not in (docker_install.stdout | default(''))"
+    - name: Ensure docker-compose-plugin
+      ansible.builtin.apt:
+        name: docker-compose-plugin
+        state: present
+    - name: Enable docker.service
+      ansible.builtin.systemd:
+        name: docker
+        enabled: true
+        state: started
+  become: true
+  when: docker_probe.rc != 0
+
+# ---------- Phase 2: Ghostwriter source tree (skip if baked) ----------
+- name: Clone Ghostwriter if missing
+  ansible.builtin.git:
+    repo: https://github.com/GhostManager/Ghostwriter.git
+    dest: /opt/ghostwriter
+    update: false
+    depth: 1
+  become: true
+  when: not ghostwriter_baked.stat.exists
+
+- name: Ensure ghostwriter-cli is executable
+  ansible.builtin.file:
+    path: "{{ ghostwriter_cli }}"
+    mode: "0755"
+  become: true
+
+# Re-resolve cli location after a possible fresh clone (the file may
+# only exist after the clone task above).
+- name: Re-probe ghostwriter-cli binary after potential clone
+  ansible.builtin.stat:
+    path: /opt/ghostwriter/ghostwriter-cli-linux
+  register: gw_cli_recheck
+  become: true
+
+- name: Re-set ghostwriter_cli path post-clone
+  ansible.builtin.set_fact:
+    ghostwriter_cli: "{{ '/opt/ghostwriter/ghostwriter-cli-linux' if gw_cli_recheck.stat.exists else '/opt/ghostwriter/ghostwriter-cli' }}"
+
+# ---------- Phase 3: run install (idempotent via .deployed marker) ----------
+# `ghostwriter-cli-linux install`:
+#   - generates .env (auto-random secrets for DJANGO_SECRET_KEY,
+#     POSTGRES_PASSWORD, HASURA_GRAPHQL_ADMIN_SECRET,
+#     DJANGO_SUPERUSER_PASSWORD, etc.)
+#   - generates self-signed TLS certs for nginx
+#   - runs `docker compose -f production.yml up -d`
+#   - prints the admin password to stdout (we capture via `config get`)
+#
+# It is NOT documented to have a --no-input flag — but it is non-interactive
+# by default. The docs explicitly show install printing "[+] You can log
+# in as `admin` with this password: <Password>". Safe to run unattended.
+- name: Run ghostwriter-cli install (generates .env + brings stack up)
+  ansible.builtin.command:
+    cmd: "{{ ghostwriter_cli }} install"
+    chdir: /opt/ghostwriter
+  become: true
+  register: gw_install
+  # Don't crash the play on install warnings; we re-verify with a
+  # docker-ps probe below.
+  failed_when: false
+  changed_when: "'is ready to go' in (gw_install.stdout | default(''))
+                 or 'Generating' in (gw_install.stdout | default(''))"
+  # Async + poll keeps the SSH connection alive on slow first-boot
+  # installs (unbaked images can take 15+ min for the django build).
+  async: "{{ ghostwriter_install_timeout }}"
+  poll: 30
+  when: not ghostwriter_deployed.stat.exists
+
+- name: Capture install stdout (first/last 20 lines) for diagnostics
+  ansible.builtin.debug:
+    msg: "{{ ['---- ghostwriter-cli install (head) ----']
+             + ((gw_install.stdout | default('')).splitlines() | list)[:20]
+             + ['---- ghostwriter-cli install (tail) ----']
+             + ((gw_install.stdout | default('')).splitlines() | list)[-20:] }}"
+  when: gw_install is defined and gw_install.stdout is defined
+
+# ---------- Phase 4: patch .env with operator-supplied values ----------
+# After install, push our preferred values for:
+#   - DJANGO_ALLOWED_HOSTS (avoid "Bad Request (400)" on the VM IP)
+#   - HASURA_GRAPHQL_ADMIN_SECRET (fixed so the oplog pipeline can
+#     hold a stable secret instead of scraping .env every redeploy)
+#
+# `ghostwriter-cli config set` is the supported API; it also runs the
+# right post-write validation. The CLI also provides `config allowhost`
+# specifically for DJANGO_ALLOWED_HOSTS entries — use it for clarity.
+- name: Resolve effective allowed_hosts list (private IP + defaults + extras)
+  ansible.builtin.set_fact:
+    ghostwriter_allowed_hosts_effective: >-
+      {{ (['localhost', '127.0.0.1', 'django', 'nginx',
+           'host.docker.internal', 'ghostwriter.local',
+           (terra_private_ip | default('127.0.0.1')),
+           ansible_default_ipv4.address | default('127.0.0.1')]
+          + ghostwriter_extra_allowed_hosts) | unique }}
+
+- name: Push DJANGO_ALLOWED_HOSTS via ghostwriter-cli (space-joined)
+  ansible.builtin.command:
+    cmd: "{{ ghostwriter_cli }} config set DJANGO_ALLOWED_HOSTS '{{ ghostwriter_allowed_hosts_effective | join(' ') }}'"
+    chdir: /opt/ghostwriter
+  become: true
+  register: gw_set_hosts
+  changed_when: true
+  failed_when: false
+
+- name: Push HASURA_GRAPHQL_ADMIN_SECRET to operator-supplied value
+  ansible.builtin.command:
+    cmd: "{{ ghostwriter_cli }} config set HASURA_GRAPHQL_ADMIN_SECRET '{{ ghostwriter_hasura_admin_secret }}'"
+    chdir: /opt/ghostwriter
+  become: true
+  register: gw_set_hasura
+  changed_when: true
+  failed_when: false
+  when: ghostwriter_hasura_admin_secret | length > 0
+
+# `config set` rewrites .env but does NOT cycle the containers; values
+# don't take effect until containers are re-created. The supported
+# pattern is `containers down` → `containers up`.
+- name: Cycle Ghostwriter containers to apply .env changes
+  ansible.builtin.command:
+    cmd: "{{ ghostwriter_cli }} {{ item }}"
+    chdir: /opt/ghostwriter
+  become: true
+  loop:
+    - containers down
+    - containers up
+  when: (gw_set_hosts is changed) or (gw_set_hasura is changed)
+  register: gw_cycle
+  changed_when: true
+  failed_when: false
+
+# ---------- Phase 5: ensure stack is running ----------
+- name: Probe running ghostwriter containers
+  ansible.builtin.command: docker ps --format '{% raw %}{{.Names}}{% endraw %}'
+  register: docker_ps
+  changed_when: false
+  become: true
+
+# If nothing is up (e.g. operator manually `containers stop`-d, or
+# a reboot dropped the stack), bring it back. The `install` step
+# already brought it up on first deploy; this is the "we've been
+# rebooted" idempotent path.
+- name: Ensure Ghostwriter containers are up
+  ansible.builtin.command:
+    cmd: "{{ ghostwriter_cli }} containers up"
+    chdir: /opt/ghostwriter
+  become: true
+  register: gw_ensure_up
+  changed_when: true
+  failed_when: false
+  when: docker_ps.stdout_lines | select('match', '^ghostwriter_') | list | length < 3
+
+# ---------- Phase 6: wait for nginx :443 ----------
+# nginx is the public TLS endpoint. Django startup + migrations + the
+# spaCy model load can take a couple minutes on first boot.
+- name: Wait for Ghostwriter nginx on port {{ ghostwriter_listen_port }}
+  ansible.builtin.wait_for:
+    port: "{{ ghostwriter_listen_port }}"
+    host: 0.0.0.0
+    timeout: "{{ ghostwriter_nginx_wait_timeout }}"
+
+# Belt-and-suspenders: hit /status/simple/ (the same path the django
+# healthcheck uses) to confirm the app is serving, not just nginx
+# returning a 502 backend-down.
+- name: Verify Django app responds (waits for migrations + qcluster)
+  ansible.builtin.uri:
+    url: "https://127.0.0.1:{{ ghostwriter_listen_port }}/status/simple/"
+    method: GET
+    validate_certs: false
+    status_code: [200, 301, 302, 401, 403, 404]
+    return_content: false
+  register: gw_health
+  retries: 30
+  delay: 10
+  until: gw_health.status is defined and gw_health.status < 500
+  failed_when: false
+
+# ---------- Phase 7: rotate admin password to operator-supplied value ----
+# Ghostwriter generates a random admin password during install. We need
+# a KNOWN password to (a) put in student_credentials output and (b)
+# authenticate the GraphQL `login` mutation for token minting.
+#
+# Two viable paths:
+#   A. `manage.py changepassword` inside the django container
+#   B. Django `User.objects.filter(...).update(password=make_password(...))`
+#      via `manage.py shell -c`
+#
+# Path B is non-interactive (changepassword wants a TTY in some Django
+# versions); we go with that.
+- name: Rotate Ghostwriter admin password to operator value
+  ansible.builtin.command:
+    argv:
+      - docker
+      - compose
+      - -f
+      - /opt/ghostwriter/production.yml
+      - exec
+      - -T
+      - django
+      - python
+      - manage.py
+      - shell
+      - -c
+      - |
+        from django.contrib.auth import get_user_model
+        from django.contrib.auth.hashers import make_password
+        U = get_user_model()
+        u, created = U.objects.get_or_create(username="{{ ghostwriter_admin_user }}", defaults={"is_superuser": True, "is_staff": True, "is_active": True})
+        u.password = make_password("{{ ghostwriter_admin_password }}")
+        u.is_superuser = True
+        u.is_staff = True
+        u.is_active = True
+        u.save()
+        print("OK admin user", u.username, "created=" + str(created))
+  become: true
+  register: gw_admin_rotate
+  changed_when: "'OK admin user' in (gw_admin_rotate.stdout | default(''))"
+  failed_when: false
+
+- name: Report — admin password rotation
+  ansible.builtin.debug:
+    msg: "{{ gw_admin_rotate.stdout_lines | default(['(skipped or failed — see install log)']) }}"
+
+# ---------- Phase 8: create the oplog ingestion user --------------------
+# Dedicated non-admin user the pipeline authenticates as. Limited blast
+# radius if the token leaks. Created via the same manage.py shell idiom.
+- name: Create dedicated oplog-pipeline user
+  ansible.builtin.command:
+    argv:
+      - docker
+      - compose
+      - -f
+      - /opt/ghostwriter/production.yml
+      - exec
+      - -T
+      - django
+      - python
+      - manage.py
+      - shell
+      - -c
+      - |
+        from django.contrib.auth import get_user_model
+        from django.contrib.auth.hashers import make_password
+        U = get_user_model()
+        u, created = U.objects.get_or_create(username="{{ ghostwriter_oplog_api_user }}", defaults={"is_staff": False, "is_active": True})
+        u.password = make_password("{{ ghostwriter_oplog_api_password }}")
+        u.is_active = True
+        u.save()
+        print("OK oplog user", u.username, "created=" + str(created))
+  become: true
+  register: gw_oplog_user
+  changed_when: "'OK oplog user' in (gw_oplog_user.stdout | default(''))"
+  failed_when: false
+
+# ---------- Phase 9: mint an API token via the GraphQL `login` mutation -
+# This is the HIGHEST-VALUE OUTPUT of the role — without this, the
+# oplog pipeline can't talk to Ghostwriter.
+#
+# Approach (per Ghostwriter docs):
+#   POST /v1/graphql with:
+#     mutation Login {
+#       login(username: "<user>", password: "<pass>") {
+#         token expires
+#       }
+#     }
+#   Returns a 15-MINUTE JWT. For long-lived tokens the docs require the
+#   web UI's "API Tokens" panel (no documented programmatic path).
+#
+# For oplog ingestion this is fine: the pipeline can re-mint a JWT
+# whenever it starts a batch (it has the user/pass anyway, since
+# whatever orchestrates the pipeline reads /opt/ghostwriter/.oplog-creds).
+# If we ever want long-lived, we'll need to either reverse-engineer the
+# Django REST endpoint the web UI calls, or insert a row directly into
+# the api_token table — that's TODO.
+#
+# We capture the JWT here so terraform can output it for the immediate
+# post-deploy sanity-check. The pipeline will refresh on its own.
+- name: Mint a short-lived JWT via GraphQL `login` mutation
+  ansible.builtin.uri:
+    url: "https://127.0.0.1:{{ ghostwriter_listen_port }}/v1/graphql"
+    method: POST
+    headers:
+      Content-Type: application/json
+    body_format: json
+    body:
+      query: |
+        mutation Login($u: String!, $p: String!) {
+          login(username: $u, password: $p) { token expires }
+        }
+      variables:
+        u: "{{ ghostwriter_oplog_api_user }}"
+        p: "{{ ghostwriter_oplog_api_password }}"
+    validate_certs: false
+    status_code: [200]
+    return_content: true
+  register: gw_login_resp
+  failed_when: false
+  retries: 5
+  delay: 5
+  # `until`: the mutation can return errors during the first minute after
+  # the user is created (django session table sync lag). Retry until we
+  # actually see a token.
+  #
+  # Plain `and` chain (not inline-if-else). Jinja2's inline `X if Y else Z`
+  # doesn't allow it as the right-hand operand of another `and` without
+  # surrounding-expression context — the previous version raised
+  # "template error: expected token ')', got 'gw_login_resp'" because the
+  # parser couldn't tell where the inner expression ended. Short-circuit
+  # evaluation makes the chain safe: if `.json` is undefined, the `and`
+  # stops before dereferencing `.data`, and so on down the path.
+  until: >
+    gw_login_resp.json is defined
+    and gw_login_resp.json.data is defined
+    and gw_login_resp.json.data.login is defined
+    and gw_login_resp.json.data.login.token is defined
+
+- name: Extract token from GraphQL response
+  ansible.builtin.set_fact:
+    ghostwriter_api_token: "{{ (gw_login_resp.json.data.login.token) | default('') }}"
+    ghostwriter_api_token_expires: "{{ (gw_login_resp.json.data.login.expires) | default('') }}"
+  when:
+    - gw_login_resp.json is defined
+    - gw_login_resp.json.data is defined
+    - gw_login_resp.json.data.login is defined
+    - gw_login_resp.json.data.login.token is defined
+
+# Persist the token (and the creds the pipeline needs to re-mint) so
+# downstream tooling can pick them up. .api-token holds JUST the bearer
+# string for trivial `curl -H "Authorization: Bearer $(cat .api-token)"`
+# use; .oplog-creds holds the creds for re-minting.
+- name: Persist API token to /opt/ghostwriter/.api-token
+  ansible.builtin.copy:
+    dest: /opt/ghostwriter/.api-token
+    # mode 0600 so the token can't be read by any user that lands on the
+    # box. The pipeline service account will run as root or have an
+    # explicit chown applied at provision time.
+    mode: "0600"
+    content: "{{ ghostwriter_api_token }}\n"
+  become: true
+  when: ghostwriter_api_token is defined and ghostwriter_api_token | length > 0
+
+- name: Persist oplog re-mint creds to /opt/ghostwriter/.oplog-creds
+  ansible.builtin.copy:
+    dest: /opt/ghostwriter/.oplog-creds
+    mode: "0600"
+    content: |
+      # Generated by ansible role `ghostwriter` — used by the oplog
+      # pipeline to re-mint short-lived JWTs (15 min TTL) against the
+      # Ghostwriter GraphQL endpoint. Do NOT commit these values.
+      GHOSTWRITER_URL=https://127.0.0.1:{{ ghostwriter_listen_port }}
+      GHOSTWRITER_GRAPHQL=https://127.0.0.1:{{ ghostwriter_listen_port }}/v1/graphql
+      GHOSTWRITER_OPLOG_USER={{ ghostwriter_oplog_api_user }}
+      GHOSTWRITER_OPLOG_PASS={{ ghostwriter_oplog_api_password }}
+      GHOSTWRITER_HASURA_ADMIN_SECRET={{ ghostwriter_hasura_admin_secret }}
+  become: true
+
+# ---------- Phase 10: systemd unit for restart-on-reboot ----------------
+# `restart: unless-stopped` is set on each compose service, BUT only
+# the docker daemon respects it; if docker itself doesn't start before
+# the host needs the stack, the timing can leave Ghostwriter down.
+# Drop a tiny oneshot unit that runs `containers up` after docker.service
+# is ready, guaranteeing the stack is up after every reboot.
+- name: Drop systemd unit for Ghostwriter auto-start
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/ghostwriter.service
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Ghostwriter reporting + oplog stack
+      Requires=docker.service
+      After=docker.service network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=true
+      WorkingDirectory=/opt/ghostwriter
+      ExecStart={{ ghostwriter_cli }} containers up
+      ExecStop={{ ghostwriter_cli }} containers down
+      TimeoutStartSec=600
+      TimeoutStopSec=300
+
+      [Install]
+      WantedBy=multi-user.target
+  become: true
+  register: gw_systemd_unit
+
+- name: Reload + enable ghostwriter.service
+  ansible.builtin.systemd:
+    name: ghostwriter.service
+    enabled: true
+    daemon_reload: true
+  become: true
+  when: gw_systemd_unit is changed
+
+# ---------- Phase 11: deployed sentinel ---------------------------------
+# Idempotency marker — next ansible run sees this and skips the
+# `ghostwriter-cli install` step. .baked alone isn't enough because the
+# bake doesn't run install (it only builds images); deployment-state
+# tracking is separate.
+- name: Write /opt/ghostwriter/.deployed sentinel
+  ansible.builtin.copy:
+    dest: /opt/ghostwriter/.deployed
+    mode: "0644"
+    content: |
+      deployed_at={{ ansible_date_time.iso8601 | default('unknown') }}
+      admin_user={{ ghostwriter_admin_user }}
+      oplog_user={{ ghostwriter_oplog_api_user }}
+      hasura_secret_set={{ ghostwriter_hasura_admin_secret | length > 0 }}
+      api_token_minted={{ ghostwriter_api_token is defined and (ghostwriter_api_token | length > 0) }}
+  become: true
+
+# ---------- Phase 12: diagnostic dump ----------------------------------
+- name: Always dump diagnostics + credentials
+  block:
+    - name: Diagnostic marker
+      ansible.builtin.debug:
+        msg: "Emitting Ghostwriter diagnostic dump (always-run)"
+      changed_when: false
+  always:
+    - name: Snapshot docker ps
+      ansible.builtin.command: docker ps --format 'table {% raw %}{{.Names}}\t{{.Status}}\t{{.Ports}}{% endraw %}'
+      register: gw_docker_ps
+      changed_when: false
+      become: true
+
+    # Slurp .env (the live truth — ghostwriter-cli rewrites it on every
+    # `config set`). Parse out the admin password (in case it differs
+    # from what we set), and the hasura secret.
+    - name: Slurp /opt/ghostwriter/.env
+      ansible.builtin.slurp:
+        src: /opt/ghostwriter/.env
+      register: gw_env_b64
+      failed_when: false
+      become: true
+
+    - name: Extract live admin password + hasura secret from .env
+      # Same pattern shape as the mythic role's .env scrape — only
+      # double-quote-or-bare handling, since ghostwriter-cli only
+      # double-quotes (or leaves bare) when writing values via
+      # `config set`. Single quotes don't appear in .env in practice.
+      ansible.builtin.set_fact:
+        gw_admin_password_live: >-
+          {{ (gw_env_b64.content | default('') | b64decode)
+             | regex_search('DJANGO_SUPERUSER_PASSWORD="?([^"\n]+)"?', '\1', multiline=True)
+             | first | default('?') }}
+        gw_hasura_secret_live: >-
+          {{ (gw_env_b64.content | default('') | b64decode)
+             | regex_search('HASURA_GRAPHQL_ADMIN_SECRET="?([^"\n]+)"?', '\1', multiline=True)
+             | first | default('?') }}
+      when: gw_env_b64.content is defined
+
+    - name: Report — Ghostwriter LIVE credentials + endpoints
+      ansible.builtin.debug:
+        msg:
+          - "---- Ghostwriter (the values that actually log in) ----"
+          - "URL          : https://{{ terra_private_ip | default('127.0.0.1') }}/"
+          - "admin user   : {{ ghostwriter_admin_user }}"
+          - "admin pass   : {{ ghostwriter_admin_password }}"
+          - "live env pass: {{ gw_admin_password_live | default('(unread)') }}"
+          - ""
+          - "---- Hasura admin secret ----"
+          - "X-Hasura-Admin-Secret: {{ gw_hasura_secret_live | default(ghostwriter_hasura_admin_secret) }}"
+          - ""
+          - "---- Oplog pipeline API user ----"
+          - "user : {{ ghostwriter_oplog_api_user }}"
+          - "pass : {{ ghostwriter_oplog_api_password }}"
+          - "token (15-min JWT, also at /opt/ghostwriter/.api-token):"
+          - "  {{ ghostwriter_api_token | default('(not minted — see login response above)') }}"
+          - "  expires: {{ ghostwriter_api_token_expires | default('?') }}"
+          - ""
+          - "---- Files on the VM ----"
+          - "/opt/ghostwriter/.env         — live config (CLI rewrites)"
+          - "/opt/ghostwriter/.api-token   — bearer JWT (mode 0600)"
+          - "/opt/ghostwriter/.oplog-creds — re-mint creds (mode 0600)"
+          - "/opt/ghostwriter/.deployed    — idempotency sentinel"
+
+    - name: Report — docker ps
+      ansible.builtin.debug:
+        msg: "{{ ['---- ghostwriter docker ps ----'] +
+                 (gw_docker_ps.stdout_lines | default(['(empty)'])) }}"

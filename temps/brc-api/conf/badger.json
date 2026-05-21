@@ -1,0 +1,23 @@
+{
+    "b-0": {
+        "b_arch": "x64",
+        "b_bld": "22621",
+        "b_c2": "https://172.16.219.1:443",
+        "b_c2_id": "primary-c2",
+        "b_cookie": "H6TT5D86",
+        "b_h_name": "DESKTOP-NAME",
+        "b_ip": "192.16.219.182",
+        "b_l_ip": "172.16.219.1",
+        "b_p_name": "C:\\test\\loader\\badger.exe",
+        "b_pid": "12024",
+        "b_seen": "05-05-2025 13:23:21",
+        "b_tid": "5960",
+        "b_type": "full",
+        "b_uid": "vendetta",
+        "b_wver": "x64/10.0",
+        "dead": false,
+        "is_pvt": false,
+        "pipeline": "Direct",
+        "pvt_master": ""
+    }
+}

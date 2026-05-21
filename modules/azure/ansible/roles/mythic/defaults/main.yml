@@ -1,0 +1,36 @@
+---
+# =============================================================================
+# Mythic role — overridable defaults
+# =============================================================================
+
+# Payload types (agents) and C2 profiles installed via `mythic-cli install
+# github <repo>` after the Mythic core is up. Each entry is:
+#
+#   - { name: <InstalledServices dir name>, repo: <github url> }
+#
+# `name` must match the directory mythic-cli creates under
+# /opt/mythic/InstalledServices/<name>, because that's how the role
+# probes "is this already installed?" for idempotency. By convention
+# mythic-cli uses the lowercase repo name.
+#
+# Default set follows the canonical Mythic intro guide
+# (https://medium.com/@lord_murak/mythic-setup-e41c66dde8ef):
+#
+#   apfell    — macOS JXA agent
+#   apollo    — .NET Windows agent (Win10/11)
+#   poseidon  — Go cross-platform agent (Linux/macOS)
+#   http      — HTTP C2 profile (canonical Mythic C2)
+#   websocket — WebSocket C2 profile
+#
+# httpx is installed by tasks/main.yml directly (its multi-instance
+# configuration is range-specific and needs port mapping); don't list it
+# here or the install probe will race with the httpx-specific setup.
+#
+# To extend per-scenario, override this var via the playbook or
+# group_vars. Order is preserved; install runs sequentially.
+mythic_extra_services:
+  - { name: apfell,    repo: "https://github.com/MythicAgents/apfell" }
+  - { name: apollo,    repo: "https://github.com/MythicAgents/apollo" }
+  - { name: poseidon,  repo: "https://github.com/MythicAgents/poseidon" }
+  - { name: http,      repo: "https://github.com/MythicC2Profiles/http" }
+  - { name: websocket, repo: "https://github.com/MythicC2Profiles/websocket" }

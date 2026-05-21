@@ -1,0 +1,80 @@
+# Scenario: splunk-ar
+# Purpose: Ludus-equivalent. See LUDUS-COVERAGE.md.
+# Cost   : ~$200-500/mo depending on student count
+# Mirrors: Ludus "Splunk Attack Range" environment guide.
+# Source : https://docs.ludus.cloud/docs/environment-guides/splunk-attack-range
+#         https://github.com/splunk/attack_range
+#
+# Per student:
+#   - 1 Splunk Enterprise indexer (Linux, 8000/8089/8088/9997)
+#   - 1 DC + 1 member, both with Splunk UF + Sysmon shipping into Splunk
+#   - 1 Kali to drive simulated attacks
+#
+# Goal for students: run an attack on the Windows boxes (e.g. atomic
+# red team) and detect it in Splunk via the indexed Sysmon /
+# wineventlog data.
+#
+# NOTE: The splunk-uf persona's ${SplunkHost} is hardcoded to the
+# splunk-server's pinned IP convention. We pin splunk to the .15 in
+# the targets subnet so the UF persona can find it.
+
+range_name: splunk-ar
+provider: azure
+azure_region: eastus
+
+students:
+  count: 5
+  tenancy: shared
+  name_format: "sp{n:02d}"
+
+lockdown: false
+guacamole_ingress_cidrs:
+  - "203.0.113.0/24"
+
+domain:
+  enabled: true
+  fqdn: corp.local
+  netbios: CORP
+  admin_user: rangeadmin
+  admin_password: "AR!RangeAdmin1"
+  safemode_password: "AR!SafeMode1"
+
+default_credentials:
+  windows_local_admin: rangeadmin
+  windows_local_password: "AR!Local1"
+  linux_user: ranger
+  linux_password: "AR!Linux1"
+
+machines:
+  # Splunk indexer — pinned IP so Windows UF persona knows where to ship.
+  # Note: edit personas/splunk-uf.ps1's $SplunkHost to "10.<n>.0.15" if
+  # you want per-student isolation. As written it points at hub-tier
+  # 10.0.1.20 which only works with a SHARED indexer in shared infra.
+  # For per-student Splunk, override the persona on the fly or keep
+  # this scenario's UF script copies pointing at the right IP.
+  - { name: splunk, role: linux-target,        os: ubuntu-22,           size: large,  persona: splunk-server, static_ip: "15" }
+
+  - { name: dc01,   role: windows-dc,          os: windows-server-2022, size: medium, static_ip: "10" }
+  - { name: srv01,  role: windows-member,      os: windows-server-2019, size: small,  domain_join: true, persona: splunk-uf }
+  - { name: ws01,   role: windows-workstation, os: windows-11,          size: small,  domain_join: true, persona: splunk-uf }
+
+  - { name: kali01, role: attacker,            os: kali,                size: medium }
+
+services:
+  guacamole:
+    enabled: true
+    admin_user: guacadmin
+    admin_password: "AR!Guac1"
+    autoregister: true
+    student_user_prefix: ar-
+    student_password_template: "AR!{n:02d}"
+  elk:
+    enabled: false
+    kibana_user: elastic
+    kibana_password: "unused"
+    deploy_agents: false
+  adaptix:
+    enabled: false
+    ssh_pubkey: ""
+  redirector:
+    enabled: false

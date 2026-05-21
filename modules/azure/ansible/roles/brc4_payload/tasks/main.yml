@@ -1,0 +1,599 @@
+---
+# =============================================================================
+# brc4_payload — generate Brute Ratel C4 badger shellcode via the Ratel
+# server's WebSocket API and save to ~/Desktop/payloads/brc4 on Kali.
+# =============================================================================
+# BRC4's API server speaks WebSockets on the same :9000 port the
+# Commander GUI uses. Auth is two-stage:
+#   1. HTTPS POST  https://<srv>:9000/   body={creds:{user,pass}} → {token}
+#   2. WS connect  wss://<srv>:9000      send={creds:{user,token}, task:0}
+# Subsequent requests are JSON {task:N, ...args} messages over the WS.
+# task 36 returns base64 shellcode in `payload_dat`.
+#
+# We log in as the DEDICATED automation operator (set in listeners.tf
+# brc4_profile.user_list.automation, password surfaced as
+# `terra_brc4_automation_password`). That session is independent of the
+# operator's GUI session under `admin`, so this role can run while the
+# operator is connected to Commander without kicking either off.
+#
+# Each invocation drops binaries into a new timestamped subdir
+# ~/Desktop/payloads/brc4/<YYYYMMDDTHHMMSSZ>/, and a `latest` symlink
+# at the base points at the freshest run — same convention as the
+# adaptix/mythic/sliver payload roles.
+
+# ---------- Phase 0: skip cleanly when no BRC4 teamserver in range ----------
+- name: Skip — no BRC4 teamserver in this range
+  ansible.builtin.debug:
+    msg: >-
+      No BRC4 teamserver in this range (groups['brc4'] is empty);
+      skipping. BRC4 is license-gated and only deployed when explicitly
+      configured (see scenarios/redteam-lab.yaml).
+  when: (groups['brc4'] | default([]) | length) == 0
+
+- name: End play for this host when BRC4 is absent
+  ansible.builtin.meta: end_host
+  when: (groups['brc4'] | default([]) | length) == 0
+
+# ---------- Phase 1: pick THIS Kali's BRC4 teamserver ----------
+# Per-student match: kali-N → brc4-N via same terra_student_id tag.
+# Falls back to the first BRC4 host so single-tenant ranges work.
+- name: Pick BRC4 teamserver hostname (match by terra_student_id, else first)
+  ansible.builtin.set_fact:
+    brc4_teamserver_name: >-
+      {%- set sid = terra_student_id | default('') -%}
+      {%- set matches = [] -%}
+      {%- for h in groups['brc4'] -%}
+      {%- if (hostvars[h].terra_student_id | default('')) == sid -%}
+      {%- set _ = matches.append(h) -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {{ (matches | first) | default(groups['brc4'] | first, true) }}
+
+- name: Resolve BRC4 teamserver private IP
+  ansible.builtin.set_fact:
+    brc4_teamserver_host: "{{ hostvars[brc4_teamserver_name].terra_private_ip }}"
+
+- name: Resolve BRC4 automation password from hostvar
+  ansible.builtin.set_fact:
+    brc4_automation_password: "{{ hostvars[brc4_teamserver_name].terra_brc4_automation_password | default('') }}"
+  no_log: true
+
+- name: Fail fast if BRC4 automation password missing
+  ansible.builtin.fail:
+    msg: >-
+      No `terra_brc4_automation_password` hostvar for {{ brc4_teamserver_name }}.
+      This usually means the terraform `ansible_inventory` output is stale
+      — re-run `terraform apply` in envs/<env>/ so the new
+      `brc4_automation_password` field lands in the inventory.
+  when: (brc4_automation_password | default('')) == ''
+
+# ---------- Phase 2: ensure base + per-run output dirs + Python deps ----------
+# Each run produces a fresh timestamped subdir. The base output dir is
+# pre-created by the kali role (roles/kali/tasks/main.yml:805-817);
+# the `file:` below is defensive.
+- name: Compute UTC build timestamp
+  ansible.builtin.set_fact:
+    brc4_payload_build_timestamp: "{{ lookup('pipe', 'date -u +%Y%m%dT%H%M%SZ') }}"
+
+- name: Compute per-run output directory
+  ansible.builtin.set_fact:
+    brc4_payload_run_dir: "{{ brc4_payload_output_dir }}/{{ brc4_payload_build_timestamp }}"
+
+- name: Ensure base + per-run output directories exist
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: "0755"
+  loop:
+    - "{{ brc4_payload_output_dir }}"
+    - "{{ brc4_payload_run_dir }}"
+  become: true
+
+# The build script uses `websockets` (asyncio websocket client) +
+# `requests` for the HTTP login bootstrap. Kali ships python3 but not
+# always these libs — the apt package is `python3-websockets`.
+- name: Ensure python3 websocket + http libs installed (for the BRC4 build script)
+  ansible.builtin.apt:
+    name:
+      - python3-requests
+      - python3-urllib3
+      - python3-websockets
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+    lock_timeout: 600
+  become: true
+
+# ---------- Phase 3: single Python build script (WebSocket-driven) ----------
+# HTTP login → token → WS connect → task:0 auth → task:8 list listeners
+# → task:31 list profiles → task:36 per matrix entry → b64 decode →
+# atomic write. One process, one keep-alive WS, one auth token.
+- name: Build all matrix payloads in one process (login + 90 builds)
+  ansible.builtin.shell:
+    cmd: |
+      python3 - <<'PY'
+      import asyncio, base64, json, os, ssl, sys, tempfile, time, traceback
+      import urllib3, requests
+      try:
+          import websockets
+      except ImportError:
+          sys.exit("python3-websockets not installed (apt install python3-websockets)")
+      urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+      SERVER      = os.environ["BRC4_SERVER"]            # host:port
+      USER        = os.environ["BRC4_USER"]
+      PASS        = os.environ["BRC4_PASS"]
+      OUT_DIR     = os.environ["BRC4_OUT_DIR"]
+      OUT_MODE    = int(os.environ["BRC4_OUT_MODE"], 8)
+      VARIANTS    = json.loads(os.environ["BRC4_VARIANTS"])
+      LISTENER_VIAS = json.loads(os.environ["BRC4_LISTENER_VIAS"])
+      OUT_EXT     = os.environ["BRC4_OUT_EXT"]
+      LOGIN_RETRY = int(os.environ["BRC4_LOGIN_RETRIES"])
+      LOGIN_DELAY = int(os.environ["BRC4_LOGIN_DELAY"])
+      BUILD_RETRY = int(os.environ["BRC4_BUILD_RETRIES"])
+      BUILD_RDELAY= int(os.environ["BRC4_BUILD_RETRY_DELAY"])
+      RECV_BUDGET = int(os.environ["BRC4_BUILD_RECV_ATTEMPTS"])
+      WS_TIMEOUT  = int(os.environ["BRC4_WS_CONNECT_TIMEOUT"])
+
+      # Mirror the (B_FAILED|B_SUCCESS|B_CONTINUE) tristate from
+      # bruteratel.py — except B_CONTINUE here means "this WS message
+      # belongs to a different task ID (likely a server-pushed async
+      # event), keep reading for the response to OUR task".
+      B_FAILED, B_SUCCESS, B_CONTINUE = 0, 1, 2
+
+      # Non-retryable error substrings — config-class failures that
+      # will fail the same way on retry. Skip immediately, log clearly.
+      NON_RETRYABLE_SUBSTRINGS = (
+          "invalid payload name",
+          "invalid payload configuration",
+          "payload_config_name",
+          "unknown payload",
+          "no such listener",
+          "listener not found",
+          "invalid format",
+      )
+
+      def log(*a):
+          print(*a, flush=True)
+
+      def short(s, n=400):
+          if s is None: return ""
+          s = str(s)
+          return s if len(s) <= n else s[:n] + "...[truncated %d]" % (len(s) - n)
+
+      def is_non_retryable(blob):
+          bl = (blob or "").lower()
+          return any(s in bl for s in NON_RETRYABLE_SUBSTRINGS)
+
+      def validate_response(task_id, jdata):
+          """Match bruteratel.py's _validate_response semantics."""
+          if not isinstance(jdata, dict):
+              return B_FAILED
+          if "task" not in jdata or "access" not in jdata or "status" not in jdata:
+              return B_FAILED
+          if jdata["access"] is False:
+              return B_FAILED
+          if jdata["task"] != task_id:
+              return B_CONTINUE
+          return jdata["status"]
+
+      def http_login():
+          """HTTP POST https://<srv>/ with creds → returns token, with retry."""
+          url = "https://" + SERVER + "/"
+          body = {"creds": {"user": USER, "pass": PASS}}
+          last = None
+          for attempt in range(1, LOGIN_RETRY + 1):
+              try:
+                  r = requests.post(url, data=json.dumps(body),
+                                    verify=False, timeout=10)
+                  if r.status_code != 200:
+                      last = "HTTP %d: %s" % (r.status_code, short(r.text))
+                      log("[!] /login attempt %d/%d: %s"
+                          % (attempt, LOGIN_RETRY, last))
+                  else:
+                      try:
+                          j = r.json()
+                      except ValueError as e:
+                          last = "non-JSON body: %s: %s" % (e, short(r.text))
+                          log("[!] /login attempt %d/%d: %s"
+                              % (attempt, LOGIN_RETRY, last))
+                          time.sleep(LOGIN_DELAY); continue
+                      tok = (j or {}).get("token", "")
+                      if tok:
+                          if attempt > 1:
+                              log("[+] /login succeeded on attempt %d" % attempt)
+                          return tok
+                      last = "no token in response: %s" % short(json.dumps(j))
+                      log("[!] /login attempt %d/%d: %s"
+                          % (attempt, LOGIN_RETRY, last))
+              except Exception as e:
+                  last = "%s: %s" % (type(e).__name__, short(str(e), 200))
+                  log("[!] /login attempt %d/%d: %s"
+                      % (attempt, LOGIN_RETRY, last))
+              time.sleep(LOGIN_DELAY)
+          sys.exit("BRC4 HTTP /login failed after %d retries: %s"
+                   % (LOGIN_RETRY, last))
+
+      async def ws_send_recv(ws, task_id, payload, recv_budget):
+          """Send a task message and wait for the matching response.
+
+          Returns parsed JSON on success / B_SUCCESS, or (None, err).
+          Tolerates B_CONTINUE (unrelated async messages) up to recv_budget
+          reads. Distinguishes auth/config errors via the response body.
+          """
+          await ws.send(json.dumps(payload))
+          attempts = 0
+          while attempts < recv_budget:
+              attempts += 1
+              try:
+                  raw = await ws.recv()
+              except Exception as e:
+                  return None, "WS recv: %s: %s" % (type(e).__name__,
+                                                     short(str(e), 200))
+              try:
+                  j = json.loads(raw)
+              except ValueError:
+                  # Server can send non-JSON binary frames for downloads;
+                  # ignore those while waiting for our task response.
+                  continue
+              v = validate_response(task_id, j)
+              if v == B_FAILED:
+                  return None, "access denied or malformed response: %s" % short(json.dumps(j))
+              if v == B_SUCCESS:
+                  return j, None
+              # B_CONTINUE — different task ID, async server push, keep reading.
+          return None, "no response after %d reads" % recv_budget
+
+      async def main_async():
+          # ---- 1) HTTP login → token ----
+          log("[*] HTTP login to https://%s/ as user=%s" % (SERVER, USER))
+          token = http_login()
+          log("[+] got token (%d chars)" % len(token))
+
+          # ---- 2) WS connect → task:0 auth ----
+          ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+          ssl_ctx.check_hostname = False
+          ssl_ctx.verify_mode = ssl.CERT_NONE
+          ws_url = "wss://" + SERVER
+          log("[*] WS connect %s (timeout=%ds)" % (ws_url, WS_TIMEOUT))
+          try:
+              ws = await asyncio.wait_for(
+                  websockets.connect(ws_url, ssl=ssl_ctx,
+                                     max_size=None,         # allow large shellcode frames
+                                     ping_interval=20,
+                                     ping_timeout=20),
+                  timeout=WS_TIMEOUT,
+              )
+          except Exception as e:
+              sys.exit("WS connect failed: %s: %s"
+                       % (type(e).__name__, short(str(e), 200)))
+
+          auth_msg = {"creds": {"user": USER, "token": token}, "task": 0}
+          try:
+              await ws.send(json.dumps(auth_msg))
+              raw = await asyncio.wait_for(ws.recv(), timeout=WS_TIMEOUT)
+              j = json.loads(raw)
+          except Exception as e:
+              sys.exit("WS auth (task 0) failed: %s: %s"
+                       % (type(e).__name__, short(str(e), 200)))
+          if validate_response(0, j) != B_SUCCESS:
+              sys.exit("WS auth (task 0) rejected: %s" % short(json.dumps(j)))
+          log("[+] WS authenticated")
+
+          # ---- 3) task:8 list listeners ----
+          log("[*] task:8 list listeners")
+          j, err = await ws_send_recv(ws, 8, {"task": 8}, RECV_BUDGET)
+          if err:
+              sys.exit("task:8 list listeners failed: %s" % err)
+          listener_obj = j.get("listeners") or {}
+          live_listeners = sorted(listener_obj.keys()) if isinstance(listener_obj, dict) else []
+          if not live_listeners:
+              sys.exit("teamserver reports zero registered listeners; "
+                       "is the brc4 role's profile load complete?")
+          log("[+] live listeners (%d): %s" % (len(live_listeners), ", ".join(live_listeners)))
+
+          # ---- 4) task:31 list badger profiles ----
+          # Profiles are pre-baked into c2.profile by listeners.tf's
+          # brc4_payload_block (5 entries, one per listener:
+          # azure_HTTPS, cloudfront_HTTPS, ...). task:31 confirms they
+          # loaded server-side. Each profile name doubles as
+          # `payload_config_name` for task:36.
+          log("[*] task:31 list badger profiles")
+          j, err = await ws_send_recv(ws, 31, {"task": 31, "edit": False}, RECV_BUDGET)
+          if err:
+              sys.exit("task:31 list profiles failed: %s" % err)
+          profile_obj = j.get("payload_config") or {}
+          live_profiles = sorted(profile_obj.keys()) if isinstance(profile_obj, dict) else []
+          if not live_profiles:
+              sys.exit("teamserver reports zero badger profiles; "
+                       "check brc4_payload_block in listeners.tf and "
+                       "the brc4 role's profile sync.")
+          log("[+] live profiles (%d): %s" % (len(live_profiles), ", ".join(live_profiles)))
+
+          # ---- 5) Resolve each via → a real profile name (prefix match) ----
+          # Profile names from listeners.tf brc4_payload_block follow the
+          # "<cdn>_HTTPS" convention, so `via=azure` → profile `azure_HTTPS`.
+          profile_for = {}
+          missing_vias = []
+          for via in LISTENER_VIAS:
+              match = next((p for p in live_profiles if p.startswith(via)), None)
+              if match is None:
+                  missing_vias.append(via)
+              else:
+                  profile_for[via] = match
+          if missing_vias:
+              log("[!] WARNING: vias %r have no matching profile in %r; "
+                  "those builds will be skipped." % (missing_vias, live_profiles))
+          if not profile_for:
+              sys.exit("None of the configured vias %r matched any live profile."
+                       % LISTENER_VIAS)
+
+          # ---- 6) task:36 build per (profile × variant) ----
+          os.makedirs(OUT_DIR, exist_ok=True)
+          planned = len(profile_for) * len(VARIANTS)
+          log("[*] planned builds: %d (vias=%d × variants=%d)"
+              % (planned, len(profile_for), len(VARIANTS)))
+
+          built, failed = [], []
+          per_profile_built = {}
+          per_evasion_built = {}
+          per_arch_built    = {}
+          for via, profile_name in profile_for.items():
+              for variant in VARIANTS:
+                  arch         = variant["arch"]
+                  evasion      = variant["evasion"]
+                  sub_type     = variant["sub_type"]
+                  exit_method  = variant["exit_method"]
+                  payload_arch = int(variant["payload_arch"])
+                  payload_type = int(variant["payload_type"])
+                  stem = "%s-badger-%s-%s-%s-%s" % (
+                      profile_name, arch, evasion, sub_type, exit_method)
+                  outpath = os.path.join(OUT_DIR, stem + OUT_EXT)
+                  label   = "%s/%s/%s/%s/%s" % (
+                      profile_name, arch, evasion, sub_type, exit_method)
+                  body = {
+                      "task": 36,
+                      "svc_name": "NA",
+                      "svc_desc": "NA",
+                      "payload_config_name": profile_name,
+                      "payload_arch": payload_arch,
+                      "payload_type": payload_type,
+                      "save_path": stem + OUT_EXT,
+                  }
+                  log("[*] build %s → %s" % (label, outpath))
+
+                  last_err = None
+                  blob = None
+                  for attempt in range(1, BUILD_RETRY + 1):
+                      try:
+                          j, err = await ws_send_recv(ws, 36, body, RECV_BUDGET)
+                      except Exception as e:
+                          last_err = "%s: %s" % (type(e).__name__,
+                                                  short(str(e), 200))
+                          log("[!] %s attempt %d/%d: %s"
+                              % (label, attempt, BUILD_RETRY, last_err))
+                          await asyncio.sleep(BUILD_RDELAY)
+                          continue
+                      if err:
+                          # ws_send_recv flagged this as failed/access-denied.
+                          # Treat as non-retryable to avoid burning attempts
+                          # against a broken session.
+                          last_err = err
+                          if is_non_retryable(err):
+                              log("[!] %s: %s (config error, not retrying)"
+                                  % (label, last_err))
+                              break
+                          log("[!] %s attempt %d/%d: %s"
+                              % (label, attempt, BUILD_RETRY, last_err))
+                          await asyncio.sleep(BUILD_RDELAY)
+                          continue
+                      # Success: server returns base64 in payload_dat.
+                      dat = j.get("payload_dat")
+                      if not dat:
+                          last_err = "no payload_dat in response: %s" % short(json.dumps(j))
+                          # Some failure modes return ok:true but no data —
+                          # check for a hint and break if non-retryable.
+                          if is_non_retryable(json.dumps(j)):
+                              log("[!] %s: %s (config error, not retrying)"
+                                  % (label, last_err))
+                              break
+                          log("[!] %s attempt %d/%d: %s"
+                              % (label, attempt, BUILD_RETRY, last_err))
+                          await asyncio.sleep(BUILD_RDELAY)
+                          continue
+                      try:
+                          blob = base64.b64decode(dat)
+                      except Exception as e:
+                          last_err = "b64 decode failed: %s" % e
+                          log("[!] %s: %s" % (label, last_err))
+                          break
+                      break  # success
+
+                  if blob is None:
+                      failed.append("%s: %s" % (label, last_err or "unknown failure"))
+                      continue
+
+                  # Atomic decode-and-write: tmp file in the same dir,
+                  # chmod, os.replace.
+                  try:
+                      fd, tmpname = tempfile.mkstemp(prefix=".brc4-",
+                                                      suffix=".tmp",
+                                                      dir=OUT_DIR)
+                      try:
+                          with os.fdopen(fd, "wb") as f:
+                              f.write(blob)
+                          os.chmod(tmpname, OUT_MODE)
+                          os.replace(tmpname, outpath)
+                      except Exception:
+                          try: os.unlink(tmpname)
+                          except OSError: pass
+                          raise
+                      built.append(outpath)
+                      per_profile_built[profile_name] = (
+                          per_profile_built.get(profile_name, 0) + 1)
+                      per_evasion_built[evasion] = (
+                          per_evasion_built.get(evasion, 0) + 1)
+                      per_arch_built[arch] = (
+                          per_arch_built.get(arch, 0) + 1)
+                      log("[+] %s -> %s (%d bytes)" % (label, outpath, len(blob)))
+                  except Exception as e:
+                      tb = traceback.format_exc()
+                      failed.append("%s: %s: %s"
+                                    % (label, type(e).__name__, short(str(e), 200)))
+                      log("[!] %s: %s: %s"
+                          % (label, type(e).__name__, short(str(e), 200)))
+                      log("      traceback: %s" % short(tb, 600))
+
+          # ---- 7) close WS cleanly ----
+          try:
+              await ws.close(1000)
+          except Exception:
+              pass
+
+          def human_bytes(n):
+              """Format byte counts like '1.2 MB' for the summary line."""
+              for unit in ("B", "KB", "MB", "GB"):
+                  if n < 1024 or unit == "GB":
+                      return "%.1f %s" % (n, unit) if unit != "B" else "%d B" % n
+                  n /= 1024.0
+
+          total_bytes = 0
+          for outpath in built:
+              try:    total_bytes += os.path.getsize(outpath)
+              except OSError: pass
+
+          log("")
+          log("---- summary ----")
+          log("[+] %d built, %d failed (of %d planned)"
+              % (len(built), len(failed), planned))
+          log("[+] total size on disk : %s across %d file(s)"
+              % (human_bytes(total_bytes), len(built)))
+          if per_profile_built:
+              log("[+] per-profile breakdown:")
+              for prof in sorted(per_profile_built.keys()):
+                  log("      %-16s %3d built"
+                      % (prof, per_profile_built[prof]))
+          if per_evasion_built:
+              log("[+] per-evasion breakdown:")
+              for ev in sorted(per_evasion_built.keys()):
+                  log("      %-16s %3d built"
+                      % (ev, per_evasion_built[ev]))
+          if per_arch_built:
+              log("[+] per-arch breakdown:")
+              for arch in sorted(per_arch_built.keys()):
+                  log("      %-16s %3d built"
+                      % (arch, per_arch_built[arch]))
+          if built:
+              log("[+] built files (sorted by name):")
+              for outpath in sorted(built):
+                  try:    sz = os.path.getsize(outpath)
+                  except OSError: sz = 0
+                  log("      %-50s %s"
+                      % (os.path.basename(outpath), human_bytes(sz)))
+          if failed:
+              log("---- failed builds ----")
+              for f in failed:
+                  log("  - " + f)
+          if not built:
+              sys.exit("0 BRC4 payloads built — see [!] / failed list above")
+
+      try:
+          asyncio.run(main_async())
+      except SystemExit:
+          raise
+      except Exception as e:
+          tb = traceback.format_exc()
+          log("[!] top-level exception: %s: %s" % (type(e).__name__, short(str(e), 200)))
+          log("      traceback: %s" % short(tb, 800))
+          sys.exit("BRC4 build wrapper crashed: %s" % e)
+      PY
+    executable: /bin/bash
+  environment:
+    BRC4_SERVER:                   "{{ brc4_teamserver_host }}:{{ brc4_payload_commander_port }}"
+    BRC4_USER:                     "{{ brc4_payload_automation_user }}"
+    BRC4_PASS:                     "{{ brc4_automation_password }}"
+    BRC4_OUT_DIR:                  "{{ brc4_payload_run_dir }}"
+    BRC4_OUT_MODE:                 "{{ brc4_payload_output_mode }}"
+    BRC4_OUT_EXT:                  "{{ brc4_payload_output_extension }}"
+    BRC4_VARIANTS:                 "{{ brc4_payload_build_variants | to_json }}"
+    BRC4_LISTENER_VIAS:            "{{ brc4_payload_listener_vias | to_json }}"
+    BRC4_LOGIN_RETRIES:            "{{ brc4_payload_login_retries }}"
+    BRC4_LOGIN_DELAY:              "{{ brc4_payload_login_delay_seconds }}"
+    BRC4_BUILD_RETRIES:            "{{ brc4_payload_build_retries }}"
+    BRC4_BUILD_RETRY_DELAY:        "{{ brc4_payload_build_retry_delay_seconds }}"
+    BRC4_BUILD_RECV_ATTEMPTS:      "{{ brc4_payload_build_recv_attempts }}"
+    BRC4_WS_CONNECT_TIMEOUT:       "{{ brc4_payload_ws_connect_timeout_seconds }}"
+  become: true
+  become_user: "{{ ansible_user }}"
+  register: brc4_build
+  changed_when: "'built,' in (brc4_build.stdout | default(''))"
+  no_log: false
+
+# ---------- Phase 4: update `latest` symlink + surface summary ----------
+- name: Update `latest` symlink to point at this run
+  ansible.builtin.file:
+    src: "{{ brc4_payload_build_timestamp }}"
+    dest: "{{ brc4_payload_output_dir }}/latest"
+    state: link
+    force: true
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+  become: true
+
+# ---------- Phase 5: retention sweep (keep latest N run dirs) ----------
+# Each run is a self-contained timestamped subdir. Prune older ones so
+# disk usage stays bounded. `find` with file_type=directory + recurse=false
+# lists only immediate subdirs of the base output dir; the `latest`
+# symlink is excluded by file_type AND by the explicit name reject below
+# (belt-and-suspenders against future ansible find behavior changes).
+- name: Retention sweep — list existing run directories
+  ansible.builtin.find:
+    paths: "{{ brc4_payload_output_dir }}"
+    file_type: directory
+    recurse: false
+  register: brc4_payload_existing_runs
+
+- name: Retention sweep — compute prune list (keep latest {{ brc4_payload_retention_runs }})
+  ansible.builtin.set_fact:
+    # Lexicographic sort over YYYYMMDDTHHMMSSZ stems is identical to
+    # chronological sort. `[:-N]` is "everything except the last N";
+    # combined with ascending sort that's "everything older than the
+    # newest N" — exactly the prune set.
+    brc4_payload_runs_to_prune: >-
+      {{ (brc4_payload_existing_runs.files
+          | map(attribute='path')
+          | reject('search', '/latest$')
+          | sort
+          | list)[:-(brc4_payload_retention_runs | int)] }}
+
+- name: Retention sweep — report plan
+  ansible.builtin.debug:
+    msg: "{{
+      [
+        '---- brc4_payload retention ----',
+        'keep latest : ' ~ (brc4_payload_retention_runs | string) ~ ' run(s)',
+        'total runs  : ' ~ (brc4_payload_existing_runs.files | length | string),
+        'to prune    : ' ~ (brc4_payload_runs_to_prune | length | string),
+      ] + (brc4_payload_runs_to_prune | map('basename') | list)
+    }}"
+
+- name: Retention sweep — prune old run directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop: "{{ brc4_payload_runs_to_prune }}"
+  loop_control:
+    label: "{{ item | basename }}"
+  become: true
+
+- name: Report build summary
+  ansible.builtin.debug:
+    msg: "{{ [
+      '---- brc4_payload build summary ----',
+      'teamserver: ' + brc4_teamserver_name + ' (' + brc4_teamserver_host + ':' + (brc4_payload_commander_port | string) + ')',
+      'auth as   : ' + brc4_payload_automation_user + '  (distinct from `admin`; GUI session safe)',
+      'run dir   : ' + brc4_payload_run_dir,
+      'latest    : ' + brc4_payload_output_dir + '/latest -> ' + brc4_payload_build_timestamp,
+    ] + (brc4_build.stdout_lines | default([])) }}"

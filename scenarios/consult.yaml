@@ -1,0 +1,172 @@
+# Scenario: consult
+# Purpose: Web-app / API security consulting stack. Two Kali analyst
+#          boxes, two Windows analyst boxes, and a dedicated Osmedeus
+#          scanner box — all reached via Guacamole over a Let's Encrypt
+#          cert on a custom CWR hostname. No domain, no AD, no C2, no
+#          ELK — minimal blast surface so a fresh assessment range
+#          stands up fast and tears down clean.
+#
+# Use it like:
+#   ./range preflight consult                   # quota + Marketplace + cost
+#   ./range apply     consult                   # deploy
+#   ./range output    consult                   # Guacamole URL + per-user creds
+#   ./range destroy   consult                   # tear down at end of engagement
+#
+# Do NOT run `./range lock consult` during an active engagement — the
+# analyst boxes and the scanner need outbound internet to reach client
+# targets. Lock is for red-team training scenarios, not consulting.
+#
+# After apply, on each Kali (RDP via Guacamole), push the tool installer:
+#   scp scripts/install-webapp-tools.sh ranger@<kali-ip>:/tmp/
+#   ssh ranger@<kali-ip> sudo bash /tmp/install-webapp-tools.sh
+# The scanner box auto-installs Osmedeus + ProjectDiscovery + API
+# tooling via the `osmedeus` persona at first boot; no post-deploy step
+# needed there. See personas/osmedeus.sh and /etc/motd on the box.
+#
+# Cost: ~$350-500/mo running 24/7 with default sizing. Engagements are
+#       short, so deploy → assess → destroy. Pass `--spot` to drop ~80%
+#       on the analyst boxes (the scanner stays on Regular for stability).
+#
+# Boxes: 2 Kali + 2 Windows + 1 scanner = 5 per engagement, plus the
+#        shared hub Guacamole VM.
+
+range_name: webapp-consult
+provider: azure
+azure_region: southeastasia    # Singapore
+
+# Single-tenant — one engagement per range. Bump `count` and re-apply
+# to share the hub Guacamole across multiple parallel engagements; each
+# consultant gets their own VNet + their own connection group.
+students:
+  count: 1
+  tenancy: shared
+  name_format: "eng"             # produces "eng" as the only student-id
+
+lockdown: false                  # consulting needs continuous outbound — do NOT lock
+
+# ---------------------------------------------------------------------------
+# Guacamole hardening — three layers stacked on top of each other.
+#
+# Layer 1: country geofence. NSG ingress is restricted to aggregated
+#          CIDR blocks for the listed countries. ipdeny.com snapshots
+#          are fetched into geofence/<CC>.txt by
+#          scripts/refresh-geofence.sh (auto-run by ./range preflight
+#          if missing).
+#
+# Layer 2: apply-time operator-IP detect. The generator hits
+#          api.ipify.org and prepends the result as /32 to ingress.
+#          Covers mobile / VPN / partner-office IPs outside the
+#          country snapshot.
+#
+# Layer 3: per-user random Guacamole passwords + 28-char random admin
+#          password (admin_password: "" triggers random_password
+#          generation). All surfaced via `./range creds`.
+#
+# Override path: set guacamole_ingress_cidrs explicitly to bypass
+# the country geofence + auto-IP and pin to exact CIDRs.
+# ---------------------------------------------------------------------------
+guacamole_allow_countries: [SG, PH, AE, QA, SA]
+guacamole_auto_add_my_ip:  true
+
+# No domain — web-app consulting rarely needs AD, and skipping it cuts
+# ~20 min off the first apply (DC promotion + reboot). The fields below
+# are required by the schema but unused when enabled is false.
+domain:
+  enabled: false
+  fqdn: corp.local
+  netbios: CORP
+  admin_user: rangeadmin
+  admin_password: "Consult!Admin1"
+  safemode_password: "Consult!SafeMode1"
+
+default_credentials:
+  windows_local_admin: rangeadmin
+  windows_local_password: "Consult!Local1"
+  linux_user: ranger
+  linux_password: "Consult!Linux1"
+
+# ---------------------------------------------------------------------------
+# Per-consultant stack.
+#
+#   kali01   — primary hands-on testing box. Burp Suite Community
+#              (bundled in kali-linux-default), OWASP ZAP, custom
+#              toolchain via install-webapp-tools.sh.
+#   kali02   — secondary analyst box. Use for parallel manual workflows
+#              while kali01 runs Burp / proxy chains.
+#   win11    — modern Windows client. Useful for testing Edge-specific
+#              behaviour, thick clients, or running a Windows-side
+#              Burp / Caido install.
+#   win10    — legacy client. Many enterprise apps still pin to old IE
+#              modes / .NET 4.x desktop runners — keep one around.
+#   scanner  — dedicated automation box (linux-target with the
+#              `osmedeus` persona). Runs Osmedeus as a systemd service
+#              with its web UI on :8000, nuclei + ProjectDiscovery +
+#              API testing CLIs (newman, swagger-cli, hurl, mitmproxy).
+#              Sits in the targets subnet of this engagement's VNet, so
+#              the analyst Kali boxes can reach it but it's not visible
+#              from the internet.
+#              See personas/osmedeus.sh for what's preinstalled and
+#              /etc/motd on the box for quick-scan wrappers
+#              (runscan-full / runscan-quick / runscan-api).
+#
+# Subnet layout per engagement (10.<n>.0.0/22):
+#   10.<n>.0.0/24  targets subnet  — scanner sits here
+#   10.<n>.1.0/24  attacker subnet — kali01/02, win10/11 sit here
+# Intra-VNet NSG rule allows traffic between the two subnets, so
+# Kali → scanner :8000 works out of the box.
+# ---------------------------------------------------------------------------
+machines:
+  - { name: kali01,  role: attacker,            os: kali,       size: medium }
+  - { name: kali02,  role: attacker,            os: kali,       size: medium }
+  - { name: win11,   role: windows-workstation, os: windows-11, size: small  }
+  - { name: win10,   role: windows-workstation, os: windows-10, size: small  }
+  - { name: scanner, role: linux-target,        os: debian-12,  size: medium, persona: osmedeus }
+
+# No shared infra — no ELK / Ghostwriter / RedELK / SteppingStones.
+# Reporting happens in the consultant's normal report tooling; this
+# range is purely workstation + Guacamole.
+shared_infrastructure: []
+
+# No AFD C2 fronting — this scenario never deploys a C2 server.
+advanced_c2:
+  enabled: false
+  domain: ""
+  dns_zone_resource_group: ""
+  cover_url: ""
+  fdid_header_required: false
+
+services:
+  guacamole:
+    enabled: true
+    admin_user: guacadmin
+    # Empty = terraform generates a 28-char random_password. Surfaced
+    # via `./range creds` and `terraform output -raw guacamole_admin_password`.
+    # NEVER hard-code a password here for a real engagement.
+    admin_password: ""
+    autoregister: true
+    student_user_prefix: consult-
+    student_password_template: "Cn!{n:02d}!Strong"
+    login_title: "CWR Consult"
+    acme_email: "markchristiansecretario@gmail.com"
+    # Custom DNS hostname for the Guacamole portal. cyberwarrange.com
+    # is delegated to Azure DNS (NS at registrar -> ns1-02.azure-dns.*).
+    # Empty custom_hostname = terraform auto-generates a name like
+    # cwr-consult-<word>-<NNN>.cyberwarrange.com (locked to range_name
+    # so re-applies don't churn the cert).
+    custom_hostname: ""
+    dns_zone_name: "cyberwarrange.com"
+    dns_zone_resource_group: "aa_group"
+    dns_zone_subscription_id: "3d78e3c1-1ec8-4ffc-ab3e-7cf1d095391f"
+
+  elk:
+    enabled: false
+    kibana_user: elastic
+    kibana_password: "unused"
+    deploy_agents: false
+
+  # No C2 in this scenario.
+  adaptix:
+    enabled: false
+    ssh_pubkey: ""
+  redirector:
+    enabled: false

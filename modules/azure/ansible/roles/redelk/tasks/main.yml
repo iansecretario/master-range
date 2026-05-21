@@ -1,0 +1,413 @@
+---
+# =============================================================================
+# RedELK — Outflank's red-team telemetry/SIEM (ES + Logstash + Kibana stack)
+# =============================================================================
+# This role is the idempotent `./range repair` layer for the RedELK box.
+# It does NOT do the heavy lifting on a properly baked image:
+#
+#   - /opt/redelk/.baked present  → skip apt install / docker install /
+#                                    git clone / image pulls (baked path).
+#   - /opt/redelk/.baked missing  → fall back to the slow install path
+#                                    (~10-15 min on a fresh Debian 12 VM).
+#
+# Then ALWAYS (idempotent):
+#   - Render the per-deploy .env (passwords + ES URL) from the operator-
+#     supplied values.
+#   - Run install-elkserver.sh ONCE — gated on /opt/redelk/.deployed —
+#     which generates certs, writes redelk_passwords.cfg, links the
+#     chosen compose profile, and `docker compose up -d`s the stack.
+#   - Wait for ES :9200 (60-180s on cold start) and Kibana :5601.
+#   - Drop a systemd unit so the stack auto-restarts on VM reboot.
+#   - Write /opt/redelk/.deployed.
+#
+# Tag everything with `redelk` so operators can scope a run:
+#   ansible-playbook playbook.yml --tags redelk
+#
+# Reference: https://github.com/outflanknl/RedELK
+
+# ---------- Phase 0: probe markers (baked + deployed) ----------
+- name: Probe baked-image marker (/opt/redelk/.baked)
+  ansible.builtin.stat:
+    path: /opt/redelk/.baked
+  register: redelk_baked
+  become: true
+  tags: [redelk, redelk-probe]
+
+- name: Probe deployed marker (/opt/redelk/.deployed)
+  ansible.builtin.stat:
+    path: /opt/redelk/.deployed
+  register: redelk_deployed
+  become: true
+  tags: [redelk, redelk-probe]
+
+- name: Report — baked / deployed state
+  ansible.builtin.debug:
+    msg:
+      - "baked    : {{ redelk_baked.stat.exists }} ({{ redelk_install_dir }}/.baked)"
+      - "deployed : {{ redelk_deployed.stat.exists }} ({{ redelk_install_dir }}/.deployed)"
+      - "profile  : {{ redelk_profile }}"
+  tags: [redelk]
+
+# =============================================================================
+# Phase 1: slow-path install (only when .baked is missing)
+# =============================================================================
+# Mirrors what the bake script does. Skipped entirely on a baked image.
+- name: Slow-path install (apt + docker + clone — only when not baked)
+  when: not redelk_baked.stat.exists
+  become: true
+  tags: [redelk, redelk-install]
+  block:
+    - name: Install base packages + docker prereqs (apt)
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+          - jq
+          - git
+          - openssl
+          - python3
+          - python3-yaml
+          - wget
+          - apt-transport-https
+          - gnupg
+        state: present
+        update_cache: true
+
+    - name: Probe for docker
+      ansible.builtin.command: docker --version
+      register: redelk_docker_probe
+      changed_when: false
+      failed_when: false
+
+    - name: Install Docker via get.docker.com (only if missing)
+      when: redelk_docker_probe.rc != 0
+      block:
+        - name: Download docker install script
+          ansible.builtin.get_url:
+            url: https://get.docker.com
+            dest: /tmp/get-docker.sh
+            mode: "0755"
+            timeout: 120
+        - name: Run docker install script
+          ansible.builtin.command: sh /tmp/get-docker.sh
+          register: redelk_docker_install
+          changed_when: "'already the newest version' not in (redelk_docker_install.stdout | default(''))"
+
+    - name: Install docker-compose-plugin
+      ansible.builtin.apt:
+        name: docker-compose-plugin
+        state: present
+
+    - name: Ensure docker.service is enabled + running
+      ansible.builtin.systemd:
+        name: docker
+        enabled: true
+        state: started
+
+    - name: Clone RedELK to {{ redelk_install_dir }}
+      ansible.builtin.git:
+        repo: https://github.com/outflanknl/RedELK.git
+        dest: "{{ redelk_install_dir }}"
+        update: false
+        depth: 1
+
+    # Image pulls — slow path only. The bake script does this in bulk;
+    # the role does a coarse `docker compose pull` so we don't have to
+    # duplicate the image-list parsing. If pulls fail, install-elkserver.sh
+    # will retry inline.
+    - name: Pre-pull images for chosen profile ({{ redelk_profile }})
+      ansible.builtin.command:
+        cmd: "docker compose -f redelk-{{ redelk_profile }}.yml pull"
+        chdir: "{{ redelk_elkserver_dir }}"
+      register: redelk_compose_pull
+      changed_when: "'Pulled' in (redelk_compose_pull.stdout | default(''))"
+      failed_when: false
+
+# =============================================================================
+# Phase 2: configuration (always run — idempotent)
+# =============================================================================
+
+# RedELK's install-elkserver.sh GENERATES random ES passwords on every
+# run. For a lab we want deterministic operator-supplied passwords so
+# the demo / grading scripts can log in. We pre-write a .env from the
+# template, substituting our chosen creds — install-elkserver.sh
+# detects the existing .env and SKIPS the regenerate step.
+- name: Ensure .env.tmpl exists in {{ redelk_elkserver_dir }}
+  ansible.builtin.stat:
+    path: "{{ redelk_elkserver_dir }}/.env.tmpl"
+  register: redelk_env_tmpl
+  become: true
+  tags: [redelk, redelk-config]
+
+- name: Fail clearly when RedELK source tree is incomplete
+  ansible.builtin.fail:
+    msg: >-
+      {{ redelk_elkserver_dir }}/.env.tmpl is missing. RedELK was not
+      cloned correctly (or the upstream layout changed). Re-run the
+      bake or manually `git clone https://github.com/outflanknl/RedELK
+      {{ redelk_install_dir }}`.
+  when: not redelk_env_tmpl.stat.exists
+  tags: [redelk, redelk-config]
+
+# .env file — substitute our deterministic passwords for the {{...}}
+# placeholders that install-elkserver.sh would otherwise fill with
+# `openssl rand`. We use the SAME password for every internal ES user
+# (kibana_system, logstash_system, redelk_ingest, redelk, elastic) for
+# the lab — operators only ever log in as `elastic` or via Kibana, the
+# rest is internal plumbing. Production deployments should NOT do this.
+- name: Render /opt/redelk/elkserver/.env from .env.tmpl
+  ansible.builtin.shell:
+    cmd: |
+      set -e
+      cp -f .env.tmpl .env
+      # Substitute our deterministic creds. sed -i in-place; the
+      # template uses {{PLACEHOLDER}} double-curly markers.
+      sed -i \
+        -e 's|{{REDELKVERSION}}|cwrlab|g' \
+        -e 's|{{CREDS_kibana_system}}|{{ redelk_es_password }}|g' \
+        -e 's|{{CREDS_logstash_system}}|{{ redelk_es_password }}|g' \
+        -e 's|{{CREDS_redelk_ingest}}|{{ redelk_es_password }}|g' \
+        -e 's|{{CREDS_redelk}}|{{ redelk_es_password }}|g' \
+        -e 's|{{ELASTIC_PASSWORD}}|{{ redelk_es_password }}|g' \
+        -e 's|{{POSTGRES_PASSWORD}}|{{ redelk_es_password }}|g' \
+        -e 's|{{NEO4J_PASSWORD}}|{{ redelk_es_password }}|g' \
+        -e 's|{{KBN_XPACK_ENCRYPTEDSAVEDOBJECTS}}|{{ redelk_es_password }}cwrlabkibanaencryptkey|g' \
+        .env
+    chdir: "{{ redelk_elkserver_dir }}"
+    creates: "{{ redelk_elkserver_dir }}/.env"
+  become: true
+  tags: [redelk, redelk-config]
+
+# RedELK's config.json drives LE / external-domain settings. For the
+# lab we run on internal IPs with self-signed certs, so we override
+# external_domain to empty and disable LE.
+- name: Ensure mounts/redelk-config/etc/redelk dir exists
+  ansible.builtin.file:
+    path: "{{ redelk_elkserver_dir }}/mounts/redelk-config/etc/redelk"
+    state: directory
+    mode: "0755"
+  become: true
+  tags: [redelk, redelk-config]
+
+- name: Drop minimal config.json (self-signed certs, no LE)
+  ansible.builtin.copy:
+    dest: "{{ redelk_elkserver_dir }}/mounts/redelk-config/etc/redelk/config.json"
+    mode: "0644"
+    content: |
+      {
+        "letsencrypt": {
+          "enabled": false,
+          "email": "{{ redelk_le_email | default('') }}"
+        },
+        "external_domain": "{{ redelk_external_domain | default('') }}"
+      }
+    force: false
+  become: true
+  tags: [redelk, redelk-config]
+
+# =============================================================================
+# Phase 3: initial install-elkserver.sh run (gated — runs once)
+# =============================================================================
+# install-elkserver.sh is the upstream installer:
+#   - Generates self-signed certs (unless LE configured).
+#   - Symlinks redelk-<profile>.yml -> docker-compose.yml.
+#   - `docker compose up --build -d` to bring the stack up.
+#   - Pushes initial index templates + Kibana dashboards into ES.
+#
+# It's NOT idempotent in the sense our other installers are — re-running
+# will regenerate certs and rotate generated secrets. We gate it on
+# .deployed so it runs exactly once per VM lifetime; subsequent runs
+# of this role just ensure the stack is up (Phase 4).
+- name: Run install-elkserver.sh (one-shot — gated by .deployed)
+  ansible.builtin.command:
+    cmd: >-
+      sh ./install-elkserver.sh {{ redelk_profile }}
+      {{ 'fixedmemory' if redelk_pass_fixedmemory else '' }}
+    chdir: "{{ redelk_elkserver_dir }}"
+    creates: "{{ redelk_install_dir }}/.deployed"
+  become: true
+  # 25 min: install pulls remaining images on slow-path (~5 min), brings
+  # up the full stack with --build (~5-10 min), and seeds Kibana
+  # dashboards (~3-5 min on a cold ES). Async + poll keeps the SSH
+  # session healthy across the wait.
+  async: 1500
+  poll: 30
+  register: redelk_install_run
+  tags: [redelk, redelk-install]
+
+- name: Report — install-elkserver.sh stdout tail (when it ran)
+  ansible.builtin.debug:
+    msg: "{{ ['---- install-elkserver.sh tail ----'] +
+             ((redelk_install_run.stdout | default('')).split('\n') | reject('equalto', '') | list)[-25:] }}"
+  when: redelk_install_run is changed
+  tags: [redelk]
+
+# =============================================================================
+# Phase 4: ensure stack is running (idempotent — every run)
+# =============================================================================
+- name: Probe running RedELK containers
+  ansible.builtin.command: docker ps --format '{% raw %}{{.Names}}{% endraw %}'
+  register: redelk_docker_ps
+  changed_when: false
+  become: true
+  tags: [redelk]
+
+# `docker compose up -d` is a no-op when the stack is already running;
+# safe to call unconditionally. We use the chosen-profile compose file
+# (install-elkserver.sh symlinks it to docker-compose.yml, but referencing
+# the explicit file is robust against a botched symlink).
+- name: Ensure RedELK stack is up (docker compose up -d)
+  ansible.builtin.command:
+    cmd: "docker compose -f redelk-{{ redelk_profile }}.yml up -d"
+    chdir: "{{ redelk_elkserver_dir }}"
+  register: redelk_compose_up
+  changed_when: "'Started' in (redelk_compose_up.stderr | default(''))
+                 or 'Creating' in (redelk_compose_up.stderr | default(''))
+                 or 'Recreated' in (redelk_compose_up.stderr | default(''))"
+  become: true
+  # Light async — `up -d` should return in under a minute when the
+  # stack is already running, but on a cold start with --build it can
+  # be 5+ min.
+  async: 600
+  poll: 15
+  tags: [redelk]
+
+# =============================================================================
+# Phase 5: systemd unit for auto-restart on reboot
+# =============================================================================
+# docker-compose stacks don't auto-resume across reboots unless the
+# containers have restart: always (RedELK upstream does set this), but
+# the systemd unit is belt-and-suspenders and gives operators a clean
+# `systemctl restart redelk` handle for the diagnostic dashboard.
+- name: Drop redelk.service systemd unit
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/redelk.service
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=RedELK (Outflank red-team SIEM) — docker-compose stack
+      Requires=docker.service
+      After=docker.service network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      WorkingDirectory={{ redelk_elkserver_dir }}
+      ExecStart=/usr/bin/docker compose -f redelk-{{ redelk_profile }}.yml up -d
+      ExecStop=/usr/bin/docker compose -f redelk-{{ redelk_profile }}.yml down
+      TimeoutStartSec=900
+
+      [Install]
+      WantedBy=multi-user.target
+  become: true
+  register: redelk_unit_written
+  tags: [redelk]
+
+- name: Enable redelk.service (no restart — compose is already up)
+  ansible.builtin.systemd:
+    name: redelk
+    enabled: true
+    daemon_reload: true
+  become: true
+  tags: [redelk]
+
+# =============================================================================
+# Phase 6: health waits (Elasticsearch + Kibana)
+# =============================================================================
+# Elasticsearch on a cold container start takes 60-180s to be query-ready
+# (JVM warmup + index recovery + license check). Kibana then needs another
+# 30-90s to handshake with ES, load its plugins, and serve /api/status.
+# Generous timeouts — operators have seen 240+s on slower SKUs.
+
+- name: Wait for Elasticsearch API ({{ redelk_es_port }}) — up to 4 min
+  ansible.builtin.wait_for:
+    port: "{{ redelk_es_port }}"
+    host: 127.0.0.1
+    timeout: 240
+  tags: [redelk, redelk-health]
+
+- name: Wait for Kibana port {{ redelk_kibana_port }} to bind — up to 4 min
+  ansible.builtin.wait_for:
+    port: "{{ redelk_kibana_port }}"
+    host: 0.0.0.0
+    timeout: 240
+  tags: [redelk, redelk-health]
+
+# Port-bind isn't enough — Kibana opens the listener early then spends
+# another 30-90s on plugin init before /api/status returns 200. Poll
+# the status endpoint until it answers green (or yellow on a single-
+# node ES, which is what we have).
+- name: Wait for Kibana /api/status to respond 200 — up to 5 min
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ redelk_kibana_port }}/api/status"
+    method: GET
+    status_code: [200]
+    return_content: false
+  register: redelk_kibana_status
+  retries: 60
+  delay: 5
+  until: redelk_kibana_status.status == 200
+  failed_when: false
+  tags: [redelk, redelk-health]
+
+# =============================================================================
+# Phase 7: write .deployed marker
+# =============================================================================
+# Records this VM as fully provisioned. The install-elkserver.sh task
+# above uses `creates: .deployed` to skip on subsequent runs.
+- name: Write /opt/redelk/.deployed marker
+  ansible.builtin.copy:
+    dest: "{{ redelk_install_dir }}/.deployed"
+    mode: "0644"
+    content: |
+      deployed_at={{ ansible_date_time.iso8601 | default('unknown') }}
+      profile={{ redelk_profile }}
+      kibana_port={{ redelk_kibana_port }}
+      admin_user={{ redelk_admin_user }}
+  become: true
+  tags: [redelk]
+
+# =============================================================================
+# Phase 8: diagnostics (always-run)
+# =============================================================================
+- name: Always dump quick diagnostics
+  block:
+    - name: Diagnostic marker
+      ansible.builtin.debug:
+        msg: "Emitting RedELK diagnostic dump (always-run)"
+      changed_when: false
+  always:
+    - name: Snapshot docker ps + ports
+      ansible.builtin.command: docker ps --format 'table {% raw %}{{.Names}}\t{{.Status}}\t{{.Ports}}{% endraw %}'
+      register: redelk_ps_dump
+      changed_when: false
+      failed_when: false
+      become: true
+    - name: Snapshot listening ports for ES/Kibana/Logstash
+      ansible.builtin.command: ss -lntp
+      register: redelk_ss_dump
+      changed_when: false
+      failed_when: false
+      become: true
+    # List-form msg renders each entry on its own line in the default
+    # callback. Block-scalar `msg: |` would collapse into one
+    # JSON-escaped string with literal "\n" — ugly to read.
+    - name: Report — RedELK access info
+      ansible.builtin.debug:
+        msg:
+          - "---- RedELK access (lab) ----"
+          - "Kibana URL  : http://{{ terra_private_ip | default(ansible_host) | default('<vm-ip>') }}:{{ redelk_kibana_port }}/"
+          - "Kibana login: elastic / {{ redelk_es_password }}"
+          - "Admin user  : {{ redelk_admin_user }} (lab default — overridable via vault_redelk_admin_password)"
+          - "Logstash    : tcp/{{ redelk_logstash_beats_port }} (filebeat input from teamservers + redirectors)"
+          - "ES API      : 127.0.0.1:{{ redelk_es_port }} (internal — not exposed externally)"
+    - name: Report — docker ps
+      ansible.builtin.debug:
+        msg: "{{ ['---- redelk docker ps ----'] +
+                 (redelk_ps_dump.stdout_lines | default(['(empty)'])) }}"
+    - name: Report — listening ports
+      ansible.builtin.debug:
+        msg: "{{ ['---- redelk listening ports ----'] +
+                 (redelk_ss_dump.stdout_lines | default([]) | select('search', ':(5044|5601|9200|443|80)') | list) }}"
+  tags: [redelk, redelk-diag]

@@ -1,0 +1,21 @@
+# Shared facts across every host in the inventory.
+# Per-host facts live in inventory.py's hostvars (terra_*).
+
+# Pinned Go for Adaptix (matches what the plugins are built with;
+# 1.25.4 also fixes the `GOEXPERIMENT=jsonv2` build error that 1.22.7
+# died on).
+adaptix_go_version: "1.25.4"
+
+# Per-CDN listener port set, used by every C2 role.
+c2_listener_ports:
+  - 8443    # azure CDN (Front Door)
+  - 8444    # cloudfront
+  - 8445    # workers.dev
+  - 8446    # fastly
+  - 8447    # other
+
+# Operator commander ports per framework.
+adaptix_commander_port: 9000
+mythic_web_port:        7443
+brc4_commander_port:    9000
+sliver_grpc_port:       31337

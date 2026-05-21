@@ -1,0 +1,43 @@
+---
+# =============================================================================
+# Stepping Stones role — overridable defaults
+# =============================================================================
+# Stepping Stones is a Django + docker-compose red-team activity logger.
+# Upstream: https://github.com/stepping-stones-cyberveiligheid/Stepping-Stones
+# Deploy URL: http://<vm-private-ip>:{{ stepping_stones_listen_port }}/
+
+# Initial Django superuser. `createsuperuser --noinput` reads these from
+# the DJANGO_SUPERUSER_* env vars; the role passes them through.
+stepping_stones_admin_user: admin
+
+# Admin password. Prefer the vault-backed value when present; fall back
+# to a stable lab-default so the role never silently creates a host
+# without a known credential. Override per-environment in
+# group_vars/host_vars or via ansible-vault.
+stepping_stones_admin_password: "{{ vault_stepping_stones_admin_password | default('CWRLab2026!') }}"
+
+# Email address for the seeded superuser. Stepping Stones requires one
+# at user-creation time (Django default), but it's never actually used.
+stepping_stones_admin_email: "{{ stepping_stones_admin_user }}@local"
+
+# TCP port the Django web service binds to. Final URL students hit is
+# http://<vm>:{{ stepping_stones_listen_port }}/. Matches the upstream
+# default + the README entry under "Shared infra" in the repo root.
+stepping_stones_listen_port: 8000
+
+# Upstream repo + checkout location. Override `stepping_stones_git_ref`
+# to pin to a specific commit / tag when a regression bites.
+stepping_stones_repo:    "https://github.com/stepping-stones-cyberveiligheid/Stepping-Stones.git"
+stepping_stones_dest:    /opt/stepping-stones
+stepping_stones_git_ref: "main"
+
+# ALLOWED_HOSTS the Django app accepts. `*` is safe here because the
+# Stepping Stones VM has NO public IP in our scenarios (see
+# scenarios/redteam-lab.yaml — `public_ip: false`) — it's only reachable
+# from the hub VNet through Guacamole. Override if you ever expose it.
+stepping_stones_allowed_hosts: "*"
+
+# Optional override for the Django SECRET_KEY. When empty (the default),
+# the role generates a random 50-char key per VM on first apply and
+# pins it into the .env file so subsequent runs don't churn it.
+stepping_stones_secret_key: ""

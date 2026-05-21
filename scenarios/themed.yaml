@@ -1,0 +1,70 @@
+# Scenario: themed
+# Purpose: Showcase the persona system. Each student gets the three
+#          named-box personas (Stark, Sentry, Warrrix) plus a Kali for
+#          attacking them. No domain, no shared infra — pure CTF.
+# Cost   : ~$60/student/mo for B-series; with 10 students ~$600/mo
+# Boxes  : 4 per student × students.count
+#
+# After deploy, persona scripts auto-clean their build artefacts:
+#   - /tmp/persona.sh removed
+#   - /var/log/cloud-init*.log truncated
+#   - /var/lib/cloud/instances/*/user-data.txt removed
+#   - systemd journal vacuumed
+# Persona-seeded content (fake .bash_history files, planted flags,
+# sensitive files) is preserved.
+
+range_name: themed-ctf
+provider: azure
+azure_region: eastus
+
+students:
+  count: 10
+  tenancy: shared
+  name_format: "p{n:02d}"            # p01..p10
+
+lockdown: false
+guacamole_ingress_cidrs:
+  - "203.0.113.0/24"
+
+# No AD in this scenario — the personas are standalone Linux boxes.
+domain:
+  enabled: false
+  fqdn: corp.local
+  netbios: CORP
+  admin_user: rangeadmin
+  admin_password: "Themed!RangeAdmin1"
+  safemode_password: "Themed!SafeMode1"
+
+default_credentials:
+  windows_local_admin: rangeadmin
+  windows_local_password: "Themed!Local1"
+  linux_user: ranger
+  linux_password: "Themed!Linux1"
+
+machines:
+  # Themed boxes — each gets its persona script baked in
+  - { name: starky,  role: linux-target, os: debian-12, size: medium, persona: starky  }
+  - { name: sentry,  role: linux-target, os: ubuntu-22, size: medium, persona: sentry  }
+  - { name: warrrix, role: linux-target, os: ubuntu-22, size: large,  persona: warrrix }
+
+  # Attacker workstation
+  - { name: kali01,  role: attacker,     os: kali,      size: medium }
+
+services:
+  guacamole:
+    enabled: true
+    admin_user: guacadmin
+    admin_password: "Themed!Guac1"
+    autoregister: true
+    student_user_prefix: player-
+    student_password_template: "Player!{n:02d}"
+  elk:
+    enabled: false
+    kibana_user: elastic
+    kibana_password: "unused"
+    deploy_agents: false
+  adaptix:
+    enabled: false
+    ssh_pubkey: ""
+  redirector:
+    enabled: false

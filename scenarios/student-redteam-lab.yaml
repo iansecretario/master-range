@@ -1,0 +1,316 @@
+# Purpose: COHORT / multi-student variant of redteam-lab. Same mixed-OS
+#          domain-joined lab + same four C2 frameworks, but with TWO
+#          structural changes from redteam-lab.yaml:
+#
+#          1. Domain-fronting layer stripped out — simpler C2 callbacks:
+#             - NO Azure Front Door (advanced_c2.enabled: false)
+#             - NO c2-redirector VMs (per-student C2 listeners are the
+#               endpoints; beacons call back to a private IP directly)
+#
+#          2. Multi-student `shared` topology (see ROADMAP.md §1):
+#             - The corporate AD lab (dc01 / srv01 / ws10 / ws11 / linux01)
+#               is SHARED across the entire cohort — every student attacks
+#               the same target boxes.
+#             - Each student gets their OWN attacker kit (kali + analyst
+#               + adaptix + mythic + sliver). Per-student machine names
+#               get a `<sid>-` prefix at generate time (e.g. lab01-kali,
+#               lab02-kali, lab03-kali).
+#             - Per-student attacker subnets are NSG-isolated from peers
+#               (alice can't see bob's kali) but every attacker subnet
+#               has egress to the shared targets subnet.
+#
+#          Why this variant: teaches C2 fundamentals (listeners, agents,
+#          payload generation, post-ex) WITHOUT the operational
+#          complexity of AFD custom domains + managed certs + redirector
+#          nginx. Cheaper, faster to deploy, faster to destroy (no 20-60
+#          min AFD cert teardown). The trade-off: you lose the realistic
+#          domain-fronting / "blue-team detects fronted C2" exercise that
+#          redteam-lab gives you — use redteam-lab when fronting IS the
+#          lesson; use this when it's a distraction (i.e. teaching
+#          students the C2 lifecycle, not the OPSEC perimeter).
+#
+# Cost   : Scales with cohort size. Rough numbers (24/7 running):
+#            N=1  (solo)        ~$1.8k/mo
+#            N=3  (small class) ~$3-4k/mo
+#            N=5  (medium)      ~$5-6k/mo
+#            N=10 (large)       ~$8-10k/mo
+#          ~½ that if you `./range pause` overnight (planned, see
+#          ROADMAP.md §2.8). The shared target lab is a fixed cost; the
+#          per-student attacker kit (5 VMs each) is the variable cost.
+#
+# Boxes  : 5 shared targets + 5 per-student VMs × N + 1 operator-only
+#          BRC4 (if licensed) + 3 shared infra + guac + ELK. At N=1 → 16
+#          VMs. At N=3 → 26 VMs. At N=10 → 61 VMs.
+#
+# Note   : BRC4 is OPERATOR-ONLY in this scenario (per_student: false).
+#          The instructor's personal C2 — students never see it. The
+#          generator's BRC4-license validator permits `count > 1` when
+#          BRC4 is per_student=false. `./range apply` still prompts for
+#          License ID / Activation Key / Email / Blob SAS URL; press
+#          Enter to skip BRC4 entirely.
+#
+# Access model:
+#   - Guacamole keeps a public IP (your operator entry point). Each
+#     student gets their own Guacamole user (operator-lab01,
+#     operator-lab02, ...) with READ on only their own connection group.
+#   - ELK + Ghostwriter + SteppingStones + RedELK have NO public IP;
+#     reach them via Guacamole-registered SSH/RDP connections, or via
+#     a student's Kali browser (Kali → hub-spoke peering).
+#   - Each Windows member box has TWO Guacamole RDP connections per
+#     student (local admin + regular domain user as the assigned user);
+#     linux01 has per-student ranger + root SSH connections.
+#
+# C2 callback model (per student, no AFD, no redirector):
+#   - The per-student C2 listeners ARE the endpoints. listeners.tf will
+#     register per-student-teamserver callback URLs at the C2's PRIVATE
+#     IP inside that student's attacker subnet. Example: alice's adaptix
+#     listener registers callback https://10.1.10.5:8443; alice's kali
+#     in the same /24 reaches it directly.
+#   - Beacons NEVER leave the spoke VNet. No internet hairpin, no DNS,
+#     no AFD edge cache, no public IP on any per-student VM.
+#   - Operators who want external-callback demos do so on their personal
+#     BRC4 (per_student: false above) — that's the only path that goes
+#     out via AFD if `advanced_c2.enabled` is flipped on for the BRC4
+#     deploy.
+#
+# Multi-student CLI:
+#   ./range apply student-redteam-lab                    # solo (count=1 default)
+#   ./range apply student-redteam-lab --students 3       # 3-student cohort
+#   ./range apply student-redteam-lab --students 10      # 10-student cohort
+#   ./range up --mode shared --count 10 --scenario student-redteam-lab
+#     (when the --mode flag lands in §B7 of ROADMAP)
+#
+# Prereqs:
+#   - Azure DNS zone for `cyberwarrange.com` (Guacamole portal) exists
+#     in RG `aa_group`, delegated to Azure DNS.
+#   - Marketplace terms accepted for kali / win10 / win11.
+#     `./range preflight student-redteam-lab` checks before apply.
+#   - NO AFD DNS zone needed — `enterprisesstudio.com` is not used here.
+
+range_name: student-redteam-lab
+provider: azure
+azure_region: southeastasia    # Singapore
+
+# vm_priority defaults to Regular. Pass --spot at apply time to flip
+# every VM in this scenario to Spot pricing (~80% off PAYG, but Azure
+# can evict any VM at any time):
+#   ./range apply student-redteam-lab --spot
+# Eviction policy is "Deallocate" so OS disk + state survive — bring
+# evicted boxes back with `az vm start -g <rg> -n <vm>`.
+
+students:
+  # count is the cohort size. Override at apply with --students N:
+  #   ./range apply student-redteam-lab --students 10
+  # 1 = solo deploy (works identically to a single-student redteam-lab,
+  # all per_student=true machines emitted at quantity 1 with no sid
+  # suffix). 2+ = per-student expansion kicks in.
+  count: 1
+  tenancy: shared
+  # name_format MUST contain `{n}` when count > 1 (the generator
+  # validates this) so each per-student machine gets a unique name —
+  # e.g. with format 'lab{n:02d}' and count=3 you get lab01-kali,
+  # lab02-kali, lab03-kali. When count=1 name_format is irrelevant
+  # (sid is always empty in single-student mode).
+  name_format: "lab{n:02d}"
+
+lockdown: false
+
+# Pre-baked images (Azure Shared Image Gallery) — TWO-STEP by design:
+#   baking.enabled: true   -> terraform creates the SIG (in its OWN
+#                             resource group, survives `./range
+#                             destroy`) + the image definitions. Cheap
+#                             (~$0.50/mo) and SAFE with nothing baked —
+#                             deploys still use the Marketplace image.
+#   ./range bake <os>      -> Packer publishes an image VERSION.
+#   use_baked_<os>: true   -> NOW deploys pull that VM's OS from the SIG
+#                             image instead of Marketplace.
+# enabled and use_baked_* are SEPARATE because the SIG version lookup
+# ERRORS the whole apply if you point it at a version that doesn't
+# exist yet. Flow:  apply (gallery) -> bake -> flip use_baked -> apply.
+#   ./range bake kali         # ~30-45 min  ->  kali deploy ~2-3 min
+#   ./range bake server-2022  # ~30 min     ->  DC deploy ~10 min
+baking:
+  enabled: true
+  # use_baked_kali: true → every per-student kali boots from the SIG
+  # image instead of pulling kali-linux-default from Marketplace. Saves
+  # ~25-30 min of apt install PER STUDENT (parallel, so the saving is
+  # also in wall time — the slowest Kali boot bounds Phase 2). For
+  # an N=10 cohort this is the single biggest speedup available.
+  use_baked_kali: true
+  # Flip to true after `./range bake server-2022` once, then every
+  # future apply skips ~10-15 min of Windows DC promotion time.
+  use_baked_win_server_2022: false
+
+# Geofence Guacamole's public IP to operator-likely countries (see the
+# redteam-lab.yaml comment for the full rationale — same behaviour).
+guacamole_allow_countries: [SG, PH, AE, QA, SA]
+
+# Also auto-detect the apply-time operator public IP and prepend it as
+# /32 to guacamole_ingress_cidrs.
+guacamole_auto_add_my_ip: true
+
+domain:
+  enabled: true
+  fqdn: corp.local
+  netbios: CORP
+  admin_user: rangeadmin
+  admin_password: "Lab!Admin1"
+  safemode_password: "Lab!SafeMode1"
+  # Regular domain users seeded at DC promotion. Each becomes a member
+  # of `Domain Users` only (no admin rights). Referenced by per-machine
+  # `assigned_user:` below for the second-tier Guacamole RDP connection.
+  lab_users:
+    - { name: alice, password: "Lab!Alice1" }
+    - { name: bob,   password: "Lab!Bob1" }
+    - { name: carol, password: "Lab!Carol1" }
+
+default_credentials:
+  windows_local_admin: rangeadmin
+  windows_local_password: "Lab!Local1"
+  linux_user: ranger
+  linux_password: "Lab!Linux1"
+
+machines:
+  # =============================================================================
+  # `per_student` field convention for this scenario:
+  # =============================================================================
+  # `per_student: false`  = SHARED target lab. One copy per range. Every
+  #                         student attacks the same DC / member servers /
+  #                         workstations / linux target. Lives on the
+  #                         shared targets subnet (10.1.0.0/24).
+  # `per_student: true`   = PER-STUDENT attacker kit. When students.count
+  #                         > 1, the generator emits one copy per student
+  #                         (lab01-kali, lab02-kali, ...). Each student's
+  #                         attacker subnet is carved out of 10.1.0.0/16
+  #                         starting at 10.1.10.0/24 (alice), 10.1.11.0/24
+  #                         (bob), etc.
+  # When students.count == 1, per_student has no effect — every machine
+  # is emitted once regardless. So this file works as a solo deploy too
+  # if you apply with --students 1 (the default).
+  # =============================================================================
+
+  # ---- SHARED target lab (per_student: false) -------------------------------
+  # The corporate AD lab every student attacks. In multi-student mode
+  # these machines land in the HUB's `shared-lab` subnet (10.0.2.0/24)
+  # — every per-student attacker spoke (10.<n>.1.0/24) is peered to
+  # the hub already, so every student's kali reaches dc01 over the
+  # existing hub↔spoke peering. dc01's static_ip is set to the
+  # canonical address within hub_shared_lab so member servers can
+  # join the domain at a predictable IP.
+  # In SINGLE-student mode (count=1) these stay in the spoke targets
+  # subnet (10.1.0.0/24) — see vms.tf machine_subnet dispatch — and
+  # dc01's auto-IP would be 10.1.0.10 (last octet from static_ip).
+  - { name: dc01,    role: windows-dc,          os: windows-server-2022, size: medium, static_ip: "10.0.2.10", per_student: false }
+  - { name: srv01,   role: windows-member,      os: windows-server-2019, size: small,  domain_join: true, assigned_user: alice,  per_student: false }
+  - { name: ws10,    role: windows-workstation, os: windows-10,          size: small,  domain_join: true, assigned_user: bob,    per_student: false }
+  - { name: ws11,    role: windows-workstation, os: windows-11,          size: small,  domain_join: true, assigned_user: carol,  per_student: false }
+  # Debian box realm-joined to corp.local via SSSD/realmd. Shared across
+  # all students; both ranger and root SSH connections are registered
+  # in Guacamole (each student gets their own connection alias under
+  # their student group).
+  - { name: linux01, role: linux-target,        os: debian-12,           size: small,  persona: realm-joined, enable_root_ssh: true, per_student: false }
+
+  # ---- PER-STUDENT attacker kit (per_student: true) -------------------------
+  # Each student gets their own copy. Names get suffixed with student_id
+  # at generate time (lab01-kali, lab02-kali, ..., lab01-adaptix, ...).
+  # Per-student attacker subnets are NSG-isolated from peers; alice
+  # can't see bob's kali. All attacker subnets have egress to the
+  # shared targets subnet so every student attacks the same dc01.
+
+  # Per-student Kali workstation. Reached through Guacamole over
+  # RDP/3389 → xrdp (Xvnc-backed XFCE). Full kali-linux-default toolset
+  # + AdaptixC2 client + screen-blank prevention. Per-student because
+  # each student's session / loot / tooling is private to them.
+  - { name: kali,          role: attacker,        os: kali,         size: medium, per_student: true }
+
+  # Per-student Windows 10 analyst workstation with Mandiant FLARE-VM
+  # (RE toolset; 4 vCPU / 16 GB / 256 GB disk). FLARE-VM installs on
+  # first interactive RDP logon (~1-2 hr unattended). Per-student so
+  # malware-analysis work isn't visible to peers.
+  - { name: analyst,       role: windows-analyst, os: windows-10,   size: medium, per_student: true }
+
+  # ---- Per-student C2 teamservers — DIRECT listeners, NO redirector ----
+  # Each box runs its framework's HTTPS listeners on :8443-:8447. With
+  # advanced_c2 disabled (below) there is no AFD edge and no paired
+  # c2-redirector VM — implants call back to the C2 box's own listener.
+  # listeners.tf will register the callback URL as the PRIVATE IP of
+  # each student's own teamserver (e.g. alice's adaptix at
+  # https://10.1.10.5:8443) — beacons stay inside the spoke VNet,
+  # never leave Azure.
+  - { name: adaptix,       role: c2-server,       os: debian-12,    size: medium, per_student: true }
+  - { name: mythic,        role: c2-mythic,       os: debian-12,    size: medium, per_student: true }
+  - { name: sliver,        role: c2-sliver,       os: debian-12,    size: medium, per_student: true }
+
+  # ---- OPERATOR-ONLY (per_student: false) -----------------------------------
+  # BRC4 teamserver. License-gated AND deliberately NOT per-student:
+  # the operator / instructor's personal C2. Students never see or use
+  # it. License caps the range at one activation; the generator's
+  # BRC4-license validator permits count > 1 ONLY when BRC4 is
+  # per_student=false (search "BRC4 license constraint" in
+  # generator/generate.py for the rule). If no license env vars are set
+  # at apply time, the generator drops this machine entirely.
+  - { name: brc4,          role: c2-brc4,         os: debian-12,    size: medium, per_student: false }
+
+# ---- Shared red-team infra — INTERNAL ONLY ----
+# Each box has public_ip: false → no Azure public IP. Operators reach
+# Ghostwriter / SteppingStones / RedELK web UIs via the Kali browser
+# (Kali → hub-spoke peering → 10.0.1.X), and SSH in via Guacamole's
+# registered SSH connections under "shared-infra".
+shared_infrastructure:
+  - { name: ghostwriter,     role: ghostwriter,     os: debian-12, size: medium, public_ip: false }
+  - { name: stepping-stones, role: stepping-stones, os: debian-12, size: medium, public_ip: false }
+  - { name: redelk,          role: redelk,          os: debian-12, size: large,  public_ip: false }
+
+# advanced_c2 DISABLED — this is the whole point of the student variant.
+# With enabled: false, terraform creates NO Azure Front Door profile,
+# NO custom domains, NO AFD DNS records, and the listeners.tf per-CDN
+# callback addresses resolve to CHANGEME-* placeholders (the operator
+# points implants at the C2's real IP instead of an AFD-fronted host).
+# The remaining fields are kept for object-shape completeness but are
+# unused while enabled is false.
+advanced_c2:
+  enabled: false
+  domain: ""
+  dns_zone_resource_group: ""
+  dns_zone_subscription_id: ""
+  cover_url: ""
+  fdid_header_required: false
+  endpoint_name: ""
+  profile_name: ""
+
+services:
+  guacamole:
+    enabled: true
+    admin_user: guacadmin
+    # Empty = generate a strong random password per deploy. Surfaced
+    # via `./range creds`.
+    admin_password: ""
+    autoregister: true
+    student_user_prefix: operator-
+    student_password_template: "Op!{n:02d}!"
+    login_title: "Guidem CWR — Student Lab"
+    acme_email: "markchristiansecretario@gmail.com"
+    custom_hostname: ""
+    dns_zone_name: "cyberwarrange.com"
+    dns_zone_resource_group: "aa_group"
+    dns_zone_subscription_id: "3d78e3c1-1ec8-4ffc-ab3e-7cf1d095391f"
+  elk:
+    enabled: true
+    kibana_user: elastic
+    kibana_password: "Lab!Elastic1"
+    deploy_agents: true
+    public_ip: false   # ELK reachable only via Guacamole/Kali
+  adaptix:
+    enabled: true
+    ssh_pubkey: "ssh-ed25519 AAAA... operator@you"     # replace with your pubkey
+  # No redirectors in this scenario — the C2 listeners are used direct.
+  redirector:
+    enabled: false
+  # Ephemeral kali-2 container pool — retired (single xrdp `kali` box is
+  # the operator workstation). Flip enabled:true to bring the pool back.
+  workspaces:
+    enabled: false
+    pool_size: 4
+    vm_size: "Standard_D4s_v4"
+    auto_restart: true
+    restart_interval_min: 30

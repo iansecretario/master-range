@@ -1,0 +1,821 @@
+---
+# =============================================================================
+# Guacamole — connection refresh from the manifest produced by terraform.
+# =============================================================================
+# Cloud-init brings up the docker stack and runs /opt/guac/register.py
+# once on first boot. This role only re-runs register.py to push any
+# updated passwords (random_password rotations etc) into the existing
+# connections.
+
+# Push the CANONICAL register.py from this role's files/ to the live
+# guac VM, overwriting whatever cloud-init baked at first boot.
+#
+# Background: register.py used to live ONLY inline inside
+# modules/azure/userdata/guacamole.sh as a cloud-init `write_files`
+# entry, so the live `/opt/guac/register.py` was a frozen snapshot of
+# whatever the user-data template looked like on the day the guac VM
+# was first deployed. Subsequent edits to the RDP parameter dict
+# (e.g. removing the `disable-wallpaper: true` flag that was hiding
+# the CWR wallpaper, or dropping `resize-method: display-update` that
+# was causing the desktop to renegotiate resolution on every browser
+# resize) would land in userdata for FRESH guac VMs but never reach
+# the live one — operators saw stale connection params indefinitely.
+# Now: the source of truth is `files/register.py` in this role; the
+# userdata still embeds an identical copy for first-boot only.
+# `./range repair` overwrites the live file on every run.
+- name: Refresh /opt/guac/register.py from this role's files/
+  ansible.builtin.copy:
+    src:    register.py
+    dest:   /opt/guac/register.py
+    owner:  root
+    group:  root
+    mode:   "0755"
+  become: true
+  register: register_py_pushed
+
+# Push a FRESH manifest before register.py runs.
+#
+# Why: the Guac VM has `lifecycle { ignore_changes = [custom_data] }` —
+# the manifest cloud-init baked into /opt/guac/manifest.json at first
+# boot is the one register.py reads on every subsequent run. So changes
+# to local.guac_connections in services.tf (e.g. flipping the Kali
+# entry from RDP/3389 to VNC/5901, or adding a new student) NEVER reach
+# the live DB after a `./range repair` unless we explicitly overwrite
+# the file here.
+#
+# `terra_guacamole_manifest_b64` is set on the `all` group by
+# inventory.py from the `ansible_inventory.guacamole_manifest_b64`
+# terraform output (added to modules/azure/outputs.tf for this exact
+# purpose). When the var is empty (older state, generator pre-update,
+# state-walk fallback), we skip the overwrite and let register.py read
+# whatever's on disk — preserving existing operator-side patches.
+- name: Refresh /opt/guac/manifest.json from current terraform state
+  ansible.builtin.copy:
+    dest:    /opt/guac/manifest.json
+    content: "{{ terra_guacamole_manifest_b64 | b64decode }}"
+    owner:   root
+    group:   root
+    mode:    "0600"
+  become: true
+  when: (terra_guacamole_manifest_b64 | default('')) | length > 0
+
+- name: Re-run guac registration (idempotent / UPSERT)
+  ansible.builtin.command:
+    cmd: python3 /opt/guac/register.py
+  register: register_run
+  become: true
+  changed_when: "'created' in (register_run.stdout | default('') | lower) or 'updated' in (register_run.stdout | default('') | lower)"
+
+# ---------- TLS: ensure a browser-trusted Let's Encrypt cert ----------
+# Cloud-init's /opt/guac/letsencrypt-bootstrap.sh was supposed to do
+# this on first boot, but two problems blocked it:
+#   1. `guac_acme_email` was wired to var.services.guacamole.admin_user
+#      ("guacadmin") — not a valid email, certbot rejects.
+#   2. The bootstrap script uses `set -e` and runs a `curl -sf` health
+#      check that returns non-zero on a 404 (expected response from
+#      nginx for /.well-known/acme-challenge/test), aborting the whole
+#      script before certbot ever runs.
+# Both issues are fixed in newer deploys via terraform's `acme_email`
+# variable; THIS block patches the existing live VM so it gets a real
+# cert without redeploying.
+
+- name: Probe current Guacamole TLS cert (issuer + CN)
+  ansible.builtin.shell:
+    cmd: |
+      # Returns lines:
+      #   selfsigned=<yes|no>
+      #   cn=<common name baked into the live cert>
+      # so the next task can decide whether to (re-)issue.
+      subj=$(openssl x509 -in /opt/guac/tls/cert.pem -noout -subject 2>/dev/null | sed 's/^subject=//')
+      iss=$(openssl x509 -in /opt/guac/tls/cert.pem -noout -issuer  2>/dev/null | sed 's/^issuer=//')
+      cn=$(openssl x509 -in /opt/guac/tls/cert.pem -noout -subject -nameopt RFC2253 2>/dev/null | sed -n 's/.*CN=\([^,]*\).*/\1/p')
+      [ "$subj" = "$iss" ] && echo "selfsigned=yes" || echo "selfsigned=no"
+      echo "cn=$cn"
+  register: tls_state
+  changed_when: false
+  failed_when: false
+  become: true
+
+- name: Parse cert state into facts
+  ansible.builtin.set_fact:
+    tls_is_selfsigned: "{{ (tls_state.stdout | default('') | regex_search('selfsigned=yes')) is not none }}"
+    tls_cert_cn: "{{ tls_state.stdout | default('') | regex_search('cn=([^\\n]+)', '\\1') | first | default('') }}"
+
+- name: Resolve LE inputs (email + FQDN) for this host
+  # The FQDN comes straight from terraform (Azure-assigned cloudapp DNS).
+  # The email is the operator-supplied ACME contact; we MUST avoid the
+  # reserved RFC2606 domains (example.com, .test, .invalid) — Let's
+  # Encrypt explicitly rejects those at account-registration time with:
+  #   "contact email has forbidden domain example.com"
+  # Fallback heuristic when no email is set: use admin@<azure FQDN>.
+  # The cloudapp.azure.com domain is real (Microsoft-owned), so LE's
+  # blocklist accepts it even though no MX record points to your VM.
+  # Renewal-reminder mail won't go anywhere, but the cert issues.
+  ansible.builtin.set_fact:
+    guac_acme_fqdn: "{{ terra_guacamole_fqdn | default(ansible_host | default('')) }}"
+    guac_acme_email: >-
+      {%- set raw = terra_guacamole_acme_email | default('') | trim -%}
+      {%- set fqdn = terra_guacamole_fqdn | default(ansible_host | default('')) -%}
+      {%- if raw and (raw.split('@')[-1] | lower) not in ['example.com', 'example.org', 'example.net', 'test', 'invalid', 'localhost'] -%}
+      {{ raw }}
+      {%- elif fqdn -%}
+      admin@{{ fqdn }}
+      {%- else -%}
+      admin@example.com
+      {%- endif -%}
+
+- name: Issue Let's Encrypt cert (only when cert is self-signed / mismatched)
+  # Defers to /opt/guac/letsencrypt-bootstrap.sh — that's the single
+  # source of truth for issuance logic (DNS-01 wildcard when
+  # services.guacamole.dns_zone_name is set, HTTP-01 per-FQDN
+  # otherwise). Running the same script Ansible-side keeps the live
+  # repair path identical to first-boot cloud-init.
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -uo pipefail
+      /opt/guac/letsencrypt-bootstrap.sh 2>&1
+      # Always pull the tail of the issuance log for diagnostics — the
+      # bootstrap script's `exec >>$LOG` redirect swallows stdout/stderr
+      # otherwise.
+      tail -40 /var/log/guacamole-letsencrypt.log 2>/dev/null
+  register: certbot_run
+  become: true
+  failed_when: false
+  changed_when:
+    - "'LE bootstrap done' in (certbot_run.stdout | default(''))
+       or 'Successfully received' in (certbot_run.stdout | default(''))"
+  when:
+    # Issue when (a) cert is the self-signed fallback, or (b) the
+    # configured FQDN differs from the cert's CN — covers the case
+    # where the operator just added a custom hostname and wants the
+    # cert reissued for it. Either way we need a non-empty target FQDN.
+    - guac_acme_fqdn | length > 0
+    - (tls_is_selfsigned | bool) or (tls_cert_cn != guac_acme_fqdn)
+
+- name: Swap nginx TLS dir to the LE cert (symlinks survive renewal)
+  # The cert LIVES at either /etc/letsencrypt/live/<fqdn>/ (HTTP-01
+  # mode) or /etc/letsencrypt/live/<zone>/ (DNS-01 wildcard mode).
+  # The bootstrap script already symlinks correctly; we re-do it here
+  # idempotently in case the symlink got out of sync (e.g. operator
+  # poked at /opt/guac/tls/ manually).
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      # Prefer the wildcard cert dir (/etc/letsencrypt/live/<apex>/)
+      # when it exists; fall back to per-FQDN dir
+      # (/etc/letsencrypt/live/<fqdn>/). The apex is derived by
+      # stripping the leftmost label off the FQDN — e.g.
+      # cwr-guidem-flyy83.cyberwarrange.com → cyberwarrange.com.
+      ZONE_DIR="/etc/letsencrypt/live/{{ guac_acme_fqdn | regex_replace('^[^.]+\\.', '') }}"
+      FQDN_DIR="/etc/letsencrypt/live/{{ guac_acme_fqdn }}"
+      if   [ -d "$ZONE_DIR" ] && [ -f "$ZONE_DIR/fullchain.pem" ]; then SRC="$ZONE_DIR"
+      elif [ -d "$FQDN_DIR" ] && [ -f "$FQDN_DIR/fullchain.pem" ]; then SRC="$FQDN_DIR"
+      else exit 0  # nothing to symlink; bootstrap probably hasn't run
+      fi
+      ln -sf "$SRC/fullchain.pem" /opt/guac/tls/cert.pem
+      ln -sf "$SRC/privkey.pem"   /opt/guac/tls/key.pem
+      readlink /opt/guac/tls/cert.pem
+  become: true
+  register: le_symlinks
+  changed_when: "'fullchain.pem' in (le_symlinks.stdout | default(''))"
+  when:
+    - guac_acme_fqdn | length > 0
+
+- name: Restart nginx-guac to pick up the new TLS cert
+  ansible.builtin.command:
+    cmd: docker compose restart nginx
+    chdir: /opt/guac
+  become: true
+  when: le_symlinks is defined and (le_symlinks is changed)
+
+# ---------- Login-page branding ----------
+# Build a Guacamole extension (.jar = zip with a manifest) that
+# replaces the default login background with files/login-bg.png from
+# this role. Mounted at /etc/guacamole/extensions inside the guacamole
+# container via the GUACAMOLE_HOME env + bind mount we add to
+# docker-compose.yml below.
+- name: Ensure /opt/guac/guacamole-home/{extensions,_branding} exist
+  # Two sibling dirs under GUACAMOLE_HOME:
+  #   extensions/  — Tomcat-scanned, bind-mounted into the container.
+  #                  cwr-branding.jar lands here.
+  #   _branding/   — host-only staging for the source assets (login-bg.png
+  #                  + sentinel) that feed the JAR build below. The
+  #                  leading underscore prevents Guacamole from trying to
+  #                  load it as an extension dir at startup. Must exist
+  #                  BEFORE the copy task — ansible.builtin.copy doesn't
+  #                  mkdir -p the parent.
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0755"
+  loop:
+    - /opt/guac/guacamole-home/extensions
+    - /opt/guac/guacamole-home/_branding
+  become: true
+
+- name: Stage login-background image
+  ansible.builtin.copy:
+    src: login-bg.png
+    dest: /opt/guac/guacamole-home/_branding/login-bg.png
+    mode: "0644"
+  become: true
+  register: bg_image
+
+- name: Build cwr-branding extension JAR (image + manifest + CSS + title)
+  # The JAR includes a translation override file under translations/en.json
+  # that replaces Guacamole's "APP.NAME" key. That key is rendered as the
+  # login-page wordmark (the "APACHE GUACAMOLE" text). Customize via
+  # `./range gen <scenario> --title "Red Team Labs"`; default "Guidem CWR".
+  ansible.builtin.shell:
+    cmd: |
+      LOGIN_TITLE='{{ terra_guacamole_login_title | default("Guidem CWR") | replace("'", "") }}' python3 <<'PY'
+      import zipfile, os, json
+      title = os.environ.get('LOGIN_TITLE') or 'Guidem CWR'
+      manifest = '''{
+        "guacamoleVersion": "1.5.0",
+        "name": "Custom CWR Branding",
+        "namespace": "cwr-branding",
+        "css": ["css/style.css"],
+        "translations": ["translations/en.json"],
+        "resources": {"images/login-bg.png": "image/png"}
+      }'''
+      translations = json.dumps({
+          "APP": {"NAME": title},
+          # The browser tab title also uses this key in newer Guacamole
+          # versions; override both to be safe.
+          "TITLE": title,
+      }, indent=2)
+      # CSS notes:
+      #   - The login template (login.html in Guacamole 1.5.5) renders:
+      #       <div class="logo"></div>
+      #       <div class="version">
+      #         <div class="app-name">[AngularJS expr: APP.NAME translated]</div>
+      #         <div class="version-number">[AngularJS expr: APP.VERSION translated]</div>
+      #       </div>
+      #     (Curly-brace AngularJS expressions removed from this comment;
+      #     Ansible's Jinja pre-pass would try to evaluate them and crash
+      #     on the unknown `translate` filter.)
+      #     `.logo` is an empty div with a background-image -- that's the
+      #     green "bowl" icon we hide. `.app-name` is the wordmark text.
+      #   - The default theme paints `.app-name` near-black, invisible on
+      #     any dark backdrop. We force white + a faint purple glow.
+      css = '''.login-ui {
+          background-image:    url("app/ext/cwr-branding/images/login-bg.png") !important;
+          background-size:     cover !important;
+          background-position: center center !important;
+          background-color:    #0a0a14 !important;
+      }
+      /* Turquoise palette matching the logo. Base RGB is approximately
+       * 30/200/179 (#1ec8b3) with a lighter shade (#2ee0c8) for
+       * highlights. All translucent accents derive from these. */
+      .login-dialog {
+          background-color: rgba(8, 22, 26, 0.82) !important;
+          border-radius:    14px !important;
+          padding:          2.5em 2em !important;
+          box-shadow:       0 10px 40px rgba(0,0,0,0.65), 0 0 60px rgba(30,200,179,0.18) !important;
+          border:           1px solid rgba(46,224,200,0.28) !important;
+          max-width:        460px !important;
+          margin:           auto !important;
+      }
+      /* Hide the default green Guacamole "bowl" logo. */
+      .login-dialog .logo,
+      .login-form .logo {
+          display: none !important;
+      }
+      /* Title block: .app-name is the wordmark, .version-number the build. */
+      .login-dialog .version,
+      .login-form .version {
+          text-align: center !important;
+          margin-bottom: 1.5em !important;
+      }
+      .login-dialog .version .app-name,
+      .login-form .version .app-name,
+      .app-name {
+          color: #ffffff !important;
+          font-size: 2em !important;
+          font-weight: 700 !important;
+          letter-spacing: 2px !important;
+          text-shadow: 0 2px 12px rgba(0,0,0,0.8), 0 0 24px rgba(46,224,200,0.32) !important;
+          margin-bottom: 0.2em !important;
+      }
+      /* Hide the Guacamole build/version string ("1.5.5") under the wordmark.
+       * It leaks the upstream identity even after we've renamed APP.NAME. */
+      .login-dialog .version .version-number,
+      .login-form .version .version-number,
+      .version-number {
+          display: none !important;
+      }
+      /* Guacamole 1.5.5 renders each login field via the guac-form
+       * directive. The DOM (from templates.js) is:
+       *   .labeled-field
+       *     .field-header
+       *       <label>   <- "Username" / "Password" text
+       *     .form-field
+       *       .username-field | .password-field
+       *         <input>
+       *
+       * The upstream theme positions .field-header absolutely OVER
+       * the input as a faux-floating-label, then transitions it up
+       * once the input is focused/populated. Our dialog CSS breaks
+       * that transition path, leaving the label painted under the
+       * typed text. We sidestep the whole dance by laying labels out
+       * as block flow ABOVE their inputs, and additionally hide them
+       * on :focus-within so the typed value is the only thing in the
+       * input's visual area. */
+      .login-dialog .labeled-field {
+          display: block !important;
+          position: relative !important;
+          margin-bottom: 1em !important;
+      }
+      .login-dialog .labeled-field .field-header {
+          position: static !important;
+          display: block !important;
+          transform: none !important;
+          margin: 0 0 0.35em 0 !important;
+          padding: 0 !important;
+          background: transparent !important;
+          pointer-events: auto !important;
+      }
+      .login-dialog .labeled-field .field-header label {
+          position: static !important;
+          display: block !important;
+          color: #d8d8f0 !important;
+          font-size: 0.85em !important;
+          font-weight: 500 !important;
+          letter-spacing: 0.5px !important;
+          margin: 0 !important;
+          padding: 0 !important;
+          opacity: 1 !important;
+          pointer-events: auto !important;
+          background: transparent !important;
+          transform: none !important;
+      }
+      /* Pseudo-element belt-and-braces in case the upstream theme
+       * uses ::before / ::after to render the placeholder overlay. */
+      .login-dialog .labeled-field .field-header label::before,
+      .login-dialog .labeled-field .field-header label::after {
+          content: none !important;
+      }
+      /* Make sure form-field + its inner -field divs stack cleanly
+       * and don't overlay the header. */
+      .login-dialog .labeled-field .form-field,
+      .login-dialog .labeled-field .form-field .username-field,
+      .login-dialog .labeled-field .form-field .password-field,
+      .login-dialog .labeled-field .form-field .text-field {
+          position: static !important;
+          display: block !important;
+          width: 100% !important;
+      }
+      .login-dialog .labeled-field .form-field input {
+          width: 100% !important;
+          box-sizing: border-box !important;
+      }
+      .login-dialog input[type="text"],
+      .login-dialog input[type="password"],
+      .login-dialog input[type="email"],
+      .login-dialog .field input {
+          background-color: rgba(255,255,255,0.08) !important;
+          border: 1px solid rgba(46,224,200,0.35) !important;
+          color: #ffffff !important;
+          border-radius: 6px !important;
+          padding: 0.7em 0.85em !important;
+      }
+      .login-dialog input::placeholder { color: rgba(255,255,255,0.55) !important; }
+      .login-dialog input:focus {
+          outline: none !important;
+          border-color: rgba(80,235,210,0.9) !important;
+          box-shadow: 0 0 0 3px rgba(46,224,200,0.25) !important;
+          background-color: rgba(255,255,255,0.12) !important;
+      }
+      .login-dialog input[type="submit"],
+      .login-dialog .login,
+      .login-dialog button {
+          background: linear-gradient(135deg, #11a397 0%, #1ec8b3 100%) !important;
+          color: #ffffff !important;
+          border: none !important;
+          border-radius: 6px !important;
+          padding: 0.85em 1em !important;
+          font-weight: 600 !important;
+          cursor: pointer !important;
+          box-shadow: 0 4px 12px rgba(17,163,151,0.45) !important;
+      }
+      .login-dialog input[type="submit"]:hover,
+      .login-dialog .login:hover,
+      .login-dialog button:hover {
+          background: linear-gradient(135deg, #1ec8b3 0%, #2ee0c8 100%) !important;
+          box-shadow: 0 6px 18px rgba(30,200,179,0.55) !important;
+      }
+      .login-dialog .login-error, .login-dialog .error {
+          color: #ff9faf !important;
+          background-color: rgba(255,100,120,0.12) !important;
+          border: 1px solid rgba(255,100,120,0.35) !important;
+          border-radius: 6px !important;
+          padding: 0.5em 0.75em !important;
+      }
+      '''
+      with open('/opt/guac/guacamole-home/_branding/login-bg.png','rb') as f:
+          img = f.read()
+      out = '/opt/guac/guacamole-home/extensions/cwr-branding.jar'
+      with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as z:
+          z.writestr('guac-manifest.json', manifest.encode('utf-8'))
+          z.writestr('css/style.css', css.encode('utf-8'))
+          z.writestr('translations/en.json', translations.encode('utf-8'))
+          z.writestr('images/login-bg.png', img)
+      os.chmod(out, 0o644)
+      PY
+  args:
+    # NOT using `creates:` here — that would short-circuit re-runs when
+    # the title changes but the image doesn't. The conditional below
+    # owns the rebuild trigger so it covers both axes.
+    executable: /bin/bash
+  become: true
+  # Rebuild whenever the image OR the title changes. Stamp the current
+  # title into a sentinel file and compare.
+  register: jar_build
+
+- name: Stamp current branding sentinel (title + image checksum)
+  # Track WHAT the current JAR was built from. Re-run rebuilds when
+  # the title changes (CLI flag) or the image bytes change, even if
+  # neither the file path nor the image stat-mtime drift.
+  ansible.builtin.shell:
+    cmd: |
+      printf 'title=%s\nimage=%s\n' \
+        "{{ terra_guacamole_login_title | default('Guidem CWR') }}" \
+        "$(sha256sum /opt/guac/guacamole-home/_branding/login-bg.png 2>/dev/null | cut -d' ' -f1)" \
+        > /opt/guac/guacamole-home/_branding/.sentinel.new
+      if [ -f /opt/guac/guacamole-home/_branding/.sentinel ] && \
+         cmp -s /opt/guac/guacamole-home/_branding/.sentinel \
+                /opt/guac/guacamole-home/_branding/.sentinel.new; then
+        rm /opt/guac/guacamole-home/_branding/.sentinel.new
+        echo UNCHANGED
+      else
+        mv /opt/guac/guacamole-home/_branding/.sentinel.new \
+           /opt/guac/guacamole-home/_branding/.sentinel
+        echo CHANGED
+      fi
+  register: brand_sentinel
+  changed_when: "'CHANGED' in brand_sentinel.stdout"
+  become: true
+
+- name: Patch /opt/guac/docker-compose.yml to mount GUACAMOLE_HOME
+  ansible.builtin.shell:
+    cmd: |
+      python3 <<'PY'
+      import yaml, pathlib
+      p = pathlib.Path('/opt/guac/docker-compose.yml')
+      doc = yaml.safe_load(p.read_text())
+      svc = doc['services']['guacamole']
+      env = svc.setdefault('environment', {})
+      mount = './guacamole-home:/etc/guacamole:ro'
+      vols = svc.setdefault('volumes', [])
+      changed = False
+      if env.get('GUACAMOLE_HOME') != '/etc/guacamole':
+          env['GUACAMOLE_HOME'] = '/etc/guacamole'
+          changed = True
+      if mount not in vols:
+          vols.append(mount)
+          changed = True
+      if changed:
+          p.write_text(yaml.dump(doc, sort_keys=False))
+          print('CHANGED')
+      else:
+          print('UNCHANGED')
+      PY
+  register: compose_patch
+  changed_when: "'CHANGED' in compose_patch.stdout"
+  become: true
+
+- name: Recreate guacamole container if branding or compose changed
+  ansible.builtin.command:
+    cmd: docker compose up -d --force-recreate guacamole
+    chdir: /opt/guac
+  become: true
+  when: (brand_sentinel is changed)
+        or (compose_patch is changed)
+        or (bg_image is changed)
+
+# ---------- Favicon override (optional) ----------
+# Drop favicon.ico (preferred) or favicon.png into
+#   modules/azure/ansible/roles/guacamole/files/
+# and the playbook will mount it into the nginx container and intercept
+# the browser's /favicon.ico request + Guacamole's own embedded icon
+# paths. If neither file is present, this block no-ops.
+- name: Discover favicon in role files (controller-side)
+  ansible.builtin.set_fact:
+    # `first_found` searches the role's files/ dir; errors='ignore' keeps
+    # the play running when neither file is present.
+    favicon_src: "{{ lookup('first_found', ['favicon.ico', 'favicon.png'], errors='ignore') | default('', true) }}"
+
+- name: Compute favicon target filename (preserve extension)
+  ansible.builtin.set_fact:
+    favicon_name: "{{ 'favicon.' + (favicon_src.split('.')[-1]) }}"
+    favicon_mime: "{{ 'image/x-icon' if favicon_src.endswith('.ico') else 'image/png' }}"
+  when: favicon_src | length > 0
+
+- name: Ensure /opt/guac/branding exists
+  ansible.builtin.file:
+    path: /opt/guac/branding
+    state: directory
+    mode: "0755"
+  become: true
+  when: favicon_src | length > 0
+
+- name: Stage favicon into branding dir
+  ansible.builtin.copy:
+    src: "{{ favicon_src }}"
+    dest: "/opt/guac/branding/{{ favicon_name }}"
+    mode: "0644"
+  become: true
+  register: favicon_stage
+  when: favicon_src | length > 0
+
+- name: Patch /opt/guac/docker-compose.yml to mount branding into nginx
+  ansible.builtin.shell:
+    cmd: |
+      python3 <<'PY'
+      import yaml, pathlib
+      p = pathlib.Path('/opt/guac/docker-compose.yml')
+      doc = yaml.safe_load(p.read_text())
+      svc = doc['services']['nginx']
+      vols = svc.setdefault('volumes', [])
+      mount = './branding:/var/www/branding:ro'
+      changed = False
+      if mount not in vols:
+          vols.append(mount)
+          changed = True
+      if changed:
+          p.write_text(yaml.dump(doc, sort_keys=False))
+          print('CHANGED')
+      else:
+          print('UNCHANGED')
+      PY
+  register: compose_nginx_patch
+  changed_when: "'CHANGED' in compose_nginx_patch.stdout"
+  become: true
+  when: favicon_src | length > 0
+
+- name: Patch /opt/guac/nginx.conf to serve custom favicon
+  # Inject a `location = /favicon.ico` block (browsers auto-request this
+  # at the site root) AND intercept Guacamole's hard-coded HTML icon path
+  # `/images/guac-tray-icons.png` so the favicon shown next to the tab
+  # title also changes. Both rules sit above the catch-all `location /`
+  # so they win the regex priority race.
+  ansible.builtin.shell:
+    cmd: |
+      FAV_NAME='{{ favicon_name }}' FAV_MIME='{{ favicon_mime }}' python3 <<'PY'
+      # All comments in this heredoc avoid the Jinja delimiters and
+      # backticks: Ansible scans the full cmd string for templating
+      # markers before bash ever sees it, and stray pairs in comments
+      # cause spurious parse errors.
+      import os, pathlib, re
+      p = pathlib.Path('/opt/guac/nginx.conf')
+      cfg = p.read_text()
+      fav_name = os.environ['FAV_NAME']
+      fav_mime = os.environ['FAV_MIME']
+      marker_begin = '# >>> cwr-favicon (managed by ansible) >>>'
+      marker_end   = '# <<< cwr-favicon (managed by ansible) <<<'
+      # Triple-quoted template plus str.replace dodges f-string brace
+      # escaping (nginx config has literal braces that would otherwise
+      # need doubling).
+      tmpl = '''  __MB__
+        location = /favicon.ico {
+          alias /var/www/branding/__NAME__;
+          default_type __MIME__;
+          add_header Cache-Control "public, max-age=86400";
+          access_log off;
+        }
+        location = /images/logo-64.png {
+          alias /var/www/branding/__NAME__;
+          default_type __MIME__;
+          add_header Cache-Control "public, max-age=86400";
+          access_log off;
+        }
+        location = /images/logo-144.png {
+          alias /var/www/branding/__NAME__;
+          default_type __MIME__;
+          add_header Cache-Control "public, max-age=86400";
+          access_log off;
+        }
+        __ME__
+      '''
+      block = (tmpl
+               .replace('__MB__', marker_begin)
+               .replace('__ME__', marker_end)
+               .replace('__NAME__', fav_name)
+               .replace('__MIME__', fav_mime))
+      # Normalize to a clean 2-space base indent so the injected block
+      # reads as a peer of the surrounding nginx server-block children.
+      norm = []
+      for line in block.splitlines():
+          s = line.strip()
+          if not s:
+              norm.append('')
+          elif s == '}':
+              norm.append('  ' + s)
+          elif s.startswith('location') or s.startswith('#'):
+              norm.append('  ' + s)
+          else:
+              norm.append('    ' + s)
+      block = '\n'.join(norm) + '\n'
+      # Strip any prior managed block so re-runs are idempotent and a
+      # favicon extension swap (ico to png or back) produces the right
+      # alias on the second apply.
+      cfg_new = re.sub(
+          r'[ \t]*' + re.escape(marker_begin) + r'.*?' + re.escape(marker_end) + r'\n?',
+          '',
+          cfg,
+          flags=re.DOTALL,
+      )
+      # Insert immediately before the catch-all location / in the 443
+      # server, anchored on the proxy_pass line. The port-80 server only
+      # has the redirect plus ACME blocks, no proxy_pass to guacamole, so
+      # the anchor matches exactly one site.
+      anchor_re = re.compile(
+          r'([ \t]*)location / \{[^}]*?proxy_pass http://guacamole:8080/guacamole/;',
+          re.DOTALL,
+      )
+      m = anchor_re.search(cfg_new)
+      if not m:
+          # Bail loudly when the anchor is missing rather than silently
+          # no-op and leave the favicon mounted but unreachable.
+          print('ANCHOR_NOT_FOUND')
+          raise SystemExit(2)
+      cfg_new = cfg_new[:m.start()] + block + m.group(0) + cfg_new[m.end():]
+      if cfg_new != cfg:
+          p.write_text(cfg_new)
+          print('CHANGED')
+      else:
+          print('UNCHANGED')
+      PY
+  register: nginx_favicon_patch
+  changed_when: "'CHANGED' in nginx_favicon_patch.stdout"
+  failed_when: nginx_favicon_patch.rc != 0 or 'ANCHOR_NOT_FOUND' in nginx_favicon_patch.stdout
+  become: true
+  when: favicon_src | length > 0
+
+# ---------- Phase: WebSocket upgrade fix ----------
+# Guacamole's HTML5 tunnel REQUIRES the WebSocket upgrade to make it
+# through the reverse proxy. The original cloud-init nginx.conf had:
+#   proxy_set_header Connection $http_connection;
+# which echoes back whatever Connection header the browser sent.
+# For WS handshake the browser sends Connection: Upgrade — fine. For
+# every NON-WS request it sends Connection: keep-alive, which Tomcat
+# treats as "don't upgrade this connection". Result: Guacamole falls
+# back to HTTP-polling tunnel ("Using HTTP tunnel (not WebSocket).
+# Performance may be sub-optimal." in guacamole logs), and ~60s
+# later the poll times out → operator sees the generic ERROR page.
+#
+# This patch:
+#   1. Adds a top-level `map $http_upgrade $connection_upgrade { ... }`
+#      that emits "upgrade" only on real WS handshakes.
+#   2. Switches the 443 `location /` to use $connection_upgrade and
+#      bumps proxy_read_timeout / proxy_send_timeout to 24h so quiet
+#      RDP sessions aren't killed at nginx's default 60s idle.
+- name: Patch /opt/guac/nginx.conf for proper WebSocket proxying
+  ansible.builtin.shell:
+    cmd: |
+      python3 <<'PY'
+      import pathlib, re
+      p = pathlib.Path('/opt/guac/nginx.conf')
+      cfg = p.read_text()
+      marker_begin = '# >>> cwr-ws-proxy (managed by ansible) >>>'
+      marker_end   = '# <<< cwr-ws-proxy (managed by ansible) <<<'
+      map_block = (
+          marker_begin + '\n'
+          'map $http_upgrade $connection_upgrade {\n'
+          '    default upgrade;\n'
+          "    ''      close;\n"
+          '}\n'
+          + marker_end + '\n\n'
+      )
+      changed = False
+      # 1) Inject map directive at file head (only if absent — re-runs
+      # are idempotent thanks to the markers).
+      if marker_begin not in cfg:
+          cfg = map_block + cfg
+          changed = True
+      # 2) Swap Connection header source: $http_connection (the bug) ->
+      # $connection_upgrade (the fix). regex covers both old and new
+      # whitespace variants from earlier versions of this file.
+      cfg_new, n = re.subn(
+          r'proxy_set_header[ \t]+Connection[ \t]+\$http_connection;',
+          'proxy_set_header Connection $connection_upgrade;',
+          cfg,
+      )
+      if n > 0:
+          cfg = cfg_new
+          changed = True
+      # 3) Add proxy_read_timeout / proxy_send_timeout after the
+      # Connection line if not already present.
+      if 'proxy_read_timeout' not in cfg:
+          cfg_new, n = re.subn(
+              r'(proxy_set_header[ \t]+Connection[ \t]+\$connection_upgrade;)',
+              r'\1\n          proxy_read_timeout 86400s;\n          proxy_send_timeout 86400s;',
+              cfg,
+              count=1,
+          )
+          if n > 0:
+              cfg = cfg_new
+              changed = True
+      if changed:
+          p.write_text(cfg)
+          print('CHANGED')
+      else:
+          print('UNCHANGED')
+      PY
+  register: nginx_ws_patch
+  changed_when: "'CHANGED' in nginx_ws_patch.stdout"
+  become: true
+
+# ---------- Phase: kill Angular FOUC ("APP.NAME" flash) ----------
+# Guacamole's HTML/JS templates bind the page wordmark with
+#   <div class="app-name">{{'APP.NAME' | translate}}</div>
+# Until our extension's translations/en.json loads (a couple hundred
+# ms after first paint), Angular renders the literal key "APP.NAME"
+# in the wordmark slot. We sidestep this by having nginx textually
+# substitute "APP.NAME" -> "<title>" in the upstream HTML/JS
+# response: Angular's translate filter then runs on the literal
+# title, finds no key, falls back to the literal — same final
+# render, just immediately.
+- name: Patch /opt/guac/nginx.conf to add sub_filter for APP.NAME
+  ansible.builtin.shell:
+    cmd: |
+      TITLE_TEXT='{{ terra_guacamole_login_title | default("Guidem CWR") | replace("'", "") }}' python3 <<'PY'
+      import os, pathlib, re
+      p = pathlib.Path('/opt/guac/nginx.conf')
+      cfg = p.read_text()
+      title = os.environ.get('TITLE_TEXT') or 'Guidem CWR'
+      marker_begin = '# >>> cwr-subfilter (managed by ansible) >>>'
+      marker_end   = '# <<< cwr-subfilter (managed by ansible) <<<'
+      # Directives injected INSIDE the catch-all `location /` block.
+      # `proxy_set_header Accept-Encoding ""` is required: nginx
+      # sub_filter cannot operate on a gzipped body, so we ask
+      # upstream (the guacamole tomcat) to send us text uncompressed.
+      # `sub_filter_types` extends sub_filter beyond the default
+      # text/html so the templates.js bundle (served as application/
+      # javascript) is rewritten too. `sub_filter_once off` lets
+      # the rule match every occurrence, not just the first.
+      tmpl = '''    __MB__
+          proxy_set_header Accept-Encoding "";
+          sub_filter_once off;
+          sub_filter_types text/html application/javascript text/javascript;
+          sub_filter "APP.NAME" "__TITLE__";
+          sub_filter "images/logo-64.png" "images/logo-64.png?cwr=1";
+          sub_filter "images/logo-144.png" "images/logo-144.png?cwr=1";
+          __ME__'''
+      block = (tmpl
+               .replace('__MB__', marker_begin)
+               .replace('__ME__', marker_end)
+               .replace('__TITLE__', title))
+      # Strip any prior managed block so this is re-applicable when
+      # the title changes (CLI --title flag).
+      cfg_new = re.sub(
+          r'[ \t]*' + re.escape(marker_begin) + r'.*?' + re.escape(marker_end) + r'\n?',
+          '',
+          cfg,
+          flags=re.DOTALL,
+      )
+      # Find the catch-all `location /` block: starts with the
+      # proxy_pass anchor, ends at the first closing brace afterward.
+      anchor = re.compile(
+          r'(location / \{[^}]*?proxy_pass http://guacamole:8080/guacamole/;[^}]*?)(\n\s*\})',
+          re.DOTALL,
+      )
+      m = anchor.search(cfg_new)
+      if not m:
+          print('ANCHOR_NOT_FOUND')
+          raise SystemExit(2)
+      cfg_new = (cfg_new[:m.end(1)] + '\n' + block + m.group(2) + cfg_new[m.end():])
+      if cfg_new != cfg:
+          p.write_text(cfg_new)
+          print('CHANGED')
+      else:
+          print('UNCHANGED')
+      PY
+  register: nginx_subfilter_patch
+  changed_when: "'CHANGED' in nginx_subfilter_patch.stdout"
+  failed_when: nginx_subfilter_patch.rc != 0 or 'ANCHOR_NOT_FOUND' in nginx_subfilter_patch.stdout
+  become: true
+
+- name: Restart nginx-guac container when favicon, mount, or sub_filter changed
+  ansible.builtin.command:
+    cmd: docker compose up -d --force-recreate nginx
+    chdir: /opt/guac
+  become: true
+  when: (favicon_src | length > 0
+         and (favicon_stage is changed
+              or compose_nginx_patch is changed
+              or nginx_favicon_patch is changed))
+        or (nginx_subfilter_patch is changed)
+
+- name: Report
+  ansible.builtin.debug:
+    msg:
+      - "Guacamole branding extension at /opt/guac/guacamole-home/extensions/cwr-branding.jar"
+      - "Login background URL: /app/ext/cwr-branding/images/login-bg.png"
+      - "Favicon: {{ ('/opt/guac/branding/' + favicon_name) if (favicon_src | length > 0) else '(none — drop favicon.ico into roles/guacamole/files/ to override)' }}"
+      - "(Hard-refresh the login page if you don't see it immediately — Guacamole's app.css is cache-busted only when the build changes.)"
+      - ""
+      - "--- registration output ---"
+      - "{{ register_run.stdout_lines | default([]) }}"

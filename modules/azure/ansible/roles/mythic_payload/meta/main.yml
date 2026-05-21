@@ -1,0 +1,24 @@
+---
+galaxy_info:
+  role_name: mythic_payload
+  author: terra-range
+  description: >-
+    Authenticate to a Mythic teamserver via the REST /auth endpoint,
+    create payloads (apollo / poseidon / athena) via /api/v1.4/payloads/create
+    for every registered httpx listener, and save them on the target
+    Kali host. Designed to run as one of the LAST plays in
+    modules/azure/ansible/playbook.yml.
+  license: MIT
+  min_ansible_version: "2.14"
+  platforms:
+    - name: Debian
+      versions:
+        - all
+  galaxy_tags:
+    - security
+    - redteam
+    - mythic
+    - c2
+    - kali
+
+dependencies: []

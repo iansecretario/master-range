@@ -1,0 +1,310 @@
+---
+# =============================================================================
+# windows-base — baseline configuration applied to every Windows host
+# =============================================================================
+# Today: stages the CWR desktop wallpaper + sets it as the machine-wide
+# wallpaper via the HKLM Policies\System keys (forced for ALL users on
+# the box, not just the currently-logged-in one).
+#
+# Future Windows config tasks go here so we don't have to spin up a
+# new role for each one.
+#
+# Connection: WinRM over HTTP/5985 (set up in each Windows VM's
+# userdata; reachable from guacamole via the spoke NSG's from-hub
+# rule). See modules/azure/ansible/inventory.py — Windows hosts are
+# in the `windows` group with `ansible_connection: winrm`.
+
+# Belt-and-suspenders: confirm WinRM is actually responding before
+# we try to do work. The setup module is a cheap no-op that fails
+# clearly if WinRM auth/network is wrong, instead of producing a
+# confusing error mid-task.
+- name: Probe WinRM (gather minimal facts)
+  ansible.builtin.setup:
+    gather_subset: ["!all", "!min", "os_family", "hostname"]
+
+# ---- CWR wallpaper ---------------------------------------------------------
+
+- name: Ensure C:\ProgramData\CWR directory exists
+  ansible.windows.win_file:
+    path: C:\ProgramData\CWR
+    state: directory
+
+- name: Stage CWR wallpaper on the Windows VM
+  # Resolves via ansible's standard `files/` search path — the same
+  # `modules/azure/ansible/files/desktop-wallpaper-CWR.png` we use
+  # for kali. 1.1 MB, 1920x1080 PNG. win_copy goes over WinRM with no
+  # practical payload size limit (multi-MB works fine), so we push the
+  # ORIGINAL full-quality PNG byte-for-byte — no JPG conversion, no
+  # resolution downscale, no transit storage account in between.
+  ansible.windows.win_copy:
+    src: desktop-wallpaper-CWR.png
+    dest: C:\ProgramData\CWR\wallpaper.png
+
+# Idempotent cleanup of any prior emergency-fix wallpaper at this path.
+# An operator can hit the wallpaper policy via `az vm run-command invoke`
+# when ansible isn't reachable yet (e.g. before the windows inventory
+# output is in terraform state — see outputs.tf history) and that path
+# can't carry a 1.1MB PNG through Azure's 256KB run-command payload
+# limit, so it lands a downsized JPG at `wallpaper.jpg` and points the
+# HKLM Wallpaper policy at the JPG. Once ansible takes over below the
+# policy moves to `wallpaper.png`, but the orphaned JPG would linger on
+# disk. Removing it here keeps `C:\ProgramData\CWR\` clean and the role
+# converges to a single deterministic on-disk artifact regardless of
+# which path landed the wallpaper originally. `state: absent` on a
+# non-existent file is a no-op, so this is safe on first-time deploys.
+- name: Remove any prior emergency-fix wallpaper.jpg
+  ansible.windows.win_file:
+    path: C:\ProgramData\CWR\wallpaper.jpg
+    state: absent
+
+# HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System is the
+# machine-wide Group Policy equivalent — Wallpaper here is forced for
+# every user that logs in, no per-user HKCU plumbing needed. This is
+# the same key the "Desktop Wallpaper" GPO writes to.
+- name: Set machine-wide Wallpaper policy (HKLM)
+  ansible.windows.win_regedit:
+    path: HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System
+    name: Wallpaper
+    data: C:\ProgramData\CWR\wallpaper.png
+    type: string
+
+# WallpaperStyle values (string-typed, per Windows registry oddity):
+#   "0" = centered / "1" = tiled / "2" = stretched / "6" = fit / "10" = fill / "22" = span
+# We use stretched (2) — looks right at 1920x1080 on every RDP viewport
+# size, no black bars, no cropping. Operators can override per-deploy
+# via a future variable if needed.
+- name: Set Wallpaper style = stretched (HKLM policy)
+  ansible.windows.win_regedit:
+    path: HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System
+    name: WallpaperStyle
+    data: "2"
+    type: string
+
+- name: Set TileWallpaper = 0 (HKLM policy, never tile)
+  ansible.windows.win_regedit:
+    path: HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System
+    name: TileWallpaper
+    data: "0"
+    type: string
+
+# Force the policy to take effect on currently-logged-in users without
+# requiring a sign-out. `RUNDLL32.EXE USER32.DLL,UpdatePerUserSystemParameters`
+# nudges Explorer to re-read the wallpaper setting; users who happen
+# to be RDP'd in see the change within a few seconds. New / future
+# logins inherit the policy at sign-in. failed_when:false because this
+# is a polish step — if it fails the wallpaper still applies on next
+# logon, just not immediately.
+- name: Trigger Explorer to re-read wallpaper policy
+  ansible.windows.win_shell: |
+    Get-Process explorer -ErrorAction SilentlyContinue | Out-Null
+    rundll32.exe user32.dll,UpdatePerUserSystemParameters 1, True
+  failed_when: false
+  changed_when: false
+
+# ============================================================================
+# Privacy / telemetry hardening
+# ============================================================================
+# These tasks bake the SAME registry posture we'll later put into the
+# `packer/_shared/windows-hardening.ps1` script when we add baked Win 10
+# / Win 11 / Win Server 2019 / Win Server 2022 images. Running the SAME
+# set of keys via ansible AND via the packer provisioner gives us
+# defense-in-depth: if an operator deploys against a stock Marketplace
+# image (no baked hardening), repair fills in. If they deploy against a
+# baked image, ansible reapplies the same keys idempotently and confirms
+# they didn't drift.
+#
+# Why "even though it wont have internet" matters: NSGs deny outbound
+# to the public internet from every spoke subnet in lockdown mode, but
+# (a) operators occasionally flip lockdown off to e.g. fetch a tool,
+# (b) AFD egress paths exist for beacon callbacks and any misconfig
+# could become a side channel, (c) the threat model anticipates a
+# future where students get inadvertent internet access. Forcing
+# sample submission off at the OS layer makes Windows REFUSE to send
+# samples even when the network would allow it — belt + suspenders.
+
+- name: Disable telemetry (HKLM Policies\DataCollection)
+  ansible.windows.win_regedit:
+    path: HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection
+    name: AllowTelemetry
+    data: 0
+    type: dword
+
+- name: Disable tailored experiences with diagnostic data
+  ansible.windows.win_regedit:
+    path: HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent
+    name: DisableTailoredExperiencesWithDiagnosticData
+    data: 1
+    type: dword
+
+- name: Disable advertising info (HKLM policy)
+  ansible.windows.win_regedit:
+    path: HKLM:\SOFTWARE\Policies\Microsoft\Windows\AdvertisingInfo
+    name: DisabledByGroupPolicy
+    data: 1
+    type: dword
+
+- name: Disable advertising info (HKLM CurrentVersion side)
+  ansible.windows.win_regedit:
+    path: HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AdvertisingInfo
+    name: Enabled
+    data: 0
+    type: dword
+
+- name: Disable Find My Device
+  ansible.windows.win_regedit:
+    path: HKLM:\SOFTWARE\Policies\Microsoft\FindMyDevice
+    name: AllowFindMyDevice
+    data: 0
+    type: dword
+
+- name: Disable Location Service (HKLM policy)
+  ansible.windows.win_regedit:
+    path: HKLM:\SOFTWARE\Policies\Microsoft\Windows\LocationAndSensors
+    name: DisableLocation
+    data: 1
+    type: dword
+
+- name: Disable Cortana
+  ansible.windows.win_regedit:
+    path: HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search
+    name: AllowCortana
+    data: 0
+    type: dword
+
+# DiagTrack ("Connected User Experiences and Telemetry") is the service
+# that ships telemetry to Microsoft. Stop + disable. failed_when:false
+# because on some SKUs (Server Core) the service may not be present —
+# ignore rather than failing the play.
+- name: Stop + disable DiagTrack telemetry service
+  ansible.windows.win_service:
+    name: DiagTrack
+    state: stopped
+    start_mode: disabled
+  failed_when: false
+
+# dmwappushservice is the WAP Push Message Routing service used by
+# telemetry-adjacent push channels. Same pattern as DiagTrack.
+- name: Stop + disable dmwappushservice
+  ansible.windows.win_service:
+    name: dmwappushservice
+    state: stopped
+    start_mode: disabled
+  failed_when: false
+
+# ============================================================================
+# Windows Defender sample submission — forced OFF
+# ============================================================================
+# Two registry keys cover the user-facing toggle ("Send file samples to
+# Microsoft") and the underlying Spynet feature. Setting both to the
+# most-restrictive value ensures:
+#   - SubmitSamplesConsent = 2  →  NeverSend
+#   - SpynetReporting       = 0  →  off
+# Even if a future Defender policy flips one of them, the other stops
+# the egress.
+- name: Force Defender SubmitSamplesConsent = NeverSend (2)
+  ansible.windows.win_regedit:
+    path: HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Spynet
+    name: SubmitSamplesConsent
+    data: 2
+    type: dword
+
+- name: Disable Defender SpynetReporting (MAPS)
+  ansible.windows.win_regedit:
+    path: HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Spynet
+    name: SpynetReporting
+    data: 0
+    type: dword
+
+# Belt-and-suspenders: also set the keys on the non-policy side. On
+# some SKUs the policy keys are honored, on others the
+# `HKLM\SOFTWARE\Microsoft\Windows Defender\...` side is what
+# Defender actually reads.
+#
+# WHY Set-MpPreference instead of win_regedit:
+# The `HKLM:\SOFTWARE\Microsoft\Windows Defender\Spynet` hive is
+# ACL-protected — even local Administrator can't write to it directly
+# (owned by NT SERVICE\TrustedInstaller, no inherit). win_regedit fails
+# with "Requested registry access is not allowed" on Win10/11/Server
+# 2019+. `Set-MpPreference` is the Defender Antimalware API itself,
+# which authorizes its own writes via the WMI MSFT_MpPreference class —
+# no ACL drama. Both knobs map cleanly:
+#   SubmitSamplesConsent = 2          → -SubmitSamplesConsent NeverSend
+#   SpynetReporting      = 0          → -MAPSReporting Disabled
+#
+# Tamper Protection (TP): if TP is ON, Set-MpPreference still works
+# for these two specific knobs in PowerShell ≥ 5.1 because they're
+# whitelisted as "user-configurable" — TP only blocks RTP/sample-on
+# transitions, not sample-OFF transitions. If a future Defender build
+# tightens that, we'll see "Operation failed with the following error:
+# 0x800704EC" and need to disable TP via Intune/MDE.
+- name: Force Defender sample-submission + MAPS OFF (non-policy side, via Set-MpPreference)
+  ansible.windows.win_shell: |
+    $ErrorActionPreference = 'Stop'
+    # Idempotent: read current values, only set if they differ. Avoids
+    # re-emitting Defender event-log entries on every repair run.
+    $pref = Get-MpPreference -ErrorAction SilentlyContinue
+    $needs = $false
+    if (-not $pref) { $needs = $true }
+    if ($pref -and $pref.SubmitSamplesConsent -ne 2) { $needs = $true }   # 2 = NeverSend
+    if ($pref -and $pref.MAPSReporting        -ne 0) { $needs = $true }   # 0 = Disabled
+    if ($needs) {
+      Set-MpPreference -SubmitSamplesConsent NeverSend -MAPSReporting Disabled
+      "CHANGED"
+    } else {
+      "UNCHANGED"
+    }
+  register: mp_pref_set
+  changed_when: "'CHANGED' in mp_pref_set.stdout"
+  # Tolerate odd corner cases (Defender service stopped, image lacks
+  # MpPreference cmdlet on Server Core, etc.) — the policy-side regedit
+  # block above is the primary enforcement, this is belt-and-suspenders.
+  failed_when: false
+
+# Disable Defender cloud-delivered protection — the pipeline that
+# uploads file hashes (and sometimes samples) for cloud lookups. MAPS
+# = Microsoft Active Protection Service.
+- name: Disable Defender cloud first-seen block (MAPS)
+  ansible.windows.win_regedit:
+    path: HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Spynet
+    name: DisableBlockAtFirstSeen
+    data: 1
+    type: dword
+
+# ============================================================================
+# OOBE / first-login UX suppression
+# ============================================================================
+# On a freshly sysprepped image, the first interactive login shows the
+# "Choose privacy settings for your device" wizard. Pre-set every
+# toggle to its most-private value AND tell Windows to skip the wizard.
+
+- name: Disable OOBE privacy-settings wizard
+  ansible.windows.win_regedit:
+    path: HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\OOBE
+    name: DisablePrivacyExperience
+    data: 1
+    type: dword
+
+- name: Skip OOBE "Protect Your PC" page
+  ansible.windows.win_regedit:
+    path: HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\OOBE
+    name: ProtectYourPC
+    data: 3
+    type: dword
+
+# Deny location capability OS-wide. Even if a future Win10/11 update
+# re-enables location prompts, this blocks the capability handshake.
+- name: Deny location capability OS-wide
+  ansible.windows.win_regedit:
+    path: HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location
+    name: Value
+    data: Deny
+    type: string
+
+# Linguistic / typing telemetry — Windows can phone home n-gram stats
+# for autocomplete model improvement. Off.
+- name: Disable linguistic data collection
+  ansible.windows.win_regedit:
+    path: HKLM:\SOFTWARE\Policies\Microsoft\Windows\TextInput
+    name: AllowLinguisticDataCollection
+    data: 0
+    type: dword

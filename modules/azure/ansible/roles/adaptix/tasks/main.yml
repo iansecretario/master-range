@@ -1,0 +1,670 @@
+---
+# =============================================================================
+# AdaptixC2 teamserver: ensure server + plugins are built, services up,
+# and the 5 BeaconHTTP listeners (:8443-:8447) are registered.
+# =============================================================================
+# This role replaces the `adaptix.sh` script that ./range _do_repair used
+# to push via `az vm run-command invoke`. Idempotent — running it twice
+# in a row should produce zero changes on a healthy box.
+
+# ---------- Phase 0: Windows cross-compiler ----------
+# AdaptixServer compiles Windows beacon binaries on the teamserver via
+# the MinGW-w64 cross-compiler (x86_64-w64-mingw32-g++). Without it,
+# `Generate Payload` on the operator UI fails with:
+#   sh: 1: x86_64-w64-mingw32-g++: not found
+#   [-] Error: agent builder failed
+# The `mingw-w64` package on Ubuntu/Debian provides both the 32- and
+# 64-bit GCC + G++ Windows toolchains.
+- name: Install MinGW-w64 cross-compiler (for Windows beacon compile)
+  ansible.builtin.apt:
+    name:
+      - mingw-w64
+      - gcc-mingw-w64-x86-64
+      - g++-mingw-w64-x86-64
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+  become: true
+
+# ---------- Phase 1: pinned Go ----------
+# Adaptix's Makefile sets GOEXPERIMENT=jsonv2, which is only recognised
+# by Go 1.25+. The plugins also need to be built with the SAME Go
+# version as the server or dlopen panics at runtime ("plugin was built
+# with a different version of go"). We install ONE pinned Go and use
+# it for everything.
+- name: Probe currently-installed Go version
+  ansible.builtin.command: /usr/local/go/bin/go version
+  register: go_probe
+  changed_when: false
+  failed_when: false
+
+- name: Install pinned Go {{ adaptix_go_version }}
+  block:
+    - name: Download Go {{ adaptix_go_version }} tarball
+      ansible.builtin.get_url:
+        url: "https://go.dev/dl/go{{ adaptix_go_version }}.linux-amd64.tar.gz"
+        dest: /tmp/go-{{ adaptix_go_version }}.tgz
+        mode: "0644"
+        timeout: 600
+    - name: Remove any previous /usr/local/go
+      ansible.builtin.file:
+        path: /usr/local/go
+        state: absent
+    - name: Extract Go tarball
+      ansible.builtin.unarchive:
+        src: /tmp/go-{{ adaptix_go_version }}.tgz
+        dest: /usr/local
+        remote_src: true
+    - name: Symlink go + gofmt into /usr/local/bin
+      ansible.builtin.file:
+        src: "/usr/local/go/bin/{{ item }}"
+        dest: "/usr/local/bin/{{ item }}"
+        state: link
+        force: true
+      loop: [go, gofmt]
+  become: true
+  when: "'go' + adaptix_go_version not in (go_probe.stdout | default(''))"
+
+# ---------- Phase 2: source tree ----------
+- name: Ensure /opt/adaptix/AdaptixC2 exists (clone if missing)
+  ansible.builtin.git:
+    repo: https://github.com/Adaptix-Framework/AdaptixC2.git
+    dest: /opt/adaptix/AdaptixC2
+    update: false   # let the operator pin versions outside this role
+    depth: 1
+  become: true
+
+# ---------- Phase 3: build server + plugins ----------
+# Env vars for every `go` invocation. `make all` would also build the
+# GUI client which needs CMake >= 3.28 (Ubuntu 22.04 ships 3.25),
+# so we run ONLY the server + plugin targets.
+- name: Build env for go commands
+  ansible.builtin.set_fact:
+    adaptix_go_env:
+      PATH: "/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin"
+      HOME: "/root"
+      GOPATH: "/root/go"
+      GOMODCACHE: "/root/go/pkg/mod"
+      GOCACHE: "/root/.cache/go-build"
+      # GOTOOLCHAIN=local prevents Go 1.21+ from silently auto-
+      # downloading a newer toolchain when go.mod has a `toolchain`
+      # directive. Without this, our pinned 1.25.4 gets bypassed by
+      # whatever go.mod requires, and we lose the server/plugin
+      # version invariant.
+      GOTOOLCHAIN: "local"
+      # CRITICAL: must match the experiments the server is built with.
+      # AdaptixC2's Makefile (Makefile:70) bakes these into `make server`:
+      #   GOEXPERIMENT=jsonv2,greenteagc go build ...
+      # The Go plugin ABI includes internal/goexperiment, so a plugin
+      # built without these experiments will fail dlopen with:
+      #   "plugin was built with a different version of package
+      #    internal/goexperiment"
+      # which is exactly what we hit when listeners refused to register.
+      GOEXPERIMENT: "jsonv2,greenteagc"
+
+# Staleness check via a sentinel file:
+#   /opt/adaptix/.build-sentinel  contains "<go-version>|<goexperiment>"
+# We rewrite it after every successful rebuild. If the file's content
+# doesn't match the current target env, the build is stale and we wipe
+# + rebuild. This is more robust than `strings | grep` because the
+# Makefile strips symbols (-ldflags="-s -w"), making version probes
+# of the actual binary unreliable.
+- name: Check build sentinel
+  ansible.builtin.slurp:
+    src: /opt/adaptix/.build-sentinel
+  register: build_sentinel_raw
+  failed_when: false
+  become: true
+
+- name: Decide whether a clean rebuild is required
+  ansible.builtin.set_fact:
+    build_sentinel_current: "go{{ adaptix_go_version }}|{{ adaptix_go_env.GOEXPERIMENT }}"
+    needs_rebuild: >-
+      {{
+        build_sentinel_raw.content is not defined or
+        (build_sentinel_raw.content | b64decode | trim) !=
+        ('go' ~ adaptix_go_version ~ '|' ~ adaptix_go_env.GOEXPERIMENT)
+      }}
+
+- name: Wipe stale build artifacts before rebuild
+  ansible.builtin.shell: |
+    rm -f /opt/adaptix/AdaptixC2/dist/adaptixserver
+    rm -f /opt/adaptix/AdaptixC2/AdaptixServer/extenders/*/*.so
+  args:
+    executable: /bin/bash
+  become: true
+  when: needs_rebuild
+
+- name: Build adaptix server (make server)
+  ansible.builtin.command:
+    cmd: make server
+    chdir: /opt/adaptix/AdaptixC2
+  environment: "{{ adaptix_go_env }}"
+  register: make_server
+  become: true
+  changed_when: needs_rebuild
+  failed_when: make_server.rc != 0
+  when: needs_rebuild
+
+- name: Find extender source directories
+  ansible.builtin.find:
+    paths: /opt/adaptix/AdaptixC2/AdaptixServer/extenders
+    file_type: directory
+    recurse: false
+  register: extender_dirs
+  become: true
+
+- name: Read each extender's config.yaml to discover its expected .so filename
+  ansible.builtin.shell:
+    cmd: >
+      grep -E '^extender_file:' "{{ item.path }}/config.yaml" 2>/dev/null
+      | sed -E 's/^extender_file:[[:space:]]*"([^"]+)".*/\1/' | head -n1
+  loop: "{{ extender_dirs.files }}"
+  register: extender_files_raw
+  changed_when: false
+  failed_when: false
+  become: true
+
+- name: Build each extender plugin (-buildmode=plugin)
+  ansible.builtin.command:
+    cmd: "/usr/local/go/bin/go build -buildmode=plugin -o {{ item.stdout }} ."
+    chdir: "{{ item.item.path }}"
+    creates: "{{ item.item.path }}/{{ item.stdout }}"
+  environment: "{{ adaptix_go_env }}"
+  loop: "{{ extender_files_raw.results }}"
+  loop_control:
+    label: "{{ item.item.path | basename }} -> {{ item.stdout }}"
+  when: item.stdout | length > 0
+  become: true
+
+# beacon_agent is special: in addition to the `agent_beacon.so` plugin
+# (which our generic `go build -buildmode=plugin` step above produces),
+# adaptixserver expects a `dist/objects_http/`, `objects_smb/`,
+# `objects_tcp/`, `objects_dns/` directory tree alongside it, each
+# containing `config.cpp` + pre-compiled stubs. Those are produced by
+# the beacon_agent's outer Makefile, which:
+#   1. `go build` the plugin into ./dist/agent_beacon.so
+#   2. `cd src_beacon && make` (clean pre x64 x86) → seeds objects_*/
+#      with config.cpp from files/config.tpl + stub.x{64,86}.bin
+#   3. `mv src_beacon/objects_* ./dist/`
+# Without this, the FIRST operator-side `Generate Agent → Build` fails:
+#   cc1plus: fatal error: objects_http/config.cpp: No such file or directory
+# Requires mingw-w64 (installed in Phase 0). Idempotent via `creates:`
+# pointing at one of the expected output files.
+- name: Build beacon_agent dist tree (objects_http/, stubs, etc.)
+  ansible.builtin.command:
+    cmd: make
+    chdir: /opt/adaptix/AdaptixC2/AdaptixServer/extenders/beacon_agent
+    creates: /opt/adaptix/AdaptixC2/AdaptixServer/extenders/beacon_agent/dist/objects_http/config.cpp
+  environment: "{{ adaptix_go_env }}"
+  become: true
+
+# Adaptix's beacon_agent plugin computes ObjectDir paths as
+# `ModuleDir + "/objects_http/..."`, where ModuleDir is the directory
+# of the loaded .so (extender root). The Makefile builds objects_*/
+# into `dist/`, not extender root — so the runtime path lookup fails:
+#   cc1plus: fatal error: objects_http/config.cpp: No such file or directory
+# The upstream `make all` flow expects the .so to ALSO live in dist/,
+# but our role's generic `go build -o agent_beacon.so .` puts it at
+# extender root (and config.yaml's `extender_file: "agent_beacon.so"`
+# matches that location). Squaring the two with symlinks is the
+# minimal-blast-radius fix: extender root sees objects_*/ siblings
+# without re-pointing extender_file or relocating the .so.
+- name: Symlink beacon_agent dist/objects_*/ up to extender root (so ModuleDir lookups resolve)
+  ansible.builtin.file:
+    src: "dist/{{ item }}"
+    dest: "/opt/adaptix/AdaptixC2/AdaptixServer/extenders/beacon_agent/{{ item }}"
+    state: link
+    force: true
+  loop:
+    - objects_http
+    - objects_smb
+    - objects_tcp
+    - objects_dns
+  become: true
+
+- name: Record the build sentinel (so a future run can skip the rebuild)
+  ansible.builtin.copy:
+    dest: /opt/adaptix/.build-sentinel
+    content: "{{ build_sentinel_current }}\n"
+    mode: "0644"
+  become: true
+  when: needs_rebuild
+
+# ---------- Phase 4: ensure systemd units are up ----------
+- name: Reload systemd (in case the units were just written)
+  ansible.builtin.systemd:
+    daemon_reload: true
+  become: true
+
+# Add a second operator account ("ian") to /opt/adaptix/profile.yaml's
+# operators: map. The password is generated by terraform's
+# random_password.operator_ian_adaptix and threaded through the
+# ansible inventory as terra_operator_ian_adaptix_password.
+#
+# We use a small Python helper instead of `lineinfile` because the
+# operators: map needs YAML-aware editing — we must add the line
+# under operators:, not anywhere else in the file.
+- name: Add operator "{{ terra_operator_ian_username }}" to /opt/adaptix/profile.yaml
+  ansible.builtin.shell:
+    # IMPORTANT: pass the password via env (PW=...) rather than Jinja2-
+    # interpolating it into the Python source. Inline interpolation
+    # breaks when the password contains characters bash treats specially
+    # (`, $, !, ") even inside `<<'PY'`, because Ansible substitutes
+    # `{{ ... }}` BEFORE the heredoc quoting takes effect. Env-var
+    # passing keeps the literal password intact end-to-end.
+    cmd: |
+      PW={{ terra_operator_ian_adaptix_password | quote }} \
+      USER={{ terra_operator_ian_username | quote }} \
+      python3 - <<'PY'
+      import os, pathlib
+      f = pathlib.Path('/opt/adaptix/profile.yaml')
+      lines = f.read_text().splitlines(keepends=True)
+      user = os.environ['USER']
+      pw   = os.environ['PW']
+
+      # Find the `operators:` line and the indent level of its entries.
+      # Walk forward from `operators:` until we leave its block (a line
+      # at <= the operators: indent that ISN'T blank or a comment).
+      # Earlier impl used a single regex with `(?:[ \t]+\w+: "..."\n)+`
+      # which greedily consumed *any* indented key/value lines and ran
+      # off the end of the operators: block — landing the new `ian: ...`
+      # line under `key: ...` (the TLS cert path), producing invalid
+      # YAML that crashed adaptixserver in a crashloop.
+      ops_idx = None
+      ops_indent = None
+      for i, ln in enumerate(lines):
+          stripped = ln.lstrip()
+          if stripped.startswith('operators:'):
+              ops_idx = i
+              ops_indent = len(ln) - len(stripped)
+              break
+      if ops_idx is None:
+          raise SystemExit("could not find operators: block in profile.yaml")
+
+      # Scan the entries that live under operators:.
+      entry_indent = None
+      end_idx = ops_idx + 1  # default: insertion point right after the header
+      existing_idx = None
+      for j in range(ops_idx + 1, len(lines)):
+          ln = lines[j]
+          stripped_ln = ln.lstrip()
+          # Blank / comment lines belong to the block — keep scanning.
+          if not stripped_ln or stripped_ln.startswith('#'):
+              end_idx = j + 1
+              continue
+          this_indent = len(ln) - len(stripped_ln)
+          if this_indent <= ops_indent:
+              break  # we've left the operators: block
+          # First real entry pins entry_indent.
+          if entry_indent is None:
+              entry_indent = this_indent
+          if this_indent != entry_indent:
+              break  # weirdly indented; bail (block ends)
+          # Same-indent entry under operators:.
+          end_idx = j + 1
+          # Does this entry match the user we're injecting?
+          key = stripped_ln.split(':', 1)[0]
+          if key == user:
+              existing_idx = j
+
+      if entry_indent is None:
+          # operators: has no entries yet — use +2 spaces from the header.
+          entry_indent = ops_indent + 2
+
+      new_line = (' ' * entry_indent) + f'{user}: "{pw}"\n'
+      if existing_idx is not None:
+          if lines[existing_idx] == new_line:
+              print("UNCHANGED"); raise SystemExit(0)
+          lines[existing_idx] = new_line
+      else:
+          lines.insert(end_idx, new_line)
+
+      f.write_text(''.join(lines))
+      print("CHANGED")
+      PY
+  register: adaptix_ian_op
+  changed_when: "'CHANGED' in adaptix_ian_op.stdout"
+  become: true
+  when: terra_operator_ian_adaptix_password | length > 0
+
+# ---- systemd drop-in: Go env for gopher_agent per-build subprocess ----
+# The gopher_agent extender forks `go build` at implant-generation time
+# to compile the gopher Go agent. Under systemd the daemon inherits a
+# minimal env (no HOME, no GOPATH, no GOMODCACHE, no PATH that includes
+# /usr/local/go/bin), so `go build` exits with:
+#   "go: module cache not found: neither GOMODCACHE nor GOPATH is set"
+# and the /agent/generate API call returns ok:false. This drop-in lives
+# at /etc/systemd/system/adaptix.service.d/go-env.conf so we don't have
+# to rewrite the cloud-init-rendered main unit body; systemd merges the
+# d/ overlay on `daemon-reload`. Idempotent: same content next run = no
+# change = no restart.
+- name: Ensure /etc/systemd/system/adaptix.service.d exists
+  # ansible.builtin.copy does NOT auto-create parent dirs. The first run
+  # against a teamserver that has never had a drop-in fails with
+  # "Destination directory /etc/systemd/system/adaptix.service.d does
+  # not exist" — fix is to mkdir -p the .d dir as its own task first.
+  ansible.builtin.file:
+    path: /etc/systemd/system/adaptix.service.d
+    state: directory
+    mode: "0755"
+    owner: root
+    group: root
+  become: true
+
+- name: Drop systemd override for adaptix.service to set Go env
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/adaptix.service.d/go-env.conf
+    mode: "0644"
+    owner: root
+    group: root
+    content: |
+      [Service]
+      Environment=HOME=/root
+      Environment=GOPATH=/root/go
+      Environment=GOMODCACHE=/root/go/pkg/mod
+      Environment=GOCACHE=/root/.cache/go-build
+      Environment=GOTOOLCHAIN=local
+      Environment=PATH=/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin
+  register: adaptix_go_env_dropin
+  become: true
+
+- name: Reload systemd if Go-env drop-in changed
+  ansible.builtin.systemd:
+    daemon_reload: true
+  become: true
+  when: adaptix_go_env_dropin is changed
+
+- name: Restart adaptix.service after (re)building OR after operator-map / Go-env change
+  ansible.builtin.systemd:
+    name: adaptix
+    state: restarted
+  become: true
+  when: needs_rebuild or (adaptix_ian_op is changed) or (adaptix_go_env_dropin is changed)
+
+- name: Wait for the operator commander port {{ adaptix_commander_port }} to listen
+  ansible.builtin.wait_for:
+    port: "{{ adaptix_commander_port }}"
+    host: 127.0.0.1
+    timeout: 60
+  # Non-fatal: a slow first-build (cold Go compile of all extender
+  # plugins) can take >60s on a 2-vCPU teamserver, and the listener
+  # registration tasks below have their own retries. More importantly,
+  # we've seen this single hard-fail TERMINATE the whole playbook
+  # under strategy:free (no Mythic/Sliver plays after) — wildly out of
+  # proportion to a transient slow-bind. Surface as `ignored` in the
+  # recap so the warning is still visible, without losing the deploy.
+  register: adaptix_port_wait
+  failed_when: false
+  changed_when: false
+
+- name: Warn (don't fail) if commander port is still down
+  ansible.builtin.debug:
+    msg: >-
+      AdaptixServer commander port {{ adaptix_commander_port }} did not
+      come up within 60s. Listener registration below will likely fail
+      too. Check `journalctl -u adaptix.service` on the teamserver.
+  when: adaptix_port_wait is defined and (adaptix_port_wait.failed | default(false))
+
+# ---------- Phase 5: register the 5 HTTPS listeners ----------
+# Drive the adaptix /endpoint/login + /listener/create REST API
+# directly (rather than relying on the configure_listeners.py systemd
+# oneshot, which can hang for 600s if the server is slow to start
+# and stop the playbook in its tracks).
+
+# Read the teamserver password from /opt/adaptix/profile.yaml on the
+# host itself. We did try terra_adaptix_password (threaded through the
+# inventory) first, but:
+#   - the inventory's state-walk fallback mode can't extract random_password
+#     resource values, so terra_adaptix_password ends up null/empty
+#   - the password is already on the server in profile.yaml -- duplicating
+#     it across inventory + server is bookkeeping nobody wants
+# Reading it on the server side means there's exactly ONE source of truth.
+- name: Read teamserver password from /opt/adaptix/profile.yaml
+  ansible.builtin.shell:
+    cmd: |
+      grep -E '^[[:space:]]*password:' /opt/adaptix/profile.yaml \
+        | head -1 \
+        | sed -E 's/^[[:space:]]*password:[[:space:]]*"([^"]+)".*/\1/'
+  register: profile_password
+  changed_when: false
+  become: true
+
+- name: Fail clearly if password is missing or empty
+  ansible.builtin.fail:
+    msg: "Could not extract a password from /opt/adaptix/profile.yaml. Check the file."
+  when: (profile_password.stdout | default('') | trim) == ''
+
+- name: Probe /endpoint/login and grab access token
+  ansible.builtin.uri:
+    url: "https://127.0.0.1:{{ adaptix_commander_port }}/endpoint/login"
+    method: POST
+    body_format: json
+    body:
+      username: "{{ ansible_user }}"
+      password: "{{ profile_password.stdout | trim }}"
+    validate_certs: false
+    # The default404Middleware in AdaptixServer hides bad-creds with a
+    # plain 404 cover-page response. So we don't get to differentiate
+    # "wrong password" from "url not found" — anything other than 200
+    # means the request didn't authenticate.
+    status_code: [200]
+    timeout: 10
+    return_content: true
+  register: login_resp
+  retries: 6
+  delay: 10
+  until: login_resp.status == 200
+
+# Listener desired-state map. Keys are CDN slot names; values are the
+# (port, callback-host:port) pair. azure resolves to the AFD-fronted
+# redirector subdomain when advanced_c2 is on (e.g.
+# api-01.enterprisestudio.com:443) — beacons hit the custom hostname,
+# Azure DNS CNAMEs it to AFD's edge, AFD forwards to the redirector.
+# That IS the AFD-fronted path, not a direct connection to the
+# redirector IP. The other four CDNs stay as placeholders the
+# operator fills in when they wire up their own fronting (cloudfront,
+# workers.dev, fastly, other).
+- name: Compute desired listener set
+  ansible.builtin.set_fact:
+    desired_listeners:
+      - name: "azure_HTTPS"
+        port: 8443
+        callback: "{{ (terra_adaptix_callbacks | default({})).azure | default('CHANGEME-azure_HTTPS:443') }}"
+      - name: "cloudfront_HTTPS"
+        port: 8444
+        callback: "{{ (terra_adaptix_callbacks | default({})).cloudfront | default('CHANGEME-cloudfront_HTTPS:443') }}"
+      - name: "workers_HTTPS"
+        port: 8445
+        callback: "{{ (terra_adaptix_callbacks | default({})).workers | default('CHANGEME-workers_HTTPS:443') }}"
+      - name: "fastly_HTTPS"
+        port: 8446
+        callback: "{{ (terra_adaptix_callbacks | default({})).fastly | default('CHANGEME-fastly_HTTPS:443') }}"
+      - name: "other_HTTPS"
+        port: 8447
+        callback: "{{ (terra_adaptix_callbacks | default({})).other | default('CHANGEME-other_HTTPS:443') }}"
+
+# Single atomic listener-reconcile call. We had to consolidate this
+# from the previous multi-task chain (list → identify-stale → stop x N
+# → refresh-JWT → create x M) because AdaptixServer's access_token
+# expires sub-minute, and ansible's per-item loops put many seconds
+# of latency between login and the final create — the last few
+# /listener/create requests landed with an expired token, hit the
+# default404Middleware, and surfaced as a generic 404 ("Not Found").
+# Doing the whole flow inside one Python process keeps the login + N
+# stops + N creates all inside one HTTPS keep-alive session, sub-
+# second end-to-end, so the token can't expire mid-flow.
+- name: Reconcile Adaptix BeaconHTTP listeners (login + stop-stale + create-missing, atomic)
+  ansible.builtin.shell:
+    cmd: |
+      python3 - <<'PY'
+      import json, os, sys, hashlib
+      import urllib3, requests
+      urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+      BASE = "https://127.0.0.1:{{ adaptix_commander_port }}/endpoint"
+      USER = os.environ["ADAPTIX_USER"]
+      PASS = os.environ["ADAPTIX_PASS"]
+      DESIRED = json.loads(os.environ["DESIRED_LISTENERS"])
+
+      # ---- Single login at the top; token reused for everything below ----
+      # adaptix.service is likely still mid-restart when this task fires
+      # (we just rebuilt the operator-map and restarted; the wait_for is
+      # non-fatal and the cold Go binary needs a few seconds to bind
+      # 9000 + finish TLS init). Retry the login on connection-level
+      # errors with a short backoff before giving up.
+      import time
+      tok = ""
+      last_err = None
+      for attempt in range(12):  # ~60s total backoff
+          try:
+              r = requests.post(f"{BASE}/login",
+                                json={"username": USER, "password": PASS},
+                                verify=False, timeout=10)
+              r.raise_for_status()
+              tok = r.json().get("access_token", "")
+              if tok:
+                  break
+              last_err = "login returned no access_token"
+          except (requests.exceptions.ConnectionError,
+                  requests.exceptions.Timeout,
+                  requests.exceptions.HTTPError) as e:
+              last_err = f"{type(e).__name__}: {str(e)[:120]}"
+          time.sleep(5)
+      if not tok:
+          sys.exit(f"adaptix login failed after 12 retries: {last_err}")
+      H = {"Authorization": f"Bearer {tok}",
+           "Content-Type": "application/json"}
+
+      # ---- List current listeners (l_name, l_data) ----
+      r = requests.get(f"{BASE}/listener/list", headers=H, verify=False, timeout=10)
+      r.raise_for_status()
+      existing = {row["l_name"]: row for row in (r.json() or [])}
+
+      UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36")
+
+      def cfg_for(name, port, cb):
+          # host:port format — AdaptixServer rejects URLs.
+          return {
+              "host_bind": "0.0.0.0", "port_bind": port,
+              "ssl": True,
+              "ssl_cert_path": "/opt/adaptix/server.rsa.crt",
+              "ssl_key_path":  "/opt/adaptix/server.rsa.key",
+              "ssl_cert": "", "ssl_key": "",
+              # Beacon callback URI — realistic-looking ("/api/auth/token")
+              # so lab C2 traffic blends into normal API requests for the
+              # blue-team exercise. MUST stay in sync with listeners.tf's
+              # adaptix_listeners `uri` (and c2-server.sh's boot-time
+              # configure_listeners.py). NOTE: distinct from the commander
+              # BASE path above ("/endpoint") — that's operator access, a
+              # different thing, and intentionally stays as-is.
+              "uri": ["/api/auth/token"], "http_method": "POST",
+              "user_agent": [UA],
+              "callback_addresses": [cb],
+              "host_header": [], "hb_header": "X-Forwarded-For",
+              "encrypt_key": hashlib.md5(f"{name}-encrypt-key-salt".encode()).hexdigest(),
+              "request_headers": "", "response_headers": {},
+              "x-forwarded-for": True,
+              "page-error":   "<!doctype html><title>404</title><h1>Not Found</h1>",
+              "page-payload": "<<<PAYLOAD_DATA>>>",
+              "server_headers": "", "protocol": "https",
+          }
+
+      changed = []
+      for spec in DESIRED:
+          name, port, cb = spec["name"], spec["port"], spec["callback"]
+          cur = existing.get(name)
+          if cur:
+              # Already exists — check if config matches desired callback.
+              data = json.loads(cur.get("l_data") or "{}")
+              cur_cb = (data.get("callback_addresses") or [""])[0]
+              if cur_cb == cb:
+                  continue  # already correct, leave running
+              # Stale (likely CHANGEME-*); stop it so we can recreate.
+              r = requests.post(f"{BASE}/listener/stop", headers=H,
+                                json={"name": name, "type": "BeaconHTTP"},
+                                verify=False, timeout=15)
+              changed.append(f"stop {name}: {r.status_code} {(r.json() or {}).get('message','?')}")
+          # Create with the desired config.
+          body = {"name": name, "type": "BeaconHTTP",
+                  "config": json.dumps(cfg_for(name, port, cb))}
+          r = requests.post(f"{BASE}/listener/create", headers=H,
+                            json=body, verify=False, timeout=15)
+          ok = r.status_code == 200 and (r.json() or {}).get("ok")
+          changed.append(f"create {name} cb={cb}: HTTP {r.status_code} ok={ok} msg={(r.json() or {}).get('message','?')}")
+      for line in changed:
+          print(line)
+      PY
+    executable: /bin/bash
+  environment:
+    ADAPTIX_USER: "{{ ansible_user }}"
+    ADAPTIX_PASS: "{{ profile_password.stdout | trim }}"
+    DESIRED_LISTENERS: "{{ desired_listeners | to_json }}"
+  register: listener_reconcile
+  changed_when: "'create ' in listener_reconcile.stdout or 'stop ' in listener_reconcile.stdout"
+  become: true
+
+- name: Report listener reconcile output
+  ansible.builtin.debug:
+    msg: "{{ ['---- adaptix listener reconcile ----'] + (listener_reconcile.stdout_lines | default([])) }}"
+  when: listener_reconcile is defined
+
+# (Legacy multi-task chain — list + identify-stale + stop + drop +
+# refresh-JWT + create — was replaced by the single atomic
+# "Reconcile Adaptix BeaconHTTP listeners" Python task above. The
+# old chain was hitting AdaptixServer's sub-minute JWT TTL: by the
+# time Ansible's per-item loop reached the last /listener/create,
+# the bearer token issued at the top of the role had expired and
+# default404Middleware swallowed the request as a 404.)
+
+# ---------- Phase 6: verify ports are bound ----------
+- name: Verify each expected listener port is now listening
+  ansible.builtin.wait_for:
+    port: "{{ item }}"
+    host: 127.0.0.1
+    timeout: 20
+  loop: "{{ c2_listener_ports }}"
+
+# ---------- Phase 7: always emit a diagnostic dump ----------
+# This block runs even when a previous step failed, so the operator
+# never has to SSH in to read the journal. The output goes to stdout
+# (Ansible captures it per-host) and is small enough not to risk
+# truncation -- ansible-playbook prints the entire `register` value.
+- name: Always dump quick diagnostics
+  # `block:` must be non-empty syntactically; we use a no-op marker so
+  # the `always:` semantics (run even when an earlier task in this
+  # block failed) work. The real work is in the always: list below.
+  block:
+    - name: Diagnostic marker
+      ansible.builtin.debug:
+        msg: "Emitting diagnostic dump (always-run)"
+      changed_when: false
+  always:
+    - name: Snapshot listening ports
+      ansible.builtin.command: ss -lntp
+      register: ss_dump
+      changed_when: false
+      become: true
+    - name: Snapshot adaptix journal (filtered)
+      ansible.builtin.shell:
+        cmd: >
+          journalctl -u adaptix --no-pager -n 200 |
+          grep -iE 'plugin|extender|register|panic|error|fail|listener' |
+          tail -25
+      register: journal_dump
+      changed_when: false
+      failed_when: false
+      become: true
+    # Print each section as its own debug task with `msg: [list]`.
+    # The default/yaml callback renders each list entry on its own
+    # line. The old `msg: |` block-scalar form collapsed into one
+    # JSON-escaped string at render time (the "\n" literals you saw).
+    - name: Report — listening ports
+      ansible.builtin.debug:
+        msg: "{{ ['---- adaptix listening ports ----'] +
+                 (ss_dump.stdout_lines | select('search', ':(9000|844[3-7])') | list) }}"
+    - name: Report — adaptix journal (filtered, last 25)
+      ansible.builtin.debug:
+        msg: "{{ ['---- adaptix journal (filtered) ----'] +
+                 (journal_dump.stdout_lines | default(['(no matching lines)'])) }}"

@@ -1,0 +1,15 @@
+{
+    "my-smb-profile": {
+        "c2_auth": "abcd@123",
+        "smb_pipe": "\\\\.\\pipe\\mynamedpipe",
+        "type": "SMB",
+        "obfsleep": "Pooling-0",
+        "key_strategy_type": "default",
+        "sleep": 1,
+        "respawn": true,
+        "jitter": 0,
+        "delay_exec": 0,
+        "stack_link_method": "rop",
+        "exec_method": "APC"
+    }
+}

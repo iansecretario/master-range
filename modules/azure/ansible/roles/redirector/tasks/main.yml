@@ -1,0 +1,221 @@
+---
+# =============================================================================
+# C2 redirector — nginx in front of teamservers, per-CDN header gating
+# =============================================================================
+# Cloud-init already wrote /etc/nginx/conf.d/c2-redirect.conf and the
+# TLS cert. This role only handles the failure modes we've seen:
+#   - cert file missing (cloud-init's openssl req failed)
+#   - dpkg-configure in failed state (nginx install ran before cert)
+#   - Debian default site shadowing our config
+
+- name: Ensure /etc/nginx/tls exists
+  ansible.builtin.file:
+    path: /etc/nginx/tls
+    state: directory
+    mode: "0755"
+  become: true
+
+- name: Probe TLS cert
+  ansible.builtin.stat:
+    path: /etc/nginx/tls/cert.pem
+  register: cert_stat
+  become: true
+
+- name: Generate a self-signed cert if cloud-init missed it
+  ansible.builtin.command:
+    cmd: >
+      openssl req -x509 -newkey rsa:2048 -nodes -days 825
+        -keyout /etc/nginx/tls/key.pem
+        -out    /etc/nginx/tls/cert.pem
+        -subj   "/CN=redir-{{ inventory_hostname }}"
+    creates: /etc/nginx/tls/cert.pem
+  become: true
+  when: not cert_stat.stat.exists
+
+- name: Lock key.pem permissions
+  ansible.builtin.file:
+    path: /etc/nginx/tls/key.pem
+    mode: "0600"
+  become: true
+
+- name: Remove Debian-default site (would shadow listen 443 default_server)
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/nginx/sites-enabled/default
+    - /etc/nginx/sites-available/default
+    - /etc/nginx/conf.d/default.conf
+  become: true
+  notify: restart nginx
+
+- name: Rename redelk-log-format.conf to load before c2-redirect.conf
+  # nginx loads conf.d/*.conf alphabetically. c2-redirect.conf
+  # references the `redelklog` log format declared in the other file
+  # -- if the format file loads AFTER, nginx -t errors out.
+  ansible.builtin.command:
+    cmd: mv /etc/nginx/conf.d/redelk-log-format.conf /etc/nginx/conf.d/00-redelk-log-format.conf
+    removes: /etc/nginx/conf.d/redelk-log-format.conf
+    creates: /etc/nginx/conf.d/00-redelk-log-format.conf
+  become: true
+  notify: restart nginx
+
+- name: Recover any partially-failed dpkg configure
+  ansible.builtin.command: dpkg --configure -a
+  changed_when: false
+  become: true
+
+- name: Validate nginx config
+  ansible.builtin.command: nginx -t
+  changed_when: false
+  become: true
+  register: nginx_t
+  failed_when: nginx_t.rc != 0
+
+- name: Ensure nginx is enabled + active
+  ansible.builtin.systemd:
+    name: nginx
+    enabled: true
+    state: started
+  become: true
+
+# ============================================================================
+# DoH (DNS-over-HTTPS) endpoint
+# ============================================================================
+# When `terra_doh_listener` is set on this host (via inventory hostvars,
+# populated by the generator from advanced_c2.dns_listeners), this
+# redirector serves the DoH leg for one C2:
+#
+#   beacon → HTTPS POST /dns-query at the DoH stealth hostname (rides AFD)
+#         → AFD routes to this redirector
+#         → nginx location /dns-query (header-gated)
+#         → dnsdist on 127.0.0.1:8053 (DoH→raw-DNS converter)
+#         → C2's DNS listener on internal :5353 (UDP)
+#         → response reverses
+#
+# Path-routing happens at nginx, NOT at AFD. Any request that doesn't
+# match BOTH the path AND the per-deploy beacon header falls through to
+# the cover-page location, which serves a benign HTML page that
+# meta-refreshes to advanced_c2.cover_url after 5 seconds.
+- name: Detect whether DoH is configured for this redirector
+  ansible.builtin.set_fact:
+    doh_enabled: "{{ (terra_doh_listener | default('') | length) > 0 }}"
+
+- name: Install dnsdist (DoH → raw-DNS converter)
+  ansible.builtin.apt:
+    name: dnsdist
+    state: present
+    update_cache: true
+    cache_valid_time: 86400
+  become: true
+  when: doh_enabled
+
+- name: Write /etc/dnsdist/dnsdist.conf
+  ansible.builtin.copy:
+    dest: /etc/dnsdist/dnsdist.conf
+    mode: "0644"
+    content: |
+      -- terra-range — DoH → raw-DNS converter for the DNS C2 leg.
+      -- nginx terminates TLS upstream and proxies /dns-query as plain
+      -- HTTP to 127.0.0.1:8053 here; dnsdist parses the DoH wrapper
+      -- and forwards the unwrapped DNS query over UDP to {{ terra_doh_c2_name | default('the assigned C2') }}'s
+      -- DNS listener on its internal IP :5353.
+
+      setACL("127.0.0.1/32")            -- only accept from local nginx
+
+      -- DoH listener (plain HTTP — TLS handled by nginx).
+      -- addDOHLocal(addr, certs, keys, urls): nil certs/keys = plain HTTP.
+      addDOHLocal("127.0.0.1:8053", nil, nil, "/dns-query")
+
+      -- Backend: raw DNS to the C2 teamserver's DNS listener.
+      newServer({
+        address    = "{{ terra_doh_c2_ip | default('127.0.0.1') }}:5353",
+        name       = "{{ terra_doh_c2_name | default('c2') }}_dns",
+        checkType  = "NONE"
+      })
+  become: true
+  register: dnsdist_conf
+  when: doh_enabled
+
+- name: Restart dnsdist if config changed
+  ansible.builtin.systemd:
+    name: dnsdist
+    enabled: true
+    state: "{{ 'restarted' if dnsdist_conf is changed else 'started' }}"
+  become: true
+  when: doh_enabled
+
+- name: Write /etc/nginx/conf.d/doh.conf (DoH server block + cover page)
+  ansible.builtin.copy:
+    dest: /etc/nginx/conf.d/doh.conf
+    mode: "0644"
+    content: |
+      # terra-range — DoH endpoint nginx server block.
+      # Separate server_name from the HTTPS C2 leg (its own AFD custom
+      # domain). Handles only DoH traffic on /dns-query and the
+      # cover-page fallback for anything else.
+
+      server {
+          listen 443 ssl;
+          server_name {{ terra_doh_listener }};
+
+          # Reuse the same self-signed cert nginx already uses for the
+          # HTTPS C2 leg's origin connection. AFD does TLS termination
+          # at the edge; the origin-side cert just needs to satisfy
+          # `listen 443 ssl` — AFD verifies via originHostHeader, not
+          # cert validity.
+          ssl_certificate     /etc/nginx/tls/cert.pem;
+          ssl_certificate_key /etc/nginx/tls/key.pem;
+
+          # ----- DoH endpoint (beacon-only) -----
+          # Per-deploy custom header gate: forward to dnsdist ONLY when
+          # the operator-configured header matches. Anything else (no
+          # header, wrong value, scanner, casual visitor) → cover page.
+          location /dns-query {
+              if ($http_{{ terra_beacon_header_name | default('X-Request-Id') | replace('-','_') | lower }} != "{{ terra_beacon_header_token | default('') }}") {
+                  return 302 {{ terra_cover_url | default('https://www.microsoft.com/') }};
+              }
+              proxy_pass http://127.0.0.1:8053/dns-query;
+              proxy_http_version 1.1;
+              proxy_set_header  Host $host;
+              proxy_buffering   off;
+              proxy_read_timeout 30s;
+          }
+
+          # ----- Cover page (everything else) -----
+          # Benign HTML with a 5-second meta-refresh to cover_url.
+          # Blue-team scrapers, curious researchers, and automated
+          # scanners hitting `/` or any other path see this and
+          # bounce off to a legitimate Microsoft URL.
+          location / {
+              return 200 '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta http-equiv="refresh" content="5;url={{ terra_cover_url | default('https://www.microsoft.com/') }}"><title>Loading</title></head><body style="font-family:-apple-system,Segoe UI,sans-serif;color:#555;text-align:center;margin-top:30vh;"><p>Redirecting&hellip;</p></body></html>';
+              add_header Content-Type "text/html; charset=utf-8";
+          }
+      }
+  become: true
+  when: doh_enabled
+  notify: restart nginx
+
+- name: Re-validate nginx config after DoH server block added
+  ansible.builtin.command: nginx -t
+  changed_when: false
+  become: true
+  when: doh_enabled
+
+# ============================================================================
+# Smoke test (existing — validates the HTTPS C2 path is up)
+# ============================================================================
+- name: Smoke test — bare HTTPS should 302 to cover URL
+  ansible.builtin.uri:
+    url: "https://127.0.0.1/"
+    validate_certs: false
+    status_code: [302, 200]
+    follow_redirects: none
+    timeout: 8
+  register: smoke
+  changed_when: false
+  failed_when: false
+
+- name: Report smoke test
+  ansible.builtin.debug:
+    msg: "smoke: HTTP {{ smoke.status | default('?') }} location={{ smoke.location | default('<none>') }}"

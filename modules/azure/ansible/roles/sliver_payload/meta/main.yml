@@ -1,0 +1,23 @@
+---
+galaxy_info:
+  role_name: sliver_payload
+  author: terra-range
+  description: >-
+    Drive `sliver-client --rc` to build a fleet of Sliver implants on
+    Kali (session + beacon, http + mtls, multi-OS/format, per listener
+    via), saved to ~/Desktop/payloads/sliver. Designed to run as one
+    of the LAST plays in modules/azure/ansible/playbook.yml.
+  license: MIT
+  min_ansible_version: "2.14"
+  platforms:
+    - name: Debian
+      versions:
+        - all
+  galaxy_tags:
+    - security
+    - redteam
+    - sliver
+    - c2
+    - kali
+
+dependencies: []

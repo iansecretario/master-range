@@ -1,0 +1,60 @@
+---
+# =============================================================================
+# Ghostwriter role — overridable defaults
+# =============================================================================
+#
+# Ghostwriter is the central reporting + oplog ingestion server for
+# the terra-range red team. The oplog pipeline (Mythic / Sliver /
+# Adaptix / BRC4 → normalizer → Ghostwriter GraphQL) is the user's
+# main initiative, so the most important output of this role is the
+# API token at /opt/ghostwriter/.api-token.
+#
+# Override any of these in scenario group_vars or via `--extra-vars`.
+
+# ---- admin / first-login credentials ------------------------------------
+# `ghostwriter-cli-linux install` always creates an `admin` user. We
+# rotate the password to this value after install. Override via vault
+# or scenario var for real engagements.
+ghostwriter_admin_user: admin
+ghostwriter_admin_password: "{{ vault_ghostwriter_admin_password | default('CWRLab2026!') }}"
+
+# Web UI bind port. Ghostwriter's nginx maps 0.0.0.0:443 by default;
+# we honor that but expose the port number here so the wait_for /
+# health check can swing if a scenario remaps it.
+ghostwriter_listen_port: 443
+
+# ---- Hasura admin secret ------------------------------------------------
+# Ghostwriter generates a random HASURA_GRAPHQL_ADMIN_SECRET during
+# `install` and writes it into .env. We override post-install to a
+# known value so the oplog pipeline can be configured with a fixed
+# secret instead of scraping the .env every redeploy. Operator can
+# still rotate via `ghostwriter-cli-linux config set HASURA_GRAPHQL_ADMIN_SECRET ...`.
+ghostwriter_hasura_admin_secret: "{{ vault_ghostwriter_hasura_secret | default('changeme-cwr-2026') }}"
+
+# ---- oplog API user -----------------------------------------------------
+# Dedicated Ghostwriter user the oplog pipeline authenticates as.
+# Created via the standard `mutation { login(...) }` flow after the
+# admin user is set up. Restricted-permissions user is preferable to
+# using `admin`; if the pipeline ever leaks the token, the blast radius
+# is limited to oplog ingestion + report reads (no admin actions).
+ghostwriter_oplog_api_user: oplog-pipeline
+ghostwriter_oplog_api_password: "{{ vault_ghostwriter_oplog_password | default('CWROplogPipeline2026!') }}"
+
+# ---- DJANGO_ALLOWED_HOSTS ----------------------------------------------
+# Ghostwriter ships with a tight ALLOWED_HOSTS that lists only loopback
+# aliases — the UI returns "Bad Request (400)" when accessed by VM IP.
+# The role expands this list with the VM's private IP + any extra
+# hostnames a scenario wants to route to it (e.g. the final
+# https://10.0.1.4/ student URL or a friendly cwr-ghostwriter.local).
+ghostwriter_extra_allowed_hosts:
+  - "10.0.1.4"
+  - "ghostwriter"
+  - "ghostwriter.local"
+  - "ghostwriter.cyberwarrange.com"
+
+# ---- timing / wait knobs ------------------------------------------------
+# `ghostwriter-cli install` on a baked image takes ~3-5 min (image build
+# is cached, but migrations + spaCy model + first-boot django startup
+# still need to run). On an unbaked image budget 20+ min.
+ghostwriter_install_timeout: 1800       # 30 min — covers worst-case unbaked
+ghostwriter_nginx_wait_timeout: 600     # 10 min — django needs to migrate + start

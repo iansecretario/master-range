@@ -1,0 +1,2163 @@
+---
+# =============================================================================
+# Kali attacker workstation: XFCE desktop + xrdp + full Kali toolset
+# =============================================================================
+# The Azure marketplace Kali image (kali-linux:kali:kali-2026-1) is
+# HEADLESS by default — just openssh-server + kali-linux-headless
+# package set. This role brings up the GUI side:
+#   - kali-desktop-xfce       — Kali's blessed XFCE metapackage
+#   - kali-linux-default      — ~2.5GB of offensive tools (Burp, MSF,
+#                               nmap, wireshark, etc). Use ...-large
+#                               via `kali_full_install: true` for the
+#                               5GB superset, or override entirely
+#                               with `kali_metapackage`.
+#   - xrdp                    — RDP server (Guacamole connects here)
+#
+# First-time install on a fresh VM takes ~15-30 minutes (apt pulls
+# a few GB). Subsequent runs are no-ops (apt-get install is idempotent
+# when packages are already at the requested state).
+
+- name: Decide Kali metapackage
+  ansible.builtin.set_fact:
+    # Override in scenario vars or with --extra-vars if you want the
+    # bigger ~5GB toolset instead. Common values:
+    #   kali-linux-headless  — base, no GUI tools (already installed)
+    #   kali-linux-default   — ~2.5GB, day-to-day toolset (default)
+    #   kali-linux-large     — ~5GB, includes wireless + forensics
+    #   kali-linux-everything ~ 8GB, the kitchen sink
+    kali_metapackage: "{{ kali_metapackage | default('kali-linux-default') }}"
+
+# Harden sshd FIRST — before any task that might trigger a parallel
+# fork. Without this, the default MaxStartups 10:30:100 rate-limits
+# ansible's 12-fork handshake burst and tasks fail with "Operation
+# timed out" (sshd logs "banner exchange: invalid format" on its side).
+# This task itself only needs one SSH channel so it makes it through;
+# every subsequent task benefits from the bumped limits.
+- name: Raise sshd handshake limits (absorb ansible burst)
+  ansible.builtin.copy:
+    dest: /etc/ssh/sshd_config.d/99-terra-range.conf
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # terra-range: keep ansible from saturating sshd during repair.
+      MaxStartups 60:30:200
+      MaxSessions 32
+      LoginGraceTime 30
+  become: true
+  register: kali_sshd_drop
+
+- name: Reload sshd if hardening drop-in changed
+  ansible.builtin.systemd:
+    name: ssh
+    state: reloaded
+  become: true
+  when: kali_sshd_drop is changed
+
+- name: Probe whether XFCE is already installed
+  ansible.builtin.stat:
+    path: /usr/bin/xfce4-session
+  register: xfce_bin
+
+# Concurrent ./range repair --limit kali invocations (or unattended-upgrades
+# firing at the wrong time) can both try to grab the dpkg lock and the
+# second one explodes with:
+#   E: Could not get lock /var/lib/dpkg/lock-frontend. It is held by
+#      process NNN (apt-get)
+# Wait up to 30 min for any other apt/dpkg run to finish before we touch
+# anything. 30 min covers a worst-case kali-linux-default install on a
+# slow disk.
+- name: Wait for any other apt/dpkg run to release the lock
+  ansible.builtin.shell:
+    cmd: |
+      for i in $(seq 1 360); do
+        if ! fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock >/dev/null 2>&1; then
+          exit 0
+        fi
+        sleep 5
+      done
+      echo "timed out waiting for dpkg lock" >&2
+      exit 1
+  changed_when: false
+  become: true
+
+- name: Update apt cache (only if older than 30 days)
+  ansible.builtin.apt:
+    update_cache: true
+    # Was 86400 (24h). Baked Kali images are rebuilt monthly at most;
+    # checking apt index on every deploy adds ~30-60s for no gain.
+    # 30 days covers the bake cadence; security-relevant package
+    # changes still get pulled via `./range repair --tags upgrade`.
+    cache_valid_time: 2592000
+    # Have apt itself retry on lock contention too; belt-and-suspenders
+    # in case the wait-loop above raced something brand new.
+    lock_timeout: 600
+  become: true
+  # Skip entirely on a baked image where XFCE is already installed —
+  # the bake also handled `apt update` so the cache on disk is fresh
+  # enough for the install task below (which is also skipped via the
+  # same gate).
+  when: not xfce_bin.stat.exists
+
+# Remote-desktop stack — ALWAYS ensured, not gated on the baked-image
+# probe. Symptom that drove this: an early SIG-published kali image
+# was baked BEFORE xrdp was added to the bake script. Deployments off
+# that image had xfce4-session present (so the probe said "baked") but
+# NO xrdp / tigervnc. Guacamole landed on "remote desktop server is
+# currently unreachable." The fix: split the install — desktop +
+# metapackage stay skip-if-baked (the slow ones, ~2-3 GB), but xrdp +
+# tigervnc + dbus-x11 are CHEAP (~30 MB total) so we always
+# `state: present` them. apt is idempotent — no cost when already there.
+- name: Install remote-desktop stack (xrdp + TigerVNC) — always-on, not skip-if-baked
+  ansible.builtin.apt:
+    name:
+      - xrdp
+      - tigervnc-standalone-server
+      - tigervnc-common
+      - tigervnc-tools
+      - dbus-x11               # required for xfce4-session
+    state: present
+    install_recommends: true
+    lock_timeout: 600
+  become: true
+
+- name: Install XFCE + Kali metapackage (skip-if-baked, slow path)
+  ansible.builtin.apt:
+    name:
+      - kali-desktop-xfce      # XFCE desktop, themed for Kali
+      # === TigerVNC stack (PRIMARY remote-desktop path) ===
+      # We migrated off xrdp+xorgxrdp after spending 10+ hours fighting
+      # config-layer bugs (vsock vs tcp, [Xorg] section, GLAMOR/DRM,
+      # virtual screen size, session policy syntax, fuse, etc.). Xvnc
+      # is self-contained — no Xorg, no xorgxrdp, no GPU dance — and
+      # works first-try in cloud VMs.
+      #
+      # (xrdp + tigervnc + dbus-x11 moved to the always-on task above
+      # so a baked image missing them gets them installed regardless.)
+      - "{{ kali_metapackage }}"
+    state: present
+    install_recommends: true
+    # If something else grabbed the lock between the wait-loop above
+    # and this task firing, wait up to 10 more minutes before failing.
+    lock_timeout: 600
+  become: true
+  # Skip on a baked Kali image — the bake already installed every
+  # package in this list (kali-baseline.sh runs the same apt-get install
+  # set). The `xfce_bin` probe above is our canary: if xfce4-session
+  # is on disk, the bake completed and apt-install would just be a
+  # 3-5 min no-op spent on dependency resolution.
+  #
+  # To force a re-install (e.g. after a package was manually removed),
+  # delete /usr/bin/xfce4-session on the target and re-run repair.
+  when: not xfce_bin.stat.exists
+  # First-time install can take ~15-30 minutes on a fresh VM (the
+  # metapackage pulls multi-GB). Bump async/timeout accordingly.
+  async: 2400
+  poll: 30
+
+- name: Configure ~/.xsession to launch XFCE (so xrdp uses it, not the default)
+  ansible.builtin.copy:
+    dest: "/home/{{ ansible_user }}/.xsession"
+    content: "xfce4-session\n"
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: "0644"
+  become: true
+
+- name: Add xrdp user to ssl-cert group (lets xrdp read /etc/ssl/private)
+  ansible.builtin.user:
+    name: xrdp
+    groups: ssl-cert
+    append: true
+  become: true
+  register: xrdp_groups
+
+# ---- TigerVNC (the primary remote-desktop path) ----
+# After all the xrdp config patches above, the xrdp.service is left
+# installed but DISABLED at the end of this role (see "Stop xrdp" task
+# below). TigerVNC takes over.
+#
+# Why this works on Azure cloud VMs while xrdp doesn't:
+#   * Xvnc is a SELF-CONTAINED X server. No /etc/X11/xrdp/xorg.conf,
+#     no GLAMOR/DRMDevice probing, no xorgxrdp module, no DRI3 fallback.
+#   * Display geometry is set at Xvnc launch time (-geometry); no
+#     dynamic-resize negotiation that can fail and produce black-screen.
+#   * Session lifecycle is just the systemd unit — no xrdp-sesman policy
+#     codes, no reconnectwm.sh, no "session_pid 12345" tracking weirdness.
+#   * Guacamole speaks VNC natively via libguac-client-vnc.so.
+
+- name: Ensure ~/.vnc and ~/.config/tigervnc dirs
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: "0700"
+  loop:
+    - "/home/{{ ansible_user }}/.vnc"
+    - "/home/{{ ansible_user }}/.config/tigervnc"
+  become: true
+
+- name: Write Xvnc session bootstrap (~/.vnc/xstartup) — launches XFCE
+  ansible.builtin.copy:
+    dest: "/home/{{ ansible_user }}/.vnc/xstartup"
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: "0755"
+    content: |
+      #!/bin/sh
+      # Sourced by Xvnc when the first viewer connects. Drop any
+      # inherited session-manager state so xfce4-session creates a
+      # fresh one (no "session already running" cross-talk).
+      unset SESSION_MANAGER
+      unset DBUS_SESSION_BUS_ADDRESS
+      # Render Xresources if user has them.
+      [ -r "$HOME/.Xresources" ] && xrdb "$HOME/.Xresources"
+
+      # Pre-populate large RandR modes so Guacamole's libguac-client-vnc
+      # can negotiate a viewport size matching the operator's browser
+      # window. Without this, Xtigervnc's mode list maxes out at
+      # 1920x1200 and Guacamole's SetDesktopSize request for anything
+      # larger silently falls back to letterboxing (black bars around a
+      # 1920x1080 framebuffer). Adding modes via xrandr is idempotent —
+      # repeat invocations are no-ops once a mode exists.
+      _addmode() {
+        ml=$(cvt "$1" "$2" 2>/dev/null | grep '^Modeline' | sed 's/^Modeline //')
+        [ -z "$ml" ] && return
+        name=$(echo "$ml" | awk '{print $1}' | tr -d '"')
+        rest=$(echo "$ml" | sed 's/^"[^"]*" *//')
+        xrandr --newmode "$name" $rest 2>/dev/null
+        xrandr --addmode VNC-0 "$name" 2>/dev/null
+      }
+      for res in 2048x1152 2256x1504 2400x1350 2560x1440 2560x1600 \
+                 2880x1620 3000x2000 3200x1800 3840x2160; do
+        _addmode "${res%x*}" "${res#*x}"
+      done
+
+      # Screen-blank prevention for the VNC display path. Guacamole's
+      # HTML5 client doesn't generate the X11 input events that the
+      # X server's built-in screensaver/DPMS timers count as "activity",
+      # so without this the framebuffer goes black after the idle
+      # timeout and the operator sees a dead session. This is the VNC
+      # equivalent of the ~/.xsessionrc the kali role drops for the
+      # xrdp path. (xfce4-power-manager / xfce4-screensaver / logind
+      # get handled by the dedicated tasks later in this role — those
+      # cover both display paths.)
+      xset s off       2>/dev/null
+      xset s noblank   2>/dev/null
+      xset s 0 0       2>/dev/null
+      xset -dpms       2>/dev/null
+
+      # dbus-launch starts a session-bus tied to the X session, so
+      # xfconfd / pipewire / xdg-portals can be activated as expected.
+      exec /usr/bin/dbus-launch --exit-with-session /usr/bin/xfce4-session
+  become: true
+
+# Set the VNC password to the same value as ranger's Linux/SSH password
+# (terra_linux_pass, default Lab!Linux1). This keeps Guacamole's saved
+# `password` parameter usable for BOTH SSH and VNC connections — and
+# matches what the operator already knows from terraform output
+# `student_logins` / `shared_infra_credentials`.
+- name: Set VNC password (matches operator's SSH password)
+  ansible.builtin.shell:
+    cmd: |
+      set -e
+      PW={{ terra_linux_pass | default("Lab!Linux1") | quote }}
+      umask 077
+      echo "$PW" | vncpasswd -f > /home/{{ ansible_user }}/.config/tigervnc/passwd
+      # Legacy clients look at ~/.vnc/passwd. Mirror both.
+      cp -f /home/{{ ansible_user }}/.config/tigervnc/passwd /home/{{ ansible_user }}/.vnc/passwd
+      chown {{ ansible_user }}:{{ ansible_user }} \
+            /home/{{ ansible_user }}/.config/tigervnc/passwd \
+            /home/{{ ansible_user }}/.vnc/passwd
+      chmod 600 /home/{{ ansible_user }}/.config/tigervnc/passwd /home/{{ ansible_user }}/.vnc/passwd
+  become: true
+  changed_when: false   # idempotent: always re-render
+
+- name: Write TigerVNC systemd unit (vncserver@.service)
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/vncserver@.service
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=TigerVNC server on display %i ({{ ansible_user }})
+      After=syslog.target network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=forking
+      User={{ ansible_user }}
+      Group={{ ansible_user }}
+      WorkingDirectory=/home/{{ ansible_user }}
+      # ExecStartPre kills any leftover display from a previous crash.
+      # `-` prefix => non-zero exit (e.g., nothing to kill) is OK.
+      ExecStartPre=-/usr/bin/vncserver -kill %i
+      # Starting geometry. Guacamole's VNC client CANNOT auto-resize
+      # the desktop (resize-method is RDP-only in Guacamole) — so this
+      # one number is what operators get for the entire session. The
+      # default 2560x1440 is the "fits most" sweet spot:
+      #   * 1080p / 1440p laptops fullscreen: 1:1 or comfortable
+      #     downscale; text stays sharp via HTML5 canvas resampling.
+      #   * 4K monitors: minor side bars on a 16:9 viewport; bump
+      #     `kali_vnc_geometry` to "3840x2160" per scenario to remove
+      #     them, at the cost of ~4× encoder CPU + bandwidth peaks
+      #     and slight downscale blur on smaller viewports.
+      #   * Ultrawide (21:9 / 32:9): side bars regardless of size
+      #     unless you set kali_vnc_geometry to a wide-aspect value
+      #     (e.g. "3440x1440" for 21:9, "5120x1440" for 32:9).
+      # -localhost no exposes :5901 on 0.0.0.0 so guacd can connect.
+      # SecurityTypes VncAuth = password file (matches our passwd setup).
+      # -AcceptSetDesktopSize stays on (default) so future Guacamole
+      # versions that DO send SetDesktopSize messages can resize using
+      # the RandR mode pool seeded in ~/.vnc/xstartup.
+      ExecStart=/usr/bin/vncserver %i -geometry {{ kali_vnc_geometry | default("2560x1440") }} -depth 24 -localhost no -SecurityTypes VncAuth
+      ExecStop=/usr/bin/vncserver -kill %i
+      Restart=on-failure
+      RestartSec=5
+      TimeoutStartSec=60
+
+      [Install]
+      WantedBy=multi-user.target
+  become: true
+  register: vnc_unit
+
+- name: Reload systemd if vncserver@.service was rewritten
+  ansible.builtin.systemd:
+    daemon_reload: true
+  become: true
+  when: vnc_unit is changed
+
+# The `kali` box reaches its desktop through Guacamole over RDP/3389 —
+# xrdp running an Xvnc backend (autorun=Xvnc, configured + started
+# further down: see "Enable + start xrdp.service"). xrdp is
+# intentionally LEFT RUNNING.
+#
+# vncserver@:1 (TigerVNC on :5901) is also kept PERMANENTLY running
+# as the persistent Xvnc display that xrdp's [Xvnc] backend points
+# at. The previous design stopped+disabled this unit on the rationale
+# that "xrdp's Xvnc backend covers it" — but the stock xrdp.ini ships
+# [Xvnc] with `port=-1` (ask sesman per-session), and on first
+# connect sesman returns the display port BEFORE Xvnc has bound its
+# TCP socket. The user sees, in Guacamole's xrdp Connection Log:
+#   "VNC connecting to TCP 127.0.0.1 -1"
+#   "Error connecting to VNC server [Operation now in progress]"
+#   "Error connecting to user session"
+# …with a refresh succeeding because Xvnc has bound in the gap.
+#
+# Pre-binding TigerVNC on :5901 here (this task) + patching xrdp.ini
+# [Xvnc] to use port=5901 (patch task below) makes xrdp connect to
+# an already-bound display — eliminates the race.
+#
+# Trade-off: ~150 MB extra RSS for the persistent VNC session, and
+# only one concurrent xrdp session per box. Fine for terra-range's
+# one-operator-per-kali model.
+- name: Enable + start vncserver@:1 (persistent TigerVNC display for xrdp [Xvnc] backend)
+  ansible.builtin.systemd:
+    name: "vncserver@:1"
+    state: started
+    enabled: true
+    daemon_reload: true
+  become: true
+  register: vncserver_start
+  failed_when: false
+
+# Verify the unit actually came up — if it didn't, the [Xvnc] backend
+# patch below (port=5901) will point at NOTHING and xrdp-sesman fails
+# with "Can't create session for user ranger - X server could not be
+# started". That was the symptom one operator hit after the xrdp
+# binary was deploy-installed without xorgxrdp recommends; the
+# vncserver@:1 unit existed but its preconditions weren't right and
+# nobody noticed because the start task didn't gate on health.
+- name: Verify vncserver@:1 is listening on :5901
+  ansible.builtin.wait_for:
+    host: 127.0.0.1
+    port: 5901
+    timeout: 30
+  become: true
+  register: vnc_port_check
+  failed_when: false
+
+- name: Restart vncserver@:1 if it didn't come up (one retry)
+  ansible.builtin.systemd:
+    name: "vncserver@:1"
+    state: restarted
+    enabled: true
+  become: true
+  when: vnc_port_check is failed
+
+- name: Re-verify vncserver@:1 after restart
+  ansible.builtin.wait_for:
+    host: 127.0.0.1
+    port: 5901
+    timeout: 30
+  become: true
+  when: vnc_port_check is failed
+  register: vnc_port_recheck
+
+- name: Surface vncserver@:1 status (fatal if still not listening on :5901)
+  ansible.builtin.fail:
+    msg: |
+      vncserver@:1 (TigerVNC) is not listening on 127.0.0.1:5901 after
+      enable+start+restart. xrdp's [Xvnc] backend (autorun=Xvnc + port=5901)
+      depends on this — without it, Guacamole RDP sessions land on
+      "X server could not be started" in xrdp-sesman.
+
+      Diagnose on the host:
+        systemctl status vncserver@:1
+        journalctl -u vncserver@:1 --no-pager -n 50
+        ls -la /home/{{ ansible_user }}/.vnc/
+        cat /home/{{ ansible_user }}/.vnc/xstartup
+      Common causes:
+        - VNC password file ~/.vnc/passwd missing or wrong mode
+        - xstartup not executable / wrong shebang
+        - Xvnc binary not on PATH (tigervnc-standalone-server missing)
+  when:
+    - vnc_port_check is failed
+    - vnc_port_recheck is defined
+    - vnc_port_recheck is failed
+
+# Enable `user_allow_other` in /etc/fuse.conf so xrdp-chansrv (running
+# as the operator) can mount Guacamole's drive-redirection share with
+# allow_other (needed so other processes — Thunar, daemons under the
+# session — can see it). Default in Debian/Kali ships this line
+# commented out. Without it the FUSE mount fails silently inside
+# xrdp-chansrv and Guacamole's drive transfer is non-functional (the
+# bug ALSO contributed to instant-disconnect previously, before fuse
+# was even installed).
+- name: Enable user_allow_other in /etc/fuse.conf (Guacamole drive redirection)
+  ansible.builtin.replace:
+    path: /etc/fuse.conf
+    regexp: '^#\s*user_allow_other\s*$'
+    replace: 'user_allow_other'
+  become: true
+
+# Debian's xrdp package ships with the Hyper-V vsock transport enabled
+# by default (`port=vsock://-1:3389`). That's correct for Hyper-V-enhanced
+# RDP, but on a stock Azure VM there's no vsock client — Guacamole speaks
+# plain TCP. Result: `systemctl is-active xrdp` shows `active`, the
+# journal says `listening to port 3389 on -1`, but `ss -tlnp` shows
+# NOTHING on :3389 and Guacamole returns "Could not connect to RDP".
+# Force TCP binding. Idempotent — the regex only matches the broken line.
+- name: Force xrdp to bind TCP :3389 (not vsock://-1:3389)
+  ansible.builtin.replace:
+    path: /etc/xrdp/xrdp.ini
+    regexp: '^port=vsock://-1:3389\s*$'
+    replace: 'port=tcp://:3389'
+  become: true
+  register: xrdp_port_fix
+
+# THIRD xrdp gotcha: the `[Xorg]` connection profile in xrdp.ini ships
+# without `ip=127.0.0.1`. xrdp uses this to know WHERE to connect after
+# sesman launches Xorg on a free display. Missing → xrdp's wm shows
+# the operator "error - no ip set" + "Error connecting to user session"
+# in the Connection Log. Adding it makes xrdp dial 127.0.0.1:6000+N
+# (TCP, since we already removed -nolisten tcp via the sesman.ini
+# [Xorg] block patch).
+- name: Patch xrdp.ini [Xorg] to set ip=127.0.0.1 (fixes "no ip set")
+  ansible.builtin.shell:
+    cmd: |
+      python3 - <<'PY'
+      import re, pathlib
+      p = pathlib.Path('/etc/xrdp/xrdp.ini')
+      src = p.read_text()
+      def patch_xorg(m):
+          block = m.group(0)
+          if re.search(r'^ip=', block, re.M):
+              return block
+          return re.sub(r'(^code=[^\n]*$)', r'\1\nip=127.0.0.1', block, count=1, flags=re.M)
+      new = re.sub(r'\[Xorg\].*?(?=^\[)', patch_xorg, src, count=1, flags=re.S | re.M)
+      if new != src:
+          p.write_text(new); print('CHANGED')
+      else:
+          print('UNCHANGED')
+      PY
+  register: xrdp_ini_ip
+  changed_when: "'CHANGED' in xrdp_ini_ip.stdout"
+  become: true
+
+# Auto-route Guacamole's RDP-passed credentials to a session section
+# without the operator seeing a "Login to attacker / Session / username
+# / password" form. xrdp.ini ships `autorun=` empty; setting it makes
+# xrdp pick that section by default whenever the client provides creds,
+# which Guacamole always does.
+#
+# We point this at [Xvnc], NOT [Xorg]. The [Xorg] backend (Xorg +
+# xorgxrdp) is the path that produced the documented "fully-loaded XFCE
+# process tree behind a black framebuffer" failure on GPU-less Azure
+# D-series VMs — see the GLAMOR/DRI3 notes below. xrdp's [Xvnc] backend
+# launches a self-contained Xvnc (TigerVNC) X server instead: no Xorg
+# config, no xorgxrdp module, no GLAMOR/DRI3/DRM probing. That is the
+# exact reason terra-range moved the Kali desktop off the Xorg backend;
+# routing xrdp through Xvnc gives the `kali` box a self-contained,
+# reliable X server while still speaking RDP on the wire to Guacamole.
+# Stock xrdp.ini [Xvnc] section ships `port=-1` ("ask sesman for a
+# free display port per new session"). That races Xvnc's TCP bind on
+# first connect:
+#   "VNC connecting to TCP 127.0.0.1 -1"
+#   "Error connecting to VNC server [Operation now in progress]"
+# Refresh works because Xvnc has bound in the gap.
+#
+# Fix: point [Xvnc] at the persistent vncserver@:1 (TigerVNC :5901
+# enabled+started above) so xrdp connects to an already-bound display.
+# Idempotent — re-runs are UNCHANGED once the port=5901 line is in.
+- name: Patch xrdp.ini [Xvnc] port=5901 (persistent vncserver@:1)
+  ansible.builtin.shell:
+    cmd: |
+      python3 - <<'PY'
+      import re, pathlib
+      p = pathlib.Path('/etc/xrdp/xrdp.ini')
+      src = p.read_text()
+      def patch_xvnc(m):
+          block = m.group(0)
+          # Set port=5901 to point at the persistent vncserver@:1.
+          block = re.sub(r'^port=.*$', 'port=5901', block, count=1, flags=re.M)
+          # REMOVE any `ip=` line that prior versions of this task added —
+          # `ip=` is only valid for the [Xorg] connection profile; in
+          # [Xvnc] it triggers a runtime warning in the xrdp Connection
+          # Log: "'ip' is not needed for this connection - please remove".
+          # Older revs of this role added it under the wrong assumption
+          # that the [Xorg] semantics carried over. They don't.
+          block = re.sub(r'^ip=.*\n', '', block, flags=re.M)
+          return block
+      new = re.sub(r'\[Xvnc\].*?(?=^\[)', patch_xvnc, src, count=1, flags=re.S | re.M)
+      if new != src:
+          p.write_text(new); print('CHANGED')
+      else:
+          print('UNCHANGED')
+      PY
+  register: xrdp_ini_xvnc
+  changed_when: "'CHANGED' in xrdp_ini_xvnc.stdout"
+  become: true
+
+- name: Set xrdp autorun=Xvnc in xrdp.ini [Globals] (skip login form, Xvnc backend)
+  ansible.builtin.lineinfile:
+    path: /etc/xrdp/xrdp.ini
+    regexp: '^autorun='
+    line: 'autorun=Xvnc'
+    state: present
+  become: true
+  register: xrdp_autorun
+
+# Second xrdp gotcha: with an empty [Xorg] section in sesman.ini, xrdp-
+# sesman launches `/usr/lib/xorg/Xorg :N ... -nolisten tcp` (built-in
+# defaults). But xrdp's `libxup.so` then tries to TALK to that Xorg via
+# `lib_mod_connect: connecting via TCP socket` (127.0.0.1:6000+display).
+# Xorg has TCP disabled → connection refused → user sees:
+#   "session is available on display 0 ... started connecting"
+#   "error - no ip set"
+#   "Error connecting to user session"
+# (the "no ip set" wording is misleading — sesman has the IP, Xorg just
+# isn't listening on it.)
+#
+# Fix: explicitly populate [Xorg] WITHOUT `-nolisten tcp`. We use the
+# blockinfile module so re-runs replace the same managed block instead
+# of stacking duplicate [Xorg] sections. The managed block ends at the
+# next [section] header so subsequent sections in sesman.ini are
+# preserved untouched.
+# Disable GLAMOR/DRI3 in xrdp's xorg.conf. On cloud VMs without a real
+# GPU (Azure D-series), the stock /etc/X11/xrdp/xorg.conf tries to use
+# hardware OpenGL via `Load "glamoregl"` + `Option "DRMDevice"
+# /dev/dri/renderD128` + `DRI3 1`. There's no usable DRM render node
+# on a stock Azure D-series VM, so GLAMOR init fails partway. Xorg
+# starts (xrdp connects, session opens), xfce4-session + xfwm4 +
+# xfdesktop launch, but NOTHING draws to the framebuffer — operators
+# see a black screen behind a fully-loaded XFCE process tree.
+# Switching to pure-software xrdpdev (no GLAMOR, no DRI3) makes the
+# framebuffer draw normally.
+# Probe whether xrdp's xorg.conf exists. It's provided by the xorgxrdp
+# package (a Recommends of xrdp). If the bake or the deploy-time install
+# pulled xrdp without recommends (e.g. via `--no-install-recommends`),
+# this file won't exist. That's fine when we're using the Xvnc backend
+# (autorun=Xvnc above) — Xvnc doesn't read xorg.conf. Gate the GLAMOR
+# + Virtual patches below on its presence so the play doesn't fail.
+- name: Probe xrdp xorg.conf presence
+  ansible.builtin.stat:
+    path: /etc/X11/xrdp/xorg.conf
+  register: xrdp_xorg_conf_stat
+  become: true
+
+- name: Disable GLAMOR/DRI3 in /etc/X11/xrdp/xorg.conf (software rendering for cloud VMs)
+  ansible.builtin.replace:
+    path: /etc/X11/xrdp/xorg.conf
+    regexp: '{{ item.regexp }}'
+    replace: '{{ item.replace }}'
+  loop:
+    - { regexp: '^(\s*)Load "glamoregl"', replace: '\1#  Load "glamoregl"' }
+    - { regexp: '^(\s*)Option "DRMDevice"', replace: '\1#  Option "DRMDevice"' }
+    - { regexp: '^(\s*)Option "DRI3"', replace: '\1#  Option "DRI3"' }
+  become: true
+  register: xrdp_xorg_conf
+  when: xrdp_xorg_conf_stat.stat.exists
+
+# Add `Virtual 4096 2160` to the Display SubSection of xrdp's xorg.conf.
+# Without it, the framebuffer is sized at the LARGEST listed Modes entry
+# (1920x1080 by default). Modern browser windows on big monitors send
+# RDP resize requests > 1920x1080 (we've seen 2552x1331 in the wild);
+# the resize fails silently, Xorg stays at the initial small fb, and the
+# operator sees a small desktop in the top-left + a huge black border —
+# or the whole viewport rendered black if Guacamole's frame scaling
+# clamps to the larger requested size. 4096x2160 covers 4K monitors.
+- name: Set xrdp xorg.conf Virtual 4096x2160 (allow resize up to 4K)
+  ansible.builtin.shell:
+    cmd: |
+      python3 - <<'PY'
+      import re, pathlib
+      p = pathlib.Path('/etc/X11/xrdp/xorg.conf')
+      src = p.read_text()
+      if 'Virtual 4096 2160' in src:
+          print('UNCHANGED'); raise SystemExit
+      new = re.sub(
+          r'(SubSection "Display"\s*\n\s*Depth 24\s*\n\s*Modes [^\n]*\n)',
+          r'\1        Virtual 4096 2160\n',
+          src, count=1)
+      if new != src:
+          p.write_text(new); print('CHANGED')
+      else:
+          print('UNCHANGED-noop')
+      PY
+  register: xrdp_xorg_virtual
+  changed_when: "'CHANGED' in xrdp_xorg_virtual.stdout"
+  # Same gate as the GLAMOR/DRI3 task above — only valid when the Xorg
+  # backend's xorg.conf actually exists (xrdp+xorgxrdp installed). On
+  # an Xvnc-only build (autorun=Xvnc, no xorgxrdp), this file is
+  # absent and that's fine.
+  when: xrdp_xorg_conf_stat.stat.exists
+  become: true
+
+- name: Patch sesman.ini [Xorg] to allow local TCP X-server connections
+  ansible.builtin.shell:
+    cmd: |
+      python3 - <<'PY'
+      import re, pathlib
+      p = pathlib.Path('/etc/xrdp/sesman.ini')
+      src = p.read_text()
+      xorg = (
+          "[Xorg]\n"
+          "param=/usr/lib/xorg/Xorg\n"
+          "param=-config\n"
+          "param=xrdp/xorg.conf\n"
+          "param=-noreset\n"
+          "param=-logfile\n"
+          "param=.xorgxrdp.%s.log\n"
+      )
+      new = re.sub(r'^\[Xorg\][^\[]*', xorg + "\n", src, count=1, flags=re.M)
+      if new == src and '[Xorg]' not in src:
+          new = src.rstrip() + "\n\n" + xorg
+      if new != src:
+          p.write_text(new)
+          print('CHANGED')
+      else:
+          print('UNCHANGED')
+      PY
+  register: xrdp_xorg_section
+  changed_when: "'CHANGED' in xrdp_xorg_section.stdout"
+  become: true
+
+# Stale-session hardening for sesman. The defaults
+# (KillDisconnected=false, Policy=Default) cause two operational
+# headaches on a multi-reconnect workflow like ours:
+#   1. KillDisconnected=false leaves an entire desktop (Xorg + xfce4-
+#      session + chansrv + ssh-agent) running indefinitely after the
+#      RDP client disconnects. Reconnect attempts often allocate a NEW
+#      display (`:1`, `:2`, …) instead of reattaching, and the new
+#      xfce4-session sees pre-existing per-user state (D-Bus, ssh-
+#      agent, X locks) and dies in <1s with "SSH authentication agent
+#      is already running" in .xsession-errors — the operator sees
+#      "You have been disconnected" on a black Guacamole tab.
+#   2. Policy=Default doesn't match reconnects to the existing session
+#      well; UBC (User + BPP + Client-IP) makes Guac at 10.0.0.20
+#      always reattach to its own session for a given user/bpp combo.
+#
+# Five-minute disconnect grace window keeps brief network blips
+# (Guacamole tab focus loss, NIC flap) from killing the desktop.
+- name: Tighten sesman.ini session lifecycle (kill stale + UBC policy)
+  ansible.builtin.lineinfile:
+    path: /etc/xrdp/sesman.ini
+    regexp: "^{{ item.key }}="
+    line: "{{ item.key }}={{ item.value }}"
+    state: present
+  loop:
+    # Sweet-spot policy: KillDisconnected=true + 10-minute window.
+    # Earlier we tried:
+    #   * 30s  → killed sessions mid-use during brief Guac→Kali blips
+    #   * 0/false → stale Xorgs stayed forever, next connect hit
+    #            "Cannot establish listening sockets" on /tmp/.X0-lock
+    # 10 minutes is long enough to survive any reasonable RDP-protocol
+    # idle (TCP retransmits, Guac focus blurs, brief VNet peering
+    # hiccups) AND short enough that truly-abandoned sessions clear
+    # before the next operator reconnects.
+    - { key: "KillDisconnected",      value: "true" }
+    - { key: "DisconnectedTimeLimit", value: "600" }
+    # Policy=Separate: each new RDP connection gets a fresh session.
+    # We previously tried UBC (User+Bpp+Client) for the reattach
+    # behavior, but xrdp 0.10+ doesn't recognize the 'C' character
+    # and silently falls back to Default, which DOES reattach — to a
+    # session whose Xorg/xfwm we may have already killed. The
+    # reconnect script (empty reconnectwm.sh) exits, sesman calls
+    # logout, the operator gets disconnected immediately. `Separate`
+    # avoids the reattach entirely; KillDisconnected=true + 10min
+    # window cleans up cleanly if the operator closes the tab.
+    - { key: "Policy",                value: "Separate" }
+  loop_control:
+    label: "{{ item.key }}={{ item.value }}"
+  register: xrdp_sesman_policy
+  become: true
+
+# Reap orphaned xrdp X sessions before the xrdp-sesman restart below.
+# Two distinct leaks, same root cause — `systemctl restart xrdp-sesman`
+# wipes sesman's in-memory session table, so every X server it spawned
+# pre-restart becomes an orphan it no longer tracks. `KillDisconnected`
+# then can't reap them (it only kills sessions sesman still knows
+# about), so each one — plus its whole XFCE process tree — lingers
+# forever:
+#   * Xorg backend  — `Xorg :N -config xrdp/xorg.conf …`. On GPU-less
+#     Azure VMs these also busy-loop at ~100% CPU (GLAMOR/DRI3 init
+#     fails). Pure garbage after the autorun=Xvnc migration — nothing
+#     legitimate uses the Xorg backend anymore.
+#   * Xvnc backend  — `Xvnc :N … -rfbauth …/sesman_passwd-… …`. The
+#     `sesman_passwd-` token is what distinguishes an xrdp-sesman-
+#     managed Xvnc from the standalone `vncserver@:1` (different
+#     rfbauth path), so we can target xrdp's Xvnc sessions without
+#     touching the main `kali` box's standalone VNC server.
+# We only reap when the xrdp config actually changed (same gate as the
+# restart task below): that's exactly when sesman is about to restart
+# and orphan everything anyway, so wiping the sessions first just means
+# the operator reconnects into ONE clean session instead of stacking a
+# 7th on top of 6 orphans. On a no-op repair we leave sessions alone —
+# in steady-state operation (no sesman restart) KillDisconnected does
+# its job and the leak stays bounded.
+- name: Reap orphaned xrdp X sessions before sesman restart (Xorg + Xvnc backends)
+  ansible.builtin.shell:
+    # IMPORTANT — the [X] bracket trick on both patterns. Ansible runs
+    # this whole block as `sh -c '<the entire script>'`, so the wrapper
+    # shell's OWN command line contains these pkill patterns verbatim.
+    # A bare `pkill -f 'Xvnc .*sesman_passwd-'` matches that wrapper and
+    # SIGTERMs its own session — the task dies rc=-15 and (sitting right
+    # before "Enable xrdp.service") aborts the whole role. `[X]vnc`
+    # still matches a real `Xvnc …` process, but the pattern *text*
+    # "[X]vnc" contains no "Xvnc" substring, so pkill can't match
+    # itself. (The Xorg line previously dodged this only by accident —
+    # the literal `\.` in `xorg\.conf` broke the self-match.)
+    # failed_when:false — reaping orphans is best-effort cleanup; a
+    # pkill quirk must never abort the role on the critical path.
+    cmd: |
+      killed=0
+      pkill -f '[X]org.*xrdp/xorg\.conf'            && killed=1
+      pkill -f '[X]vnc .*-rfbauth .*sesman_passwd-' && killed=1
+      [ "$killed" = 1 ] && echo KILLED || echo NONE
+  register: xrdp_session_reap
+  changed_when: "'KILLED' in xrdp_session_reap.stdout"
+  failed_when: false
+  become: true
+  when: >
+    xrdp_groups is changed or xrdp_port_fix is changed
+    or xrdp_xorg_section is changed or xrdp_sesman_policy is changed
+    or xrdp_ini_ip is changed or xrdp_autorun is changed
+    or xrdp_xorg_conf is changed or xrdp_xorg_virtual is changed
+
+- name: Enable + start xrdp.service
+  ansible.builtin.systemd:
+    name: xrdp
+    enabled: true
+    state: started
+  become: true
+
+- name: Restart xrdp + xrdp-sesman if any xrdp config changed
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: restarted
+  loop:
+    - xrdp-sesman   # picks up new [Xorg] section
+    - xrdp          # picks up TCP port binding + group-membership
+  become: true
+  when: xrdp_groups is changed or xrdp_port_fix is changed or xrdp_xorg_section is changed or xrdp_sesman_policy is changed or xrdp_ini_ip is changed or xrdp_autorun is changed or xrdp_xorg_conf is changed or xrdp_xorg_virtual is changed
+
+- name: Verify xrdp is listening on :3389
+  ansible.builtin.wait_for:
+    port: 3389
+    host: 0.0.0.0
+    timeout: 30
+
+# ============================================================================
+# Aggressive screen-blank + lock-screen prevention (the `kali` host).
+# ============================================================================
+# Applies to the `kali` attacker box (the single xrdp/Xvnc workstation).
+# (The kali-2 ephemeral container pool, when enabled, gets the
+# equivalent treatment baked into its start.sh — see
+# modules/azure/userdata/workspaces.sh.)
+#
+# The "Kali black screen via Guacamole" issue has two root classes:
+#   1. xrdp + Xorg config errors (vsock binding, GLAMOR, sesman policy)
+#      — addressed by the patches further up in this role.
+#   2. The XFCE session blanking / locking itself when there's no human
+#      activity — Guacamole's HTML5 client doesn't generate the X11
+#      input events that xfce4-power-manager / xfce4-screensaver / xset's
+#      built-in timer count as "activity", so after the idle timeout the
+#      framebuffer goes black (or the lock screen appears) and the
+#      operator sees a "lost session".
+#
+# This block kills ALL of (2):
+#   - xset s off / -dpms / s noblank        ← X11-level (xrdp path via
+#                                              ~/.xsessionrc; VNC path
+#                                              via ~/.vnc/xstartup which
+#                                              already carries these —
+#                                              see the xstartup task)
+#   - xfce4-power-manager idle/blank zeros  ← session-level
+#   - xfce4-screensaver autostart Hidden    ← session-level (the LOCK
+#                                              screen daemon)
+#   - logind HandleIdleAction=ignore        ← OS-level fallback
+#
+# The operator asked for no blank screen and no lock screen on the Kali
+# box. ~/.xsessionrc + ~/.xsession feed the X11-level xset settings into
+# xrdp's Xvnc session; the xfce4-power-manager / screensaver / logind
+# pieces apply to the XFCE session regardless of display protocol.
+- name: Aggressive screen-blank + lock-screen prevention (the kali box)
+  block:
+    - name: Drop a Xresources-time xset-s-off into ~/.xsessionrc
+      ansible.builtin.copy:
+        dest: "/home/{{ ansible_user }}/.xsessionrc"
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: "0755"
+        content: |
+          #!/bin/sh
+          # Disable every X11 idle-timer the session controls. Runs at
+          # X session start (sourced by ~/.xsession before xfce4-session
+          # launches). Without this, xfce4-session inherits the default
+          # X server timeouts and the framebuffer blanks after 10 min
+          # of no input.
+          xset s off       2>/dev/null
+          xset s noblank   2>/dev/null
+          xset s 0 0       2>/dev/null
+          xset -dpms       2>/dev/null
+          # Belt-and-braces: also disable any inherited screensaver.
+          xset -display "$DISPLAY" s reset 2>/dev/null || true
+      become: true
+
+    - name: Wire ~/.xsession to source ~/.xsessionrc before xfce4-session
+      ansible.builtin.copy:
+        dest: "/home/{{ ansible_user }}/.xsession"
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: "0755"
+        content: |
+          #!/bin/sh
+          # Read by xrdp's Xsession.d/ chain at session start.
+          [ -r "$HOME/.xsessionrc" ] && . "$HOME/.xsessionrc"
+          exec /usr/bin/dbus-launch --exit-with-session /usr/bin/xfce4-session
+      become: true
+
+    - name: Stage CWR wallpaper file on the Kali box
+      ansible.builtin.copy:
+        # Ansible looks this up via the standard files/ search path:
+        # role's files/ first, then playbook-level files/ (where
+        # `desktop-wallpaper-CWR.png` lives — added at the same time as
+        # this task). 1.1 MB PNG, 1920x1080.
+        src: desktop-wallpaper-CWR.png
+        dest: /usr/share/backgrounds/cwr-wallpaper.png
+        owner: root
+        group: root
+        mode: "0644"
+      become: true
+
+    # ----- SYSTEM-WIDE wallpaper + greeter background -----------------------
+    # The bake script also writes these, but the role re-asserts them so
+    # an already-running (non-baked) box gets the same outcome via
+    # `./range repair`. /etc/alternatives/desktop-background is the path
+    # the lightdm-gtk-greeter reads on most Debian/Kali installs; the
+    # XFCE desktop reads /etc/xdg/xfce4/xfconf/.../xfce4-desktop.xml for
+    # the system default that new sessions inherit.
+    - name: Symlink CWR wallpaper into the system desktop-background path (greeter + desktop pick this up)
+      ansible.builtin.file:
+        src:   /usr/share/backgrounds/cwr-wallpaper.png
+        dest:  "{{ item }}"
+        state: link
+        force: true
+      loop:
+        - /etc/alternatives/desktop-background
+        - /etc/alternatives/desktop-grub
+      become: true
+      failed_when: false
+
+    # Probe whether lightdm is installed — Azure's Kali Marketplace image
+    # is headless by default and may not have lightdm at all (students
+    # only ever reach it via xrdp/VNC, never the local console). All
+    # subsequent lightdm-related tasks are gated on this so we don't
+    # explode trying to write into /etc/lightdm/* that doesn't exist.
+    - name: Probe whether lightdm is installed
+      ansible.builtin.stat:
+        path: /etc/lightdm
+      register: lightdm_dir
+      become: true
+
+    - name: Ensure /etc/lightdm/lightdm-gtk-greeter.conf.d exists (when lightdm present)
+      ansible.builtin.file:
+        path: /etc/lightdm/lightdm-gtk-greeter.conf.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      become: true
+      when: lightdm_dir.stat.exists
+
+    - name: Ensure /etc/lightdm/lightdm.conf.d exists (when lightdm present)
+      ansible.builtin.file:
+        path: /etc/lightdm/lightdm.conf.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      become: true
+      when: lightdm_dir.stat.exists
+
+    - name: Drop lightdm-gtk-greeter background config (greeter wallpaper)
+      ansible.builtin.copy:
+        dest: /etc/lightdm/lightdm-gtk-greeter.conf.d/90-cwr.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [greeter]
+          background = /usr/share/backgrounds/cwr-wallpaper.png
+          default-user-image = /usr/share/backgrounds/cwr-wallpaper.png
+      become: true
+      when: lightdm_dir.stat.exists
+
+    - name: Plant system-wide XFCE wallpaper default (/etc/xdg/...)
+      # System default = applies to any user without their own per-user
+      # xfce4-desktop.xml. ranger gets this on first session if their
+      # ~/.config/.../xfce4-desktop.xml is missing OR matches the system
+      # default (no per-user override yet). Critical for "wallpaper on
+      # desktop AND lock screen" — same image, same path, two consumers.
+      ansible.builtin.copy:
+        dest: /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfce4-desktop.xml
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          <?xml version="1.0" encoding="UTF-8"?>
+          <channel name="xfce4-desktop" version="1.0">
+            <property name="backdrop" type="empty">
+              <property name="screen0" type="empty">
+                <property name="monitor0" type="empty">
+                  <property name="workspace0" type="empty">
+                    <property name="color-style"  type="int"    value="0"/>
+                    <property name="image-style"  type="int"    value="5"/>
+                    <property name="last-image"   type="string" value="/usr/share/backgrounds/cwr-wallpaper.png"/>
+                  </property>
+                </property>
+                <property name="monitorVNC-0" type="empty">
+                  <property name="workspace0" type="empty">
+                    <property name="color-style"  type="int"    value="0"/>
+                    <property name="image-style"  type="int"    value="5"/>
+                    <property name="last-image"   type="string" value="/usr/share/backgrounds/cwr-wallpaper.png"/>
+                  </property>
+                </property>
+                <property name="monitorscreen" type="empty">
+                  <property name="workspace0" type="empty">
+                    <property name="color-style"  type="int"    value="0"/>
+                    <property name="image-style"  type="int"    value="5"/>
+                    <property name="last-image"   type="string" value="/usr/share/backgrounds/cwr-wallpaper.png"/>
+                  </property>
+                </property>
+              </property>
+            </property>
+          </channel>
+      become: true
+
+    # ----- Autologin: lightdm + PAM groups + cloud-init runcmd ------------
+    # The user reported "kali is not automatic login it still on lock
+    # screen" — that's lightdm showing the greeter form. lightdm reads
+    # /etc/lightdm/lightdm.conf.d/*.conf, picks `autologin-user=ranger`,
+    # and tries to log them in WITHOUT a password. That requires ranger
+    # to be a member of either `autologin` or `nopasswdlogin` group
+    # (lightdm checks both), which we ensure below.
+    - name: Drop lightdm autologin config for ranger (only if lightdm present)
+      ansible.builtin.copy:
+        dest: /etc/lightdm/lightdm.conf.d/90-cwr-autologin.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Seat:*]
+          autologin-user={{ ansible_user }}
+          autologin-user-timeout=0
+          autologin-session=xfce
+          greeter-hide-users=false
+          greeter-show-manual-login=true
+      become: true
+      when: lightdm_dir.stat.exists
+      register: lightdm_autologin
+
+    - name: Ensure autologin + nopasswdlogin groups exist
+      ansible.builtin.group:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - autologin
+        - nopasswdlogin
+      become: true
+
+    - name: Add ranger to autologin + nopasswdlogin groups (lightdm skip-password)
+      ansible.builtin.user:
+        name: "{{ ansible_user }}"
+        groups: autologin,nopasswdlogin
+        append: true
+      become: true
+
+    # On a headless Kali (no lightdm, accessed only via xrdp+VNC), the
+    # "lock screen" the user sees is actually one of:
+    #   (a) xrdp's session login form — bypassed by autorun=Xvnc in
+    #       xrdp.ini [Globals] (already set earlier in this role)
+    #   (b) the Xvnc password prompt — handled by the VNC password
+    #       being set to match ranger's SSH password (earlier in role)
+    #   (c) xfce4-screensaver locking the live session on idle —
+    #       handled by the screensaver-disable task below + the
+    #       xfce4-screensaver.xml file we wrote system-wide
+    #   (d) xscreensaver (a separate daemon) if it's installed —
+    #       handled by the systemd mask below
+    - name: Mask xfce4-screensaver + xscreensaver system services (belt + suspenders)
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        masked: true
+        enabled: false
+        state: stopped
+      loop:
+        - xfce4-screensaver.service
+      become: true
+      failed_when: false
+
+    - name: Kill any running screensaver processes for ranger (no-op if none)
+      ansible.builtin.shell:
+        cmd: |
+          pkill -u "{{ ansible_user }}" -f xfce4-screensaver 2>/dev/null || true
+          pkill -u "{{ ansible_user }}" -f xscreensaver       2>/dev/null || true
+          pkill -u "{{ ansible_user }}" -f light-locker       2>/dev/null || true
+          exit 0
+      become: true
+      changed_when: false
+
+    # Active-session refresh — for cases where ranger is ALREADY logged
+    # in via xrdp/VNC. Without this, the new wallpaper XML sits on disk
+    # but xfdesktop in the live session keeps the old (Kali default).
+    # `pkill -USR1 xfdesktop` is the documented "reload settings + redraw"
+    # signal. Best-effort: if no xfdesktop is running (user hasn't
+    # logged in yet), the signal goes nowhere — that's fine, the next
+    # session start picks up the on-disk settings.
+    - name: Reload xfdesktop in any active session (USR1 = reload + redraw)
+      ansible.builtin.shell:
+        cmd: pkill -USR1 -u "{{ ansible_user }}" xfdesktop 2>/dev/null || true
+      become: true
+      changed_when: false
+
+    - name: xfconf — set the CWR wallpaper for all backend monitor names
+      # Plants xfce4-desktop.xml so xfdesktop picks up the wallpaper on
+      # the first session start. xrdp's Xvnc backend and direct-VNC
+      # sessions present the desktop under DIFFERENT monitor names
+      # depending on the SDL/display setup — covering the common cases
+      # (monitor0, monitorscreen, monitorVNC-0) means the wallpaper
+      # appears regardless of which backend launched the session.
+      # image-style 5 = stretched (good for 1920x1080 covering varied
+      # client resolutions over RDP/VNC).
+      ansible.builtin.shell:
+        cmd: |
+          set -e
+          mkdir -p /home/{{ ansible_user }}/.config/xfce4/xfconf/xfce-perchannel-xml
+          cat > /home/{{ ansible_user }}/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-desktop.xml <<'XML'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <channel name="xfce4-desktop" version="1.0">
+            <property name="backdrop" type="empty">
+              <property name="screen0" type="empty">
+                <property name="monitor0" type="empty">
+                  <property name="workspace0" type="empty">
+                    <property name="last-image" type="string" value="/usr/share/backgrounds/cwr-wallpaper.png"/>
+                    <property name="image-style" type="int" value="5"/>
+                  </property>
+                </property>
+                <property name="monitorscreen" type="empty">
+                  <property name="workspace0" type="empty">
+                    <property name="last-image" type="string" value="/usr/share/backgrounds/cwr-wallpaper.png"/>
+                    <property name="image-style" type="int" value="5"/>
+                  </property>
+                </property>
+                <property name="monitorVNC-0" type="empty">
+                  <property name="workspace0" type="empty">
+                    <property name="last-image" type="string" value="/usr/share/backgrounds/cwr-wallpaper.png"/>
+                    <property name="image-style" type="int" value="5"/>
+                  </property>
+                </property>
+              </property>
+            </property>
+          </channel>
+          XML
+          chown -R {{ ansible_user }}:{{ ansible_user }} /home/{{ ansible_user }}/.config/xfce4
+      become: true
+      changed_when: false
+
+    - name: xfconf — zero out xfce4-power-manager blanking timers
+      ansible.builtin.shell:
+        cmd: |
+          set -e
+          # When the user isn't logged in yet, xfconf-query has no DBus
+          # session to write to — schedule the prefs via a per-user
+          # systemd-user run-once instead. Cheapest path: pre-populate
+          # the xfconf XML so the values are present on first session.
+          mkdir -p /home/{{ ansible_user }}/.config/xfce4/xfconf/xfce-perchannel-xml
+          cat > /home/{{ ansible_user }}/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-power-manager.xml <<'XML'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <channel name="xfce4-power-manager" version="1.0">
+            <property name="xfce4-power-manager" type="empty">
+              <property name="blank-on-ac"               type="int"  value="0"/>
+              <property name="blank-on-battery"          type="int"  value="0"/>
+              <property name="dpms-enabled"              type="bool" value="false"/>
+              <property name="dpms-on-ac-sleep"          type="uint" value="0"/>
+              <property name="dpms-on-ac-off"            type="uint" value="0"/>
+              <property name="dpms-on-battery-sleep"     type="uint" value="0"/>
+              <property name="dpms-on-battery-off"       type="uint" value="0"/>
+              <property name="inactivity-on-ac"          type="uint" value="14"/>
+              <property name="inactivity-sleep-mode-on-ac" type="uint" value="0"/>
+              <property name="presentation-mode"         type="bool" value="true"/>
+              <property name="lock-screen-suspend-hibernate" type="bool" value="false"/>
+            </property>
+          </channel>
+          XML
+          chown -R {{ ansible_user }}:{{ ansible_user }} /home/{{ ansible_user }}/.config/xfce4
+      become: true
+      changed_when: false
+
+    - name: Disable xfce4-screensaver (session-level lock daemon)
+      ansible.builtin.shell:
+        cmd: |
+          # The screensaver runs per-user under the X session, not as a
+          # system service, so we deal with it via a .desktop autostart
+          # override that says Hidden=true. (Masking via systemctl
+          # --user is too brittle across login mode changes.)
+          mkdir -p /home/{{ ansible_user }}/.config/autostart
+          cat > /home/{{ ansible_user }}/.config/autostart/xfce4-screensaver.desktop <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Hidden=true
+          EOF
+          chown -R {{ ansible_user }}:{{ ansible_user }} /home/{{ ansible_user }}/.config/autostart
+      become: true
+      changed_when: false
+
+    - name: Ensure /etc/systemd/logind.conf.d exists
+      ansible.builtin.file:
+        path: /etc/systemd/logind.conf.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      become: true
+
+    - name: logind HandleIdleAction=ignore (OS-level fallback)
+      ansible.builtin.copy:
+        dest: /etc/systemd/logind.conf.d/99-no-idle.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # terra-range (all Kali hosts): prevent logind from triggering
+          # any idle action that could blank/lock the X session. The
+          # default IdleAction is `ignore` but we set it explicitly +
+          # zero the timeout so a future Debian default change can't bite.
+          [Login]
+          HandleIdleAction=ignore
+          IdleAction=ignore
+          IdleActionSec=0
+      become: true
+      register: logind_idle_drop
+
+    - name: Reload logind if drop-in changed
+      ansible.builtin.systemd:
+        name: systemd-logind
+        state: reloaded
+      become: true
+      when: logind_idle_drop is changed
+      failed_when: false
+
+# Derive the student-index from Kali's own private IP (10.<N>.1.20).
+# Used by the Tools/README and the desktop launcher below so the URLs
+# point at THIS student's C2 boxes (10.<N>.1.5 / .7 / .9 / .11).
+- name: Compute student_index from private IP
+  ansible.builtin.set_fact:
+    terra_student_index: "{{ (terra_private_ip | default('10.1.1.20')).split('.')[1] }}"
+
+# ---------- Operator Tools/ folder on the Kali desktop ----------
+# A single place to find the C2 clients + connection info, surfaced
+# right on the XFCE desktop so RDP'd-in operators don't have to dig.
+- name: Ensure ~/Desktop/Tools exists
+  ansible.builtin.file:
+    path: "/home/{{ ansible_user }}/Desktop/Tools"
+    state: directory
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: "0755"
+  become: true
+
+# ---------- Operator payloads/ folder on the Kali desktop ----------
+# An organised landing pad for payloads the operator builds MANUALLY in
+# each C2 client's GUI. terra-range does NOT auto-generate implants —
+# the operator builds them themselves in Adaptix / Sliver / Mythic and
+# saves the output into the matching subdirectory here. Pre-creating
+# the tree just means there's a consistent home for them across every
+# deploy (and the C2-client "save payload" dialogs default to a sane
+# path instead of scattering binaries around $HOME).
+- name: Ensure ~/Desktop/payloads tree exists
+  ansible.builtin.file:
+    path: "/home/{{ ansible_user }}/Desktop/payloads/{{ item }}"
+    state: directory
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: "0755"
+  loop:
+    - ""          # the payloads/ root itself
+    - adaptix
+    - sliver
+    - mythic
+  become: true
+
+- name: Drop the operator payload-build runbook into ~/Desktop/payloads
+  ansible.builtin.copy:
+    dest: "/home/{{ ansible_user }}/Desktop/payloads/README.txt"
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: "0644"
+    content: |
+      ============================================================
+       terra-range — C2 payload build runbook (manual, per scenario)
+      ============================================================
+      Build artifacts in each C2 client and save them into the matching
+      subdirectory of this folder. Subdirs: adaptix/  sliver/  mythic/
+
+      All three teamservers in this range are pre-configured: listeners
+      created, C2 profiles seeded with working defaults, redirectors
+      fronting them. You only need to pick OS/arch + a filename.
+
+      Student index for THIS Kali: derive the N in 10.N.x.x from
+      `ip -4 a` (it's the second octet). Teamserver IPs below use <N>.
+
+      ------------------------------------------------------------
+      ADAPTIX   (teamserver 10.<N>.1.5:9000, endpoint /endpoint)
+      ------------------------------------------------------------
+        1. Launch "Adaptix C2" desktop icon (wrapper re-seeds the
+           cwr profile every launch — just click Connect).
+        2. Listeners tab: 5 HTTPS listeners are already up
+           (azure/cloudfront/workers/fastly/other on :8443-:8447).
+        3. Right-click the listener you want -> Generate / Agent.
+        4. Pick agent OS + arch, set output path to:
+              ~/Desktop/payloads/adaptix/
+        5. The "azure" listener's callback already points at the
+           AFD-fronted redirector; the other four are CHANGEME until
+           you wire their CDNs.
+
+      ------------------------------------------------------------
+      SLIVER    (teamserver 10.<N>.1.11)
+      ------------------------------------------------------------
+        1. Launch "Sliver C2" desktop icon (operator.cfg is already
+           imported — sliver-client connects on its own).
+        2. At the sliver> prompt, generate against the redirector URL:
+              generate --http <redirector-fqdn> --os windows \
+                       --save ~/Desktop/payloads/sliver/
+           (swap --os linux|mac, add `beacon` before --http for a
+           beacon instead of a session, --arch amd64|arm64 as needed)
+        3. `profiles` / `implants` list what you've built.
+           The redirector FQDN is in ~/Desktop/Tools/README.
+
+      ------------------------------------------------------------
+      MYTHIC    (Web UI https://10.<N>.1.7:7443)
+      ------------------------------------------------------------
+        1. Launch "Mythic Web UI" desktop icon. If the C2 profile
+           list looks empty, hard-refresh the tab (Ctrl+Shift+R) —
+           httpx/http/websocket are always registered server-side.
+        2. Create Payload -> Payload Type: poseidon (Linux/macOS) or
+           apollo (Windows).
+        3. Target OS -> pick one.
+        4. C2 Profiles step: *** CHECK THE httpx BOX *** — this is
+           the step that's easy to skip; an unchecked profile is why
+           a build fails with "must select at least one C2 Profile".
+        5. httpx params are pre-seeded (raw_c2_config + callback_domains
+           point at the AFD redirector). Adjust if needed.
+        6. Pick commands -> set filename -> Build.
+        7. When the build goes green, download the artifact and save
+           it into ~/Desktop/payloads/mythic/.
+
+      ------------------------------------------------------------
+      Connection details + teamserver creds: ~/Desktop/Tools/README
+      ============================================================
+  become: true
+
+# ~/Downloads is the SFTP landing directory for the Kali Guacamole VNC
+# connection (see services.tf — `sftp.directory` resolves to this path).
+# Kali's first-boot XFCE sometimes lazily creates xdg-user-dirs, so we
+# pre-make it to avoid the Guac SFTP sidebar opening with "directory
+# does not exist" on the very first connect.
+- name: Ensure ~/Downloads exists (SFTP landing dir for Guac VNC)
+  ansible.builtin.file:
+    path: "/home/{{ ansible_user }}/Downloads"
+    state: directory
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: "0755"
+  become: true
+
+# --- sliver-client (latest amd64 release binary) ---
+# We use `curl` (via the command module) instead of ansible.builtin.get_url
+# because Kali's urllib3 on the target had a "CustomHTTPSConnection has no
+# attribute cert_file" bug interacting with Ansible's urllib wrapper.
+# curl avoids that whole stack.
+- name: Download sliver-client into Tools/
+  ansible.builtin.command:
+    cmd: >
+      curl -fL --retry 8 --retry-delay 10 -o
+      /home/{{ ansible_user }}/Desktop/Tools/sliver-client
+      https://github.com/BishopFox/sliver/releases/latest/download/sliver-client_linux-amd64
+    creates: "/home/{{ ansible_user }}/Desktop/Tools/sliver-client"
+  become: true
+
+- name: Make sliver-client executable + owned by operator
+  ansible.builtin.file:
+    path: "/home/{{ ansible_user }}/Desktop/Tools/sliver-client"
+    mode: "0755"
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+  become: true
+
+# Pull the operator.cfg off the sliver teamserver so `./sliver-client`
+# Just Works on first launch (no manual SCP). Without this step the
+# client errors out with: "No config files found at
+# /home/<user>/.sliver-client/configs". Multi-tenant TODO: filter
+# groups['sliver'] by matching terra_private_ip.split('.')[1] to
+# pick the right per-student teamserver; for now we take the first
+# sliver host (single-tenant ranges).
+- name: Determine sliver teamserver host for this Kali
+  ansible.builtin.set_fact:
+    sliver_host: "{{ groups['sliver'] | default([]) | first | default('') }}"
+
+# Wait for sliver's SSH to actually be reachable before trying the
+# slurp. Sliver's cloud-init runs 10-15 min on a fresh VM (Go binary
+# download + server-asset unpack + listener registration); the
+# ranger user + operator SSH key land early in that timeline but not
+# always instantly. Without this wait the slurp races cloud-init and
+# silently fails (the `failed_when: false` below swallows it),
+# leaving operator.cfg unwritten and any downstream task that needs
+# it (e.g. sliver_payload's precondition) red-lining every repair
+# until manually re-run. wait_for_connection patiently retries until
+# SSH succeeds. ignore_errors/unreachable so a genuinely-down sliver
+# doesn't abort the rest of the kali role — operator just re-runs
+# `./range repair --add kali` later when sliver is up.
+- name: Wait for sliver SSH to be reachable (up to 10 min)
+  ansible.builtin.wait_for_connection:
+    timeout: 600
+    delay: 0
+    sleep: 5
+  delegate_to: "{{ sliver_host }}"
+  ignore_errors: true
+  ignore_unreachable: true
+  when: sliver_host | length > 0
+
+- name: Slurp operator.cfg from sliver teamserver
+  ansible.builtin.slurp:
+    src: /opt/sliver-cfg/operator.cfg
+  delegate_to: "{{ sliver_host }}"
+  become: true
+  register: sliver_cfg_b64
+  failed_when: false
+  when: sliver_host | length > 0
+
+- name: Ensure ~/.sliver-client/configs exists
+  ansible.builtin.file:
+    path: "/home/{{ ansible_user }}/.sliver-client/configs"
+    state: directory
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: "0700"
+  become: true
+  when:
+    - sliver_cfg_b64 is defined
+    - sliver_cfg_b64.content is defined
+
+- name: Drop operator.cfg into ~/.sliver-client/configs
+  ansible.builtin.copy:
+    content: "{{ sliver_cfg_b64.content | b64decode }}"
+    dest: "/home/{{ ansible_user }}/.sliver-client/configs/operator.cfg"
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: "0600"
+  become: true
+  when:
+    - sliver_cfg_b64 is defined
+    - sliver_cfg_b64.content is defined
+
+# ---- Pre-populate the AdaptixClient Connect-dialog "Profiles" ----
+# AdaptixClient stores its saved connection profiles in a SQLite
+# database at ~/.adaptix/storage-v1.db (Projects table: project TEXT
+# primary key, data TEXT — a JSON blob with host/port/user/password/
+# projectDir). Without this seed the operator has to retype the
+# teamserver URL + credentials every launch. Source proof:
+#   AdaptixC2/AdaptixClient/Source/Client/Storage.cpp lines 8-32
+- name: Determine adaptix teamserver host for this Kali
+  ansible.builtin.set_fact:
+    adaptix_host: "{{ groups['adaptix'] | default([]) | first | default('') }}"
+
+- name: Slurp /opt/adaptix/profile.yaml from teamserver (for operator password)
+  ansible.builtin.slurp:
+    src: /opt/adaptix/profile.yaml
+  delegate_to: "{{ adaptix_host }}"
+  become: true
+  register: adaptix_profile_b64
+  failed_when: false
+  when: adaptix_host | length > 0
+
+- name: Parse adaptix profile.yaml to extract teamserver creds
+  ansible.builtin.set_fact:
+    adaptix_profile_parsed: "{{ adaptix_profile_b64.content | b64decode | from_yaml }}"
+  when:
+    - adaptix_profile_b64 is defined
+    - adaptix_profile_b64.content is defined
+
+- name: Compute adaptix Connect-dialog seed values
+  ansible.builtin.set_fact:
+    # The c2-server.sh cloud-init writes `operators: { <user>: <pw> }`
+    # inside `Teamserver:`. The user is "ranger" in the standard
+    # deploy. Fall back to `Teamserver.password` (the team password)
+    # if a per-user entry is missing.
+    adaptix_seed_user: "ranger"
+    adaptix_seed_password: >-
+      {{ (adaptix_profile_parsed.Teamserver.operators.ranger
+          | default(adaptix_profile_parsed.Teamserver.password | default('')))
+         | string }}
+    adaptix_seed_host: "{{ hostvars[adaptix_host].terra_private_ip | default('10.' ~ terra_student_index ~ '.1.5') }}"
+    adaptix_seed_port: 9000
+    # Project name shows up in the Profiles sidebar; keep it short and
+    # range-flavored. operator can rename in the Connect dialog later.
+    adaptix_seed_project: "cwr"
+  when: adaptix_profile_parsed is defined
+
+- name: Install sqlite3 client (for AdaptixClient DB seeding)
+  ansible.builtin.apt:
+    name: sqlite3
+    state: present
+    lock_timeout: 600
+  become: true
+  when: adaptix_seed_password is defined
+
+- name: Ensure ~/.adaptix exists
+  ansible.builtin.file:
+    path: "/home/{{ ansible_user }}/.adaptix"
+    state: directory
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: "0700"
+  become: true
+  when: adaptix_seed_password is defined
+
+- name: Ensure AdaptixProjects directory exists
+  ansible.builtin.file:
+    path: "/home/{{ ansible_user }}/AdaptixProjects/{{ adaptix_seed_project }}"
+    state: directory
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: "0755"
+  become: true
+  when: adaptix_seed_password is defined
+
+- name: Build seed SQL (one-shot file; sqlite3 ".read"s it)
+  # Build the JSON via python so json.dumps handles all the special-char
+  # escaping; then drop a SQL file the next task `.read`s. INSERT OR
+  # REPLACE makes the task idempotent and a password rotation gets
+  # picked up on re-run.
+  ansible.builtin.shell:
+    cmd: |
+      python3 - <<'PY'
+      import json, os
+      # Adaptix Web API endpoint path — set in c2-server.sh's
+      # /opt/adaptix/profile.yaml as `endpoint: "/endpoint"`. The client
+      # builds the connect URL as <host>:<port><endpoint>, so:
+      #   host="10.1.1.5", port=9000, endpoint="/endpoint"
+      #     →  https://10.1.1.5:9000/endpoint
+      # If endpoint is "" the client's GUI normalizes it to "/" AND
+      # silently defaults port to 443 on first open of the Connect
+      # dialog, producing the broken https://10.1.1.5/ URL. Keep both
+      # in sync with profile.yaml.
+      data = {
+          "host": os.environ["ADAPTIX_HOST"],
+          "port": int(os.environ["ADAPTIX_PORT"]),
+          "endpoint": "/endpoint",
+          "username": os.environ["ADAPTIX_USER"],
+          "password": os.environ["ADAPTIX_PASS"],
+          "projectDir": os.environ["ADAPTIX_PROJDIR"],
+          "subscriptions": [],
+          "consoleMultiuser": False,
+      }
+      data_s = json.dumps(data, separators=(',', ':')).replace("'", "''")
+      proj = os.environ["ADAPTIX_PROJ"].replace("'", "''")
+      with open("/tmp/adaptix-seed.sql", "w") as f:
+          f.write("CREATE TABLE IF NOT EXISTS Projects (project TEXT UNIQUE PRIMARY KEY, data TEXT);\n")
+          f.write(f"INSERT OR REPLACE INTO Projects (project, data) VALUES ('{proj}', '{data_s}');\n")
+      PY
+    executable: /bin/bash
+  environment:
+    ADAPTIX_HOST: "{{ adaptix_seed_host }}"
+    ADAPTIX_PORT: "{{ adaptix_seed_port }}"
+    ADAPTIX_USER: "{{ adaptix_seed_user }}"
+    ADAPTIX_PASS: "{{ adaptix_seed_password }}"
+    ADAPTIX_PROJ: "{{ adaptix_seed_project }}"
+    ADAPTIX_PROJDIR: "/home/{{ ansible_user }}/AdaptixProjects/{{ adaptix_seed_project }}"
+  become: true
+  when: adaptix_seed_password is defined
+
+- name: Apply seed SQL to ~/.adaptix/storage-v1.db
+  ansible.builtin.shell:
+    cmd: |
+      sqlite3 "/home/{{ ansible_user }}/.adaptix/storage-v1.db" ".read /tmp/adaptix-seed.sql"
+    executable: /bin/bash
+  become_user: "{{ ansible_user }}"
+  become: true
+  when: adaptix_seed_password is defined
+  register: adaptix_seed_apply
+  changed_when: true
+
+- name: Clean up the seed SQL temp file (keeps tmp tidy + avoids leaking pw)
+  ansible.builtin.file:
+    path: /tmp/adaptix-seed.sql
+    state: absent
+  become: true
+  when: adaptix_seed_password is defined
+
+# ---- Mythic HTTPS cert trust on Kali (Firefox-trusted launch) ----
+# Mythic's nginx serves https://10.X.1.7:7443 with a self-signed cert
+# (CN=Mythic, issuer=Mythic). Firefox shows a "Potential Security
+# Risk" warning every time the Mythic Web UI launcher fires.
+#
+# Three-pronged fix:
+#   1. Drop the cert into Kali's system CA store (curl/wget/etc trust).
+#   2. Create Firefox enterprise policies.json with ImportEnterpriseRoots
+#      + Certificates.Install — covers fresh Firefox profiles.
+#   3. Import via NSS certutil into any existing profile (covers profiles
+#      created before this role ran).
+- name: Determine Mythic teamserver host
+  ansible.builtin.set_fact:
+    mythic_host: "{{ groups['mythic'] | default([]) | first | default('') }}"
+
+# Wait for Mythic's SSH to be reachable — same pattern as the sliver
+# slurp above. Mythic is the heaviest userdata in the range (Docker
+# pulls + mythic-cli build + listener registration), so its
+# cloud-init can run 20-30 min; the ranger user + key land early
+# but the early-config window can race the slurp on a fresh repair.
+- name: Wait for Mythic SSH to be reachable (up to 10 min)
+  ansible.builtin.wait_for_connection:
+    timeout: 600
+    delay: 0
+    sleep: 5
+  delegate_to: "{{ mythic_host }}"
+  ignore_errors: true
+  ignore_unreachable: true
+  when: mythic_host | length > 0
+
+- name: Slurp Mythic self-signed cert from teamserver
+  ansible.builtin.slurp:
+    src: /opt/mythic/nginx-docker/ssl/mythic-cert.crt
+  delegate_to: "{{ mythic_host }}"
+  become: true
+  register: mythic_cert_b64
+  failed_when: false
+  when: mythic_host | length > 0
+
+- name: Stage Mythic cert into Kali system CA store
+  # /usr/local/share/ca-certificates/*.crt is the documented spot for
+  # local CA roots on Debian/Kali; update-ca-certificates rehashes
+  # /etc/ssl/certs so curl/wget/openssl all pick it up. Even though
+  # Mythic's leaf isn't a CA in the BasicConstraints sense, dropping
+  # it here is what makes Firefox's ImportEnterpriseRoots happy too.
+  ansible.builtin.copy:
+    content: "{{ mythic_cert_b64.content | b64decode }}"
+    dest: /usr/local/share/ca-certificates/cwr-mythic.crt
+    owner: root
+    group: root
+    mode: "0644"
+  become: true
+  when:
+    - mythic_cert_b64 is defined
+    - mythic_cert_b64.content is defined
+  register: mythic_ca_staged
+
+- name: Refresh Kali system CA bundle (update-ca-certificates)
+  ansible.builtin.command:
+    cmd: update-ca-certificates --fresh
+  become: true
+  when: mythic_ca_staged is changed
+  changed_when: true
+
+- name: Install Firefox NSS tools (provides certutil)
+  ansible.builtin.apt:
+    name:
+      - libnss3-tools
+      - ca-certificates
+    state: present
+    lock_timeout: 600
+  become: true
+  when: mythic_cert_b64 is defined and mythic_cert_b64.content is defined
+
+# Firefox enterprise policies path. Kali 2024+ ships `firefox` (not
+# firefox-esr); the policy file location depends on which build is
+# installed. We drop into BOTH so we don't have to detect.
+#
+# UNCONDITIONAL — the policies file does TWO things: cert trust AND
+# lab bookmarks. The cert trust portion is gated INSIDE the content
+# (only included if the mythic cert was actually staged), but the
+# bookmarks must always be written so operators get the navigation
+# regardless of whether mythic is reachable at deploy time.
+- name: Ensure Firefox policy dirs exist (both variants)
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - /etc/firefox/policies
+    - /etc/firefox-esr/policies
+    - /usr/lib/firefox/distribution
+    - /usr/lib/firefox-esr/distribution
+  become: true
+  failed_when: false
+
+# Compute whether the mythic cert was successfully staged on disk.
+# Used as the gate for the `Certificates` policy block below — we
+# don't want to point Firefox at a path that doesn't exist.
+- name: Probe whether mythic cert is on disk
+  ansible.builtin.stat:
+    path: /usr/local/share/ca-certificates/cwr-mythic.crt
+  register: mythic_cert_on_disk
+  become: true
+
+- name: Drop Firefox enterprise policy file (cert trust + lab bookmarks)
+  # `Certificates.Install` accepts a list of cert paths; Firefox loads
+  # them as enterprise roots at startup. Combined with
+  # ImportEnterpriseRoots: true, Firefox also picks up the OS CA bundle
+  # update we did above.
+  #
+  # `ManagedBookmarks` pre-populates the bookmarks toolbar with a "CWR
+  # Lab" folder containing every range service. The operator just
+  # opens Firefox after RDP'ing into Kali and has one-click access to
+  # all the panels — no hunting through the README or typing private
+  # IPs. ManagedBookmarks is system-managed (operator can't delete
+  # them); FirefoxHome.Highlights keeps them visible on the new-tab
+  # page too.
+  #
+  # Layout: each lab URL appears TWICE on the bookmarks toolbar:
+  #   1. inside the "CWR Lab" folder (grouped — easy to find later)
+  #   2. loose at the toolbar's top level (one-click, no folder open
+  #      step needed)
+  # Firefox's ManagedBookmarks schema allows an entry to be either
+  # a folder (`{name, children: [...]}`) or a loose bookmark
+  # (`{name, url}`); listing both shapes at the top level renders
+  # the folder + the loose bookmarks side by side. Duplicate labels
+  # are intentional — operators who train muscle memory on the
+  # toolbar icons get the loose set; operators who hunt visually
+  # for a service get the named folder.
+  # Build the policy object dynamically:
+  #   - `Certificates` block is INCLUDED only if the mythic cert was
+  #     actually staged on disk. Otherwise Firefox would log an error
+  #     about a missing cert path on every startup.
+  #   - `ManagedBookmarks` is ALWAYS included so the navigation is
+  #     present regardless of whether mythic is reachable.
+  ansible.builtin.copy:
+    content: "{{ {'policies':
+      (
+        {'Certificates': {
+          'ImportEnterpriseRoots': True,
+          'Install': ['/usr/local/share/ca-certificates/cwr-mythic.crt']
+        }} if mythic_cert_on_disk.stat.exists else {}
+      ) | combine({
+        'ManagedBookmarks': [
+          {'name': 'CWR Lab',
+           'children': [
+             {'name': 'Mythic — C2 (Apollo/Apfell/Poseidon)',
+              'url': 'https://10.' ~ terra_student_index ~ '.1.7:7443/'},
+             {'name': 'Ghostwriter — Reporting',
+              'url': 'https://10.0.1.4/'},
+             {'name': 'SteppingStones — Activity logging',
+              'url': 'http://10.0.1.5:8000/'},
+             {'name': 'ELK Kibana — Lab telemetry',
+              'url': 'http://10.0.0.10:5601/'},
+             {'name': 'RedELK Kibana — Red-team telemetry',
+              'url': 'http://10.0.1.40:5601/'},
+           ]},
+          {'name': 'Mythic — C2 (Apollo/Apfell/Poseidon)',
+           'url': 'https://10.' ~ terra_student_index ~ '.1.7:7443/'},
+          {'name': 'Ghostwriter — Reporting',
+           'url': 'https://10.0.1.4/'},
+          {'name': 'SteppingStones — Activity logging',
+           'url': 'http://10.0.1.5:8000/'},
+          {'name': 'ELK Kibana — Lab telemetry',
+           'url': 'http://10.0.0.10:5601/'},
+          {'name': 'RedELK Kibana — Red-team telemetry',
+           'url': 'http://10.0.1.40:5601/'},
+        ],
+        'DisplayBookmarksToolbar': 'always',
+        'FirefoxHome': { 'Highlights': True, 'Pocket': False, 'Snippets': False }
+      })
+    } | to_nice_json }}"
+    dest: "{{ item }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - /etc/firefox/policies/policies.json
+    - /etc/firefox-esr/policies/policies.json
+    - /usr/lib/firefox/distribution/policies.json
+    - /usr/lib/firefox-esr/distribution/policies.json
+  become: true
+  failed_when: false
+  # UNCONDITIONAL: bookmarks must always write. The cert block inside
+  # the content is gated on mythic_cert_on_disk.stat.exists above.
+
+- name: Discover existing Firefox profiles for the operator
+  # Glob both .default and .default-release suffixes — Firefox ESR and
+  # vanilla Firefox use different conventions. Empty list = the
+  # operator hasn't launched Firefox yet, which is fine: enterprise
+  # policies kick in on first launch and ImportEnterpriseRoots handles
+  # the cert for them.
+  ansible.builtin.find:
+    paths: "/home/{{ ansible_user }}/.mozilla/firefox"
+    patterns: "*.default*"
+    file_type: directory
+    recurse: false
+  register: ff_profiles
+  failed_when: false
+  become_user: "{{ ansible_user }}"
+  become: true
+  when: mythic_cert_b64 is defined and mythic_cert_b64.content is defined
+
+- name: Import Mythic cert into existing Firefox profile NSS DBs
+  # `-t P,,` flag = trust as Peer (server cert override) for SSL.
+  # This is what "Add Exception" → "Confirm Security Exception" does
+  # interactively in the browser, but persistent. -n is the friendly
+  # name; -d sql: tells certutil to use the modern SQLite NSS format
+  # (Firefox switched to this years ago).
+  ansible.builtin.shell:
+    cmd: |
+      certutil -A -d "sql:{{ item.path }}" -n "CWR Mythic Server" -t "P,," \
+        -i /usr/local/share/ca-certificates/cwr-mythic.crt
+    executable: /bin/bash
+  loop: "{{ ff_profiles.files | default([]) }}"
+  loop_control:
+    label: "{{ item.path | basename }}"
+  become_user: "{{ ansible_user }}"
+  become: true
+  changed_when: true
+  failed_when: false
+  when:
+    - mythic_cert_b64 is defined
+    - mythic_cert_b64.content is defined
+    - ff_profiles.files | default([]) | length > 0
+
+# --- AdaptixClient (Qt6 GUI client; build from source) ---
+# Kali rolling ships CMake 3.31+ and Qt6 dev libs in the
+# kali-linux-default metapackage, so the build works out of the box.
+# (The teamserver VM is Ubuntu/Debian with CMake 3.25, which is why we
+# skip `make all` there. Operators connect from Kali, not the server.)
+- name: Install AdaptixClient build deps
+  # Mirrors AdaptixC2's documented client build deps. Notably:
+  #   - qt6-declarative-dev — pulls in QML / QtQuick which the client
+  #     uses for its session-graph view. Missing this caused
+  #     "Could NOT find Qt6Qml" cmake errors on Kali rolling.
+  #   - libgl1-mesa-dev — required by Qt6 GUI link step.
+  # Earlier revisions of this task listed `libqt6websockets6-dev` and
+  # `libqt6core5compat6-dev` but those package names don't exist in
+  # Kali rolling — websockets is `qt6-websockets-dev`, and Qt5Compat
+  # support is rolled into `qt6-5compat-dev` (added below).
+  ansible.builtin.apt:
+    name:
+      - cmake
+      - qt6-base-dev
+      - qt6-base-private-dev   # AdaptixClient's kddockwidgets bundle
+                                # pulls in QtGui/private/qtx11extras_p.h
+      - qt6-tools-dev
+      - qt6-tools-dev-tools
+      - qt6-websockets-dev
+      - qt6-multimedia-dev
+      - qt6-declarative-dev
+      - qt6-5compat-dev
+      - libgl1-mesa-dev
+      # AdaptixClient links against OpenSSL for its TLS code path
+      # (separate from Qt's own SSL wiring). Without `libssl-dev`
+      # cmake errors with "Could NOT find OpenSSL ... missing
+      # OPENSSL_CRYPTO_LIBRARY OPENSSL_INCLUDE_DIR".
+      - libssl-dev
+      - build-essential
+      - git
+    state: present
+    lock_timeout: 600
+  become: true
+
+- name: Clone AdaptixC2 repo into Tools/
+  ansible.builtin.git:
+    repo: https://github.com/Adaptix-Framework/AdaptixC2.git
+    dest: "/home/{{ ansible_user }}/Desktop/Tools/AdaptixC2"
+    update: false
+    depth: 1
+  become: true
+
+- name: Fix Tools/AdaptixC2 ownership (git clone runs as root)
+  ansible.builtin.file:
+    path: "/home/{{ ansible_user }}/Desktop/Tools/AdaptixC2"
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    recurse: true
+  become: true
+
+- name: Probe AdaptixClient build artefact
+  ansible.builtin.stat:
+    path: "/home/{{ ansible_user }}/Desktop/Tools/AdaptixC2/dist/AdaptixClient"
+  register: adaptix_bin
+
+- name: Build AdaptixClient (best-effort; failure is non-fatal but logged)
+  # Capture FULL output (no tail) so we can read it back in the
+  # diagnostic dump below when the build fails. Earlier this was
+  # `make client 2>&1 | tail -30` which threw away the real error.
+  # Build log lives at Tools/AdaptixC2/build.log on the VM for
+  # post-mortem on operator-side too.
+  #
+  # The client compile is a large Qt6 build (kddockwidgets + the
+  # client itself, ~600 translation units). On a Kali D2s_v5 (2 vCPU)
+  # a cold first build runs ~20 min wall; -j$(nproc) keeps it inside
+  # the async window. Re-runs are incremental and finish in seconds.
+  ansible.builtin.shell:
+    cmd: |
+      cd /home/{{ ansible_user }}/Desktop/Tools/AdaptixC2 && \
+        MAKEFLAGS="-j$(nproc)" make client > build.log 2>&1
+      rc=$?
+      tail -80 build.log
+      exit $rc
+    executable: /bin/bash
+  become_user: "{{ ansible_user }}"
+  become: true
+  register: adaptix_client_build
+  failed_when: false
+  # `rc` is absent on async timeout (ansible reports the whole task
+  # failed before the inner shell exited). Default to 1 so the
+  # subsequent `changed_when` evaluates cleanly and we move on.
+  changed_when: (adaptix_client_build.rc | default(1)) == 0
+  # Bump async to 40 min so the cold build has headroom on slower
+  # student VMs / SIG-baked images that haven't pre-warmed the
+  # ccache. poll: 30 keeps the SSH session alive between checks.
+  async: 2400
+  poll: 30
+  # Guard against the probe task itself being skipped / unreachable —
+  # in those cases `adaptix_bin` is a dict without a `.stat` attribute
+  # and a raw `adaptix_bin.stat.exists` raises AttributeError. Treat
+  # "no probe result" as "binary doesn't exist" so we still attempt the
+  # build (idempotent: re-running won't recompile if dist/AdaptixClient
+  # already exists).
+  when: not (adaptix_bin.stat.exists | default(false))
+
+- name: Surface AdaptixClient build log when the build failed
+  ansible.builtin.debug:
+    msg: "{{ ['---- AdaptixClient build FAILED (rc=' ~ adaptix_client_build.rc ~ ') ----'] +
+             (adaptix_client_build.stdout_lines | default([])) +
+             (adaptix_client_build.stderr_lines | default([])) +
+             ['(full log on VM: /home/' ~ ansible_user ~ '/Desktop/Tools/AdaptixC2/build.log)'] }}"
+  when:
+    - adaptix_client_build is defined
+    - adaptix_client_build.rc is defined
+    - adaptix_client_build.rc != 0
+
+- name: Re-probe AdaptixClient binary after build
+  ansible.builtin.stat:
+    path: "/home/{{ ansible_user }}/Desktop/Tools/AdaptixC2/dist/AdaptixClient"
+  register: adaptix_bin_after
+
+- name: Symlink AdaptixClient to Tools/ root for easier access
+  ansible.builtin.file:
+    src: "/home/{{ ansible_user }}/Desktop/Tools/AdaptixC2/dist/AdaptixClient"
+    dest: "/home/{{ ansible_user }}/Desktop/Tools/adaptix-client"
+    state: link
+    force: true
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+  become: true
+  # Same guard as adaptix_bin above: if the probe was skipped/unreachable,
+  # the register dict has no `.stat` attribute and a raw lookup raises.
+  when: (adaptix_bin_after.stat.exists | default(false))
+
+# --- README + Mythic URL shortcut ---
+- name: Write Tools/README.txt with connection info
+  ansible.builtin.copy:
+    dest: "/home/{{ ansible_user }}/Desktop/Tools/README.txt"
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: "0644"
+    content: |
+      Operator quick-reference
+      =======================
+
+      Mythic web UI:
+          https://10.{{ terra_student_index | default(1) }}.1.7:7443
+          (Note: it's HTTPS, self-signed. Firefox will warn — accept the risk.
+           HTTP returns "400 The plain HTTP request was sent to HTTPS port".)
+
+      Adaptix client (GUI):
+          ./adaptix-client    (or AdaptixC2/dist/AdaptixClient)
+          Connect to:
+            host: 10.{{ terra_student_index | default(1) }}.1.5
+            port: 9000
+            username: ranger
+            password: see ~/labs/<range_name>/credentials.txt on operator's machine
+                       (or `cat /opt/adaptix/profile.yaml | grep password` on the teamserver)
+
+      Sliver client (CLI):
+          ./sliver-client                       # opens interactive shell
+          The operator config is auto-imported by Ansible into
+          ~/.sliver-client/configs/operator.cfg, so the client connects
+          straight to the teamserver at 10.{{ terra_student_index | default(1) }}.1.11:31337 on launch.
+          (If you want a second named login for audit-trail purposes,
+          SCP /opt/sliver-cfg/ian.cfg off the teamserver and
+          `./sliver-client import ian.cfg`.)
+
+      BRC4 client:
+          Use the Windows-only Brute Ratel client (download from Dark Vortex).
+          BRC4 teamserver: 10.{{ terra_student_index | default(1) }}.1.9:9000
+          BRC4 password: see credentials.txt on operator's machine.
+
+      Network notes:
+        - This Kali sits in the attacker subnet (10.X.1.0/24).
+        - It can reach every other VM in this range via intra-vnet NSG rule.
+        - Operator -> Kali is RDP through Guacamole (no direct RDP from internet).
+
+- name: Create XFCE desktop launcher for Mythic web UI
+  ansible.builtin.copy:
+    dest: "/home/{{ ansible_user }}/Desktop/Tools/Mythic Web UI.desktop"
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: "0755"
+    content: |
+      [Desktop Entry]
+      Version=1.0
+      Type=Application
+      Name=Mythic Web UI
+      Comment=Open Mythic operator web interface (https://10.{{ terra_student_index | default(1) }}.1.7:7443)
+      Exec=firefox https://10.{{ terra_student_index | default(1) }}.1.7:7443
+      Icon=firefox
+      Terminal=false
+      Categories=Network;Security;
+
+# ---- Sliver C2 client launchers ------------------------------------------
+# Goal: operator RDPs into Kali via Guacamole, and a Sliver C2 console is
+# already at the `[server] sliver >` prompt without them having to open a
+# terminal + chdir + ./sliver-client. The operator.cfg dropped earlier
+# (~/.sliver-client/configs/operator.cfg) means `sliver-client` connects
+# automatically — we just need a window running it.
+#
+# Two complementary entries:
+#   1. ~/Desktop/Tools/Sliver C2.desktop   — clickable icon for relaunch.
+#   2. ~/.config/autostart/cwr-sliver.desktop — XFCE Autostart, fires
+#      once per session when the XFCE session manager replays the
+#      autostart dir. RDP-via-xrdp triggers a fresh session each login,
+#      so the operator gets a Sliver terminal automatically.
+#
+# Both invoke `xfce4-terminal --command 'bash -c "...; exec bash"'` so
+# the terminal stays open if sliver-client exits (operator sees any
+# error message + drops to a shell rather than a window flashing closed).
+
+- name: Create XFCE desktop launcher for Sliver C2 client
+  ansible.builtin.copy:
+    dest: "/home/{{ ansible_user }}/Desktop/Tools/Sliver C2.desktop"
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: "0755"
+    content: |
+      [Desktop Entry]
+      Version=1.0
+      Type=Application
+      Name=Sliver C2
+      Comment=Launch Sliver operator console (auto-loads ~/.sliver-client/configs/operator.cfg)
+      Exec=xfce4-terminal --title=Sliver-C2 --command="bash -c 'cd ~/Desktop/Tools && ./sliver-client; echo; echo [sliver-client exited — Ctrl-D or close to dismiss]; exec bash'"
+      Icon=utilities-terminal
+      Terminal=false
+      Categories=Network;Security;
+
+- name: Ensure ~/.config/autostart exists
+  ansible.builtin.file:
+    path: "/home/{{ ansible_user }}/.config/autostart"
+    state: directory
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: "0755"
+
+- name: Autostart Sliver C2 client on XFCE session login
+  ansible.builtin.copy:
+    dest: "/home/{{ ansible_user }}/.config/autostart/cwr-sliver.desktop"
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: "0644"
+    content: |
+      [Desktop Entry]
+      Version=1.0
+      Type=Application
+      Name=Sliver C2 (autostart)
+      Comment=Open a Sliver operator console at session start
+      Exec=xfce4-terminal --title=Sliver-C2 --command="bash -c 'cd ~/Desktop/Tools && ./sliver-client; echo; echo [sliver-client exited — Ctrl-D or close to dismiss]; exec bash'"
+      X-GNOME-Autostart-enabled=true
+      Hidden=false
+      NoDisplay=false
+      OnlyShowIn=XFCE;
+      # 5s delay lets xrdp finish drawing the desktop + the panel/dock
+      # come up before our terminal pops, so the operator doesn't see
+      # a flicker / focus-fight on first login.
+      X-GNOME-Autostart-Delay=5
+
+# ---- Adaptix C2 client launcher ----
+# AdaptixClient is a Qt GUI built earlier from source; the binary lives
+# at ~/Desktop/Tools/AdaptixC2/dist/AdaptixClient, symlinked to
+# ~/Desktop/Tools/adaptix-client. Drop a .desktop alongside the Sliver
+# one so double-click works just like Mythic Web UI.
+
+# Pre-launch wrapper that re-seeds the `cwr` row in storage-v1.db with
+# canonical values every time the operator launches the client.
+#
+# Why we need it: AdaptixClient's Qt GUI serializes the port field as
+# a string on save (so port=9000 becomes "9000"), and after the user
+# edits the URL field at all it sometimes reverts port to 443 (the
+# default HTTPS port → URL builder hides it from the display, so the
+# operator sees "https://10.1.1.5/endpoint" and the connect fails
+# silently). The kali ansible role's earlier seed task in this file
+# only fires on `./range repair`; this wrapper makes the seed
+# IDEMPOTENT on every double-click of the desktop launcher.
+- name: Install adaptix-client pre-launch wrapper
+  ansible.builtin.copy:
+    dest: "/home/{{ ansible_user }}/.local/bin/adaptix-client-launch"
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: "0755"
+    content: |
+      #!/usr/bin/env bash
+      # Adaptix client launcher wrapper. Re-seeds the cwr profile in
+      # storage-v1.db before exec'ing the real client, so a previous
+      # corruption (port serialized as string, port reverted to 443,
+      # missing endpoint) doesn't survive into the next session.
+
+      DB="$HOME/.adaptix/storage-v1.db"
+      mkdir -p "$(dirname "$DB")"
+
+      python3 - "$DB" <<'PY'
+      import json, sqlite3, sys
+      db = sys.argv[1]
+      con = sqlite3.connect(db)
+      con.execute("CREATE TABLE IF NOT EXISTS Projects "
+                  "(project TEXT UNIQUE PRIMARY KEY, data TEXT)")
+      data = {
+          "host":             "{{ adaptix_seed_host | default('10.1.1.5') }}",
+          # Stored as int. Qt may re-save as string on first GUI
+          # interaction; that's fine for next-time reads. What we
+          # MUST avoid is the row drifting to port=443 / endpoint="/"
+          # which is the silent failure mode.
+          "port":             {{ adaptix_seed_port | default(9000) }},
+          "endpoint":         "/endpoint",
+          "username":         "{{ adaptix_seed_user | default('ranger') }}",
+          "password":         "{{ adaptix_seed_password | default('') }}",
+          "projectDir":       "/home/{{ ansible_user }}/AdaptixProjects/{{ adaptix_seed_project | default('cwr') }}",
+          "subscriptions":    [],
+          "consoleMultiuser": False,
+      }
+      con.execute("DELETE FROM Projects WHERE project = ?",
+                  ("{{ adaptix_seed_project | default('cwr') }}",))
+      con.execute("INSERT INTO Projects (project, data) VALUES (?, ?)",
+                  ("{{ adaptix_seed_project | default('cwr') }}",
+                   json.dumps(data, separators=(",", ":"))))
+      con.commit()
+      PY
+
+      # Now exec the real client. The right-pane profile list will show
+      # exactly one entry ("cwr") with correct host:port/endpoint.
+      exec /home/{{ ansible_user }}/Desktop/Tools/adaptix-client "$@"
+  become: true
+  when: adaptix_seed_password is defined
+
+- name: Create XFCE desktop launcher for Adaptix C2 client
+  ansible.builtin.copy:
+    dest: "/home/{{ ansible_user }}/Desktop/Tools/Adaptix C2.desktop"
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: "0755"
+    content: |
+      [Desktop Entry]
+      Version=1.0
+      Type=Application
+      Name=Adaptix C2
+      Comment=Launch AdaptixClient (pre-seeds cwr profile every launch)
+      Exec=/home/{{ ansible_user }}/.local/bin/adaptix-client-launch
+      Path=/home/{{ ansible_user }}/Desktop/Tools
+      Icon=utilities-terminal
+      Terminal=false
+      Categories=Network;Security;
+
+# ---- Auto-trust XFCE .desktop launchers ----
+# XFCE 4.18+ added a "Allow this file to run as a program" prompt on
+# double-clicking any .desktop file unless the file is marked TRUSTED.
+# `chmod +x` alone no longer bypasses this — the trust flag is stored
+# as GIO metadata at ~/.local/share/gvfs-metadata/, written by
+# `gio set <file> metadata::trusted true`. That call needs the user's
+# DBUS session, so we can't do it from ansible-as-ranger-over-SSH
+# (no session there). Instead: drop a tiny autostart that runs once
+# per session and marks every .desktop in Desktop/ and Desktop/Tools/
+# as trusted. First login after deploy: trust gets set in metadata; any
+# subsequent double-click goes through without the prompt. The
+# X-GNOME-Autostart-Delay=0 (no delay) ensures this runs before the
+# user can race-click an untrusted launcher.
+- name: Autostart — trust all CWR .desktop launchers on session start
+  ansible.builtin.copy:
+    dest: "/home/{{ ansible_user }}/.config/autostart/cwr-trust-launchers.desktop"
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: "0644"
+    content: |
+      [Desktop Entry]
+      Version=1.0
+      Type=Application
+      Name=CWR — trust desktop launchers
+      Comment=Marks ~/Desktop and ~/Desktop/Tools .desktop files as trusted (silences XFCE 4.18+ launcher prompt)
+      # Set BOTH metadata flags: GNOME/Nautilus uses `trusted`, XFCE/
+      # Thunar uses `xfce-trusted` (and sometimes the legacy
+      # `xfce4-trusted`). Setting all three covers Thunar and any
+      # secondary file manager the operator might launch. Also chmod
+      # +x in case some prior step stripped the bit — XFCE also
+      # requires the executable bit set, separately from the metadata.
+      Exec=bash -lc 'for f in $HOME/Desktop/*.desktop $HOME/Desktop/Tools/*.desktop; do [ -f "$f" ] || continue; chmod +x "$f"; for k in trusted xfce-trusted xfce4-trusted; do gio set "$f" "metadata::$k" true 2>/dev/null; done; done; true'
+      X-GNOME-Autostart-enabled=true
+      Hidden=false
+      NoDisplay=true
+      OnlyShowIn=XFCE;
+      X-GNOME-Autostart-Delay=0
+
+# ---------- Diagnostics ----------
+- name: Always emit Kali diagnostics
+  block:
+    - name: Diagnostic marker
+      ansible.builtin.debug:
+        msg: "Emitting Kali diagnostic dump"
+      changed_when: false
+  always:
+    - name: Snapshot xrdp service state
+      ansible.builtin.command: systemctl is-active xrdp
+      register: xrdp_state
+      changed_when: false
+      failed_when: false
+      become: true
+    - name: Snapshot installed kali metapackages
+      ansible.builtin.shell:
+        cmd: "dpkg -l 'kali-linux-*' 'kali-desktop-*' 2>/dev/null | awk '/^ii/ {print $2, $3}'"
+      register: kali_pkgs
+      changed_when: false
+      failed_when: false
+      become: true
+    - name: Report — Kali state
+      ansible.builtin.debug:
+        msg: "{{ ['---- kali xrdp + packages ----',
+                  'xrdp.service: ' ~ (xrdp_state.stdout | default('unknown'))] +
+                 (kali_pkgs.stdout_lines | default(['(no kali metapackages installed)'])) }}"

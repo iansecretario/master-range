@@ -1,0 +1,895 @@
+---
+# =============================================================================
+# mythic_payload — generate Mythic payloads via REST API and save to
+# ~/Desktop/payloads/mythic on the target Kali host.
+# =============================================================================
+# Runs after the existing `mythic` role has finished bringing the
+# teamserver + httpx C2 profile online, and after the `kali` role has
+# finished setting up ~/Desktop/payloads/mythic.
+
+# ---------- Phase 0: skip cleanly on scenarios without Mythic ----------
+- name: Skip — no Mythic teamserver in this range
+  ansible.builtin.debug:
+    msg: >-
+      No Mythic teamserver in this range (groups['mythic'] is empty);
+      skipping payload generation.
+  when: (groups['mythic'] | default([]) | length) == 0
+
+- name: End play for this host when Mythic is absent
+  ansible.builtin.meta: end_host
+  when: (groups['mythic'] | default([]) | length) == 0
+
+# ---------- Phase 1: pick this Kali's Mythic teamserver ----------
+- name: Pick teamserver hostname (match by terra_student_id, else first)
+  ansible.builtin.set_fact:
+    mythic_teamserver_name: >-
+      {%- set sid = terra_student_id | default('') -%}
+      {%- set matches = [] -%}
+      {%- for h in groups['mythic'] -%}
+      {%- if (hostvars[h].terra_student_id | default('')) == sid -%}
+      {%- set _ = matches.append(h) -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {{ (matches | first) | default(groups['mythic'] | first, true) }}
+
+- name: Resolve teamserver private IP
+  ansible.builtin.set_fact:
+    mythic_teamserver_host: "{{ hostvars[mythic_teamserver_name].terra_private_ip }}"
+
+- name: Build base URL
+  ansible.builtin.set_fact:
+    mythic_url: "https://{{ mythic_teamserver_host }}:{{ mythic_payload_server_port }}"
+
+# ---------- Phase 2: read admin creds from /opt/mythic/.env ----------
+# c2-mythic.sh seeds /opt/mythic-env (sidecar) but the AUTHORITATIVE
+# values that mythic-cli + the Mythic server actually use live in
+# /opt/mythic/.env. mythic-cli auto-generates / rotates the password
+# into that file on first run, so the seed sidecar can be stale.
+# Reading /opt/mythic/.env matches what the mythic role does
+# (modules/azure/ansible/roles/mythic/tasks/main.yml:589-603). Slurp
+# via delegate_to since this role runs on Kali, not the teamserver.
+- name: Slurp /opt/mythic/.env from Mythic teamserver
+  ansible.builtin.slurp:
+    src: /opt/mythic/.env
+  delegate_to: "{{ mythic_teamserver_name }}"
+  become: true
+  register: mythic_env_b64
+  no_log: true
+
+- name: Parse admin user + password from /opt/mythic/.env
+  ansible.builtin.set_fact:
+    # Lines look like:  MYTHIC_ADMIN_USER=mythic_admin
+    # or quoted:        MYTHIC_ADMIN_PASSWORD="abc!@#xyz"
+    # regex_search matches the value inside optional double-quotes and
+    # captures everything up to a quote / newline. multiline mode lets
+    # ^MYTHIC_ADMIN_USER= match each .env line, not just the file head.
+    mythic_admin_user: >-
+      {{ (mythic_env_b64.content | b64decode)
+         | regex_search('^MYTHIC_ADMIN_USER="?([^"\n]+)"?', '\1', multiline=True)
+         | first
+         | default('mythic_admin')
+         | trim }}
+    mythic_admin_password: >-
+      {{ (mythic_env_b64.content | b64decode)
+         | regex_search('^MYTHIC_ADMIN_PASSWORD="?([^"\n]+)"?', '\1', multiline=True)
+         | first
+         | default('')
+         | trim }}
+  no_log: true
+
+- name: Fail fast if admin password is missing
+  ansible.builtin.fail:
+    msg: >-
+      Could not extract MYTHIC_ADMIN_PASSWORD from
+      {{ mythic_teamserver_name }}:/opt/mythic/.env. Check the file.
+  when: (mythic_admin_password | default('')) == ''
+
+# ---- Hasura admin secret (for GraphQL polling) ----
+# Mythic 3.x moved most REST endpoints to GraphQL via Hasura. The
+# /api/v1.4/createpayload_webhook endpoint still works for kicking off
+# a build, but POLLING build status requires GraphQL against the
+# `payload` table. Hasura accepts either JWT or X-Hasura-Admin-Secret
+# auth; admin-secret is simpler than threading Mythic's JWT through
+# Hasura's claims namespace, so we grab it from the mythic_graphql
+# container's env (same trick the mythic role uses at line 533).
+- name: Extract HASURA_GRAPHQL_ADMIN_SECRET from mythic_graphql container
+  ansible.builtin.shell:
+    cmd: |
+      docker exec mythic_graphql env 2>/dev/null \
+        | grep ^HASURA_GRAPHQL_ADMIN_SECRET= | cut -d= -f2
+  delegate_to: "{{ mythic_teamserver_name }}"
+  become: true
+  register: mythic_hasura_secret_raw
+  changed_when: false
+  no_log: true
+
+- name: Set Hasura admin secret fact
+  ansible.builtin.set_fact:
+    mythic_hasura_secret: "{{ mythic_hasura_secret_raw.stdout | trim }}"
+  no_log: true
+
+- name: Fail fast if Hasura admin secret is missing
+  ansible.builtin.fail:
+    msg: >-
+      Could not extract HASURA_GRAPHQL_ADMIN_SECRET from the
+      mythic_graphql container on {{ mythic_teamserver_name }}. Is
+      Mythic actually running? Check `docker ps` on the teamserver.
+  when: (mythic_hasura_secret | default('')) == ''
+
+# ---------- Phase 3: ensure base + per-run output dirs ----------
+# Each invocation drops binaries into a NEW timestamped subdirectory
+# under the base output dir, e.g.
+#   ~/Desktop/payloads/mythic/20260515T045824Z/
+# A `latest` symlink at the base points at the freshest run.
+- name: Compute UTC build timestamp
+  ansible.builtin.set_fact:
+    mythic_payload_build_timestamp: "{{ lookup('pipe', 'date -u +%Y%m%dT%H%M%SZ') }}"
+
+- name: Compute per-run output directory
+  ansible.builtin.set_fact:
+    mythic_payload_run_dir: "{{ mythic_payload_output_dir }}/{{ mythic_payload_build_timestamp }}"
+
+- name: Ensure base + per-run output directories exist
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: "0755"
+  loop:
+    - "{{ mythic_payload_output_dir }}"
+    - "{{ mythic_payload_run_dir }}"
+  become: true
+
+- name: Ensure python3-requests + python3-urllib3 are installed
+  ansible.builtin.apt:
+    name:
+      - python3-requests
+      - python3-urllib3
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+    lock_timeout: 600
+  become: true
+
+# ---------- Phase 4: single Python build script ----------
+# Login retry → loop matrix×vias → POST /api/v1.4/payloads/create →
+# poll status → download → atomic write.
+#
+# Verbose by design: every phase (create / poll / download / write)
+# logs the URL, status code, response body excerpt, and decision. This
+# is the diff between "it failed" and "it failed because Mythic's
+# /api/v1.4/payloads/create returned a 422 because the apollo container
+# isn't started yet".
+- name: Build all matrix payloads in one process
+  ansible.builtin.shell:
+    cmd: |
+      python3 - <<'PY'
+      import base64, json, os, sys, tempfile, time, traceback
+      import urllib3, requests
+      urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+      BASE          = os.environ["MYTHIC_URL"]
+      USER          = os.environ["MYTHIC_USER"]
+      PASS          = os.environ["MYTHIC_PASS"]
+      OUT_DIR       = os.environ["MYTHIC_OUT_DIR"]
+      OUT_MODE      = int(os.environ["MYTHIC_OUT_MODE"], 8)
+      MATRIX        = json.loads(os.environ["MYTHIC_MATRIX"])
+      VIAS          = json.loads(os.environ["MYTHIC_VIAS"])
+      EXT_MAP       = json.loads(os.environ["MYTHIC_EXT_MAP"])
+      C2_PROFILE    = os.environ["MYTHIC_C2_PROFILE"]
+      LOGIN_RETRY   = int(os.environ["MYTHIC_LOGIN_RETRIES"])
+      LOGIN_DELAY   = int(os.environ["MYTHIC_LOGIN_DELAY"])
+      POLL_DELAY    = int(os.environ["MYTHIC_POLL_DELAY"])
+      POLL_MAX      = int(os.environ["MYTHIC_POLL_MAX"])
+      TS_HOST       = os.environ["MYTHIC_TS_HOST"]
+      BUILD_RETRY   = int(os.environ["MYTHIC_BUILD_RETRIES"])
+      BUILD_RDELAY  = int(os.environ["MYTHIC_BUILD_RETRY_DELAY"])
+      CREATE_TO     = int(os.environ["MYTHIC_CREATE_TIMEOUT"])
+      DOWNLOAD_TO   = int(os.environ["MYTHIC_DOWNLOAD_TIMEOUT"])
+      HASURA_SECRET = os.environ["MYTHIC_HASURA_SECRET"]
+
+      # Substrings in error bodies that mean "don't retry". These are
+      # config-class failures — the same request will fail the same way
+      # on every retry, so log loud, skip fast, save the operator time.
+      NON_RETRYABLE_SUBSTRINGS = (
+          "unknown payload_type",
+          "payload_type not found",
+          "failed to find payload type",
+          "c2_profile not found",
+          "unknown c2_profile",
+          "invalid build parameter",
+          "unsupported os",
+          "unsupported arch",
+          "build_phase: error",
+      )
+
+      def log(*a):
+          print(*a, flush=True)
+
+      def short(s, n=600):
+          """Trim long strings for log readability. 600 chars covers full
+          Mythic error bodies, which typically include stack traces."""
+          if s is None: return ""
+          s = str(s)
+          return s if len(s) <= n else s[:n] + "...[truncated %d]" % (len(s) - n)
+
+      def is_non_retryable(blob):
+          bl = (blob or "").lower()
+          return any(s in bl for s in NON_RETRYABLE_SUBSTRINGS)
+
+      session = requests.Session()
+      session.verify = False
+
+      # ---- /auth with retry ----
+      # Mythic's /auth endpoint returns { access_token, refresh_token,
+      # user }. Token is sent as Authorization: Bearer <token>.
+      log("[*] authenticating to %s as user=%s" % (BASE, USER))
+      access_token = ""
+      last_err = None
+      for attempt in range(1, LOGIN_RETRY + 1):
+          try:
+              # NOTE: scripting_version MUST be a JSON string, not an
+              # int. Mythic's LoginInput struct types it as string (see
+              # mythic/src/rest/auth.go), so sending an int returns
+              # HTTP 400 "cannot unmarshal JSON number into
+              # LoginInput.scripting_version of Go type string".
+              r = session.post(BASE + "/auth",
+                               json={"username": USER, "password": PASS,
+                                     "scripting_version": "7"},
+                               timeout=15)
+              if r.status_code == 200:
+                  j = r.json() or {}
+                  access_token = j.get("access_token", "")
+                  if access_token:
+                      if attempt > 1:
+                          log("[+] /auth succeeded on attempt %d" % attempt)
+                      break
+                  last_err = "no access_token in response body=%s" % short(r.text)
+                  log("[!] /auth attempt %d/%d: %s" % (attempt, LOGIN_RETRY, last_err))
+              else:
+                  last_err = "HTTP %d: %s" % (r.status_code, short(r.text))
+                  log("[!] /auth attempt %d/%d: %s" % (attempt, LOGIN_RETRY, last_err))
+          except (requests.exceptions.ConnectionError,
+                  requests.exceptions.Timeout) as e:
+              last_err = type(e).__name__ + ": " + short(str(e), 200)
+              log("[!] /auth attempt %d/%d: %s" % (attempt, LOGIN_RETRY, last_err))
+          time.sleep(LOGIN_DELAY)
+      if not access_token:
+          sys.exit("Mythic /auth failed after %d retries: %s"
+                   % (LOGIN_RETRY, last_err))
+      H = {"Authorization": "Bearer " + access_token,
+           "Content-Type":  "application/json"}
+      log("[+] logged in to %s" % BASE)
+
+      # ---- Preflight: query installed payload-types + c2-profiles ----
+      # Hits Hasura GraphQL and returns the set of payloadtype.name and
+      # c2profile.name rows that the teamserver actually has installed.
+      # We then filter the matrix to only-installed agents (so e.g.
+      # athena auto-skips when it isn't installed) and fail loud if the
+      # configured c2_profile isn't present.
+      # GQL_HDRS carries BOTH the Hasura admin secret AND the operator's
+      # JWT. Hasura uses the admin secret to bypass row-level auth (so we
+      # can query any payload row); the JWT is forwarded to action
+      # webhooks (like createFile) that need to attribute the action to
+      # a real Mythic user. Sending only the admin secret makes Hasura
+      # set X-Hasura-Role=admin but leaves user_id unset, which breaks
+      # actions that look up the calling user.
+      GQL_URL  = BASE + "/graphql/"
+      GQL_HDRS = {"X-Hasura-Admin-Secret": HASURA_SECRET,
+                  "Authorization":         "Bearer " + access_token,
+                  "Content-Type":          "application/json"}
+
+      def gql(query, variables=None):
+          r = session.post(GQL_URL, headers=GQL_HDRS,
+                           json={"query": query,
+                                 "variables": variables or {}},
+                           timeout=15)
+          r.raise_for_status()
+          j = r.json() or {}
+          if "errors" in j:
+              raise RuntimeError("GraphQL errors: %s" % short(json.dumps(j["errors"])))
+          return (j.get("data") or {})
+
+      log("[*] preflight: querying installed payload types + c2 profiles")
+      try:
+          pre = gql(
+              "query InstalledTypes {\n"
+              "  payloadtype { name deleted container_running }\n"
+              "  c2profile   { name deleted container_running }\n"
+              "}"
+          )
+      except Exception as e:
+          sys.exit("preflight GraphQL failed: %s: %s"
+                   % (type(e).__name__, short(str(e), 300)))
+      # `deleted=true` rows are payload-types/c2-profiles that were once
+      # installed and then removed; we ignore them. `container_running`
+      # tells us whether the build container is up; a payload-type that
+      # exists but whose container is down will accept the create call
+      # and then the build will silently hang — surfacing this in
+      # preflight saves a full POLL_MAX timeout per cell.
+      installed_pts = {row["name"] for row in (pre.get("payloadtype") or [])
+                       if not row.get("deleted")}
+      installed_c2  = {row["name"] for row in (pre.get("c2profile") or [])
+                       if not row.get("deleted")}
+      down_pts = {row["name"] for row in (pre.get("payloadtype") or [])
+                  if not row.get("deleted")
+                  and not row.get("container_running")}
+      down_c2  = {row["name"] for row in (pre.get("c2profile") or [])
+                  if not row.get("deleted")
+                  and not row.get("container_running")}
+      log("[+] installed payload_types: %s" % sorted(installed_pts))
+      log("[+] installed c2_profiles:   %s" % sorted(installed_c2))
+      if down_pts:
+          log("[!] WARNING: these payload-type containers are NOT running: %s"
+              % sorted(down_pts))
+          log("    builds against them will likely hang. Start them with:")
+          log("      sudo /opt/mythic/mythic-cli payload start <name>")
+      if down_c2:
+          log("[!] WARNING: these c2-profile containers are NOT running: %s"
+              % sorted(down_c2))
+          log("    builds will fail or hang. Start them with:")
+          log("      sudo /opt/mythic/mythic-cli c2 start <name>")
+      if C2_PROFILE not in installed_c2:
+          sys.exit("c2_profile %r is not installed on this teamserver "
+                   "(have: %s). Install it with mythic-cli install "
+                   "github MythicC2Profiles/%s, or change "
+                   "mythic_payload_c2_profile."
+                   % (C2_PROFILE, sorted(installed_c2), C2_PROFILE))
+
+      # Log the parameter inventory for the chosen c2_profile so any
+      # later "unknown parameter" / "missing required parameter" build
+      # failure is easy to diagnose against the actual schema.
+      try:
+          c2p = gql(
+              "query C2Params($name: String!) {\n"
+              "  c2profileparameters(where: {c2profile: {name: {_eq: $name}}}) {\n"
+              "    name parameter_type required default_value\n"
+              "  }\n}",
+              {"name": C2_PROFILE},
+          )
+          params = c2p.get("c2profileparameters") or []
+          log("[+] %s exposes %d parameter(s):" % (C2_PROFILE, len(params)))
+          for prm in params:
+              dv = prm.get("default_value") or ""
+              log("      %-22s type=%-10s required=%-5s default=%s"
+                  % (prm.get("name"),
+                     prm.get("parameter_type"),
+                     prm.get("required"),
+                     short(dv, 80)))
+      except Exception as e:
+          log("[~] could not enumerate %s parameters (non-fatal): %s: %s"
+              % (C2_PROFILE, type(e).__name__, short(str(e), 200)))
+
+      # ---- Upload raw_c2_config as a file (httpx requires File type) ----
+      # httpx's `raw_c2_config` parameter is type=File, not String. The
+      # value we pass MUST be an agent_file_id (UUID); Mythic appends it
+      # to /direct/download/<uuid> during the Config Check step to fetch
+      # the TOML and bake it into the implant. Passing TOML content
+      # directly (as the first version of this role did) made Mythic
+      # try to GET /direct/download/[[instances]]\nport=8443... which
+      # fails with "invalid control character in URL".
+      #
+      # We upload one TOML file at script start and reuse the same UUID
+      # for all matrix cells. Per-via differences (which port the agent
+      # calls back to) live in `callback_domains`, NOT in this file.
+      def build_listener_toml():
+          """Build an httpx agent-variation TOML.
+
+          The httpx `raw_c2_config` parameter is NOT a list of listener
+          instances (that's the OLD/upstream-misnamed format). It is a
+          single "agent variation" defining the HTTP message shape the
+          agent will use: GET + POST URIs, headers, and the transform
+          pipeline that wraps each message body.
+
+          The build server rejects anything lacking a top-level `name`
+          field with the error "Missing name for agent variation". Other
+          required keys at minimum are [get] and [post] sections with
+          a `client.message` location + transform list.
+
+          This format matches what the existing `mythic` role writes
+          for the httpx profile default at roles/mythic/tasks/main.yml
+          (lines 262-290), and is the same shape that ships in the
+          upstream MythicC2Profiles/httpx HTTP-DEFAULT example.
+          """
+          return (
+              'name = "default"\n'
+              '\n'
+              '[get]\n'
+              'verb = "GET"\n'
+              'uris = ["/api/auth/session"]\n'
+              '[get.client.headers]\n'
+              '"User-Agent" = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+              'AppleWebKit/537.36 (KHTML, like Gecko) '
+              'Chrome/120.0.0.0 Safari/537.36"\n'
+              '[get.client.message]\n'
+              'location = "query"\n'
+              'name = "q"\n'
+              '[[get.client.transforms]]\n'
+              'action = "base64url"\n'
+              '[get.server.headers]\n'
+              '"Server" = "Server"\n'
+              '\n'
+              '[post]\n'
+              'verb = "POST"\n'
+              'uris = ["/api/auth/token"]\n'
+              '[post.client.headers]\n'
+              '"User-Agent" = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+              'AppleWebKit/537.36 (KHTML, like Gecko) '
+              'Chrome/120.0.0.0 Safari/537.36"\n'
+              '[post.client.message]\n'
+              'location = "body"\n'
+              '[[post.client.transforms]]\n'
+              'action = "base64url"\n'
+              '[post.server.headers]\n'
+              '"Keep-Alive" = "true"\n'
+          )
+
+      def upload_raw_c2_config_file():
+          """POST raw_c2_config TOML as multipart/form-data, return UUID.
+
+          Endpoint + body shape are from the official Mythic_Scripting
+          PyPi package (mythic.register_file at mythic/mythic.py:1621):
+              POST /api/v1.4/task_upload_file_webhook
+              Content-Type: multipart/form-data
+              Form field: file = <bytes> (filename in Content-Disposition)
+              Response: {"status":"success", "agent_file_id":"<uuid>"}
+
+          File uploads are explicitly NOT routed through Hasura GraphQL
+          in Mythic 3.x (see docs.mythic-c2.net/scripting: "Most actions
+          go through the GraphQL interface (except for file transfers)").
+          Earlier attempts at `createFile` mutations + JSON-body REST
+          webhooks all 404'd; this endpoint is the only one that works.
+          """
+          toml_content = build_listener_toml()
+          filename = "terra_range_raw_c2_config.toml"
+          url = BASE + "/api/v1.4/task_upload_file_webhook"
+          log("[*] uploading raw_c2_config (%d bytes, agent-variation) via"
+              " multipart POST %s" % (len(toml_content), url))
+          log("      toml preview: %s"
+              % short(toml_content.replace("\n", " | "), 300))
+          # `requests`'s files= parameter takes (filename, content,
+          # content_type) tuples and emits multipart/form-data with the
+          # filename properly set in the Content-Disposition header.
+          # We DROP H["Content-Type"] here because requests sets the
+          # multipart boundary itself; reusing H's application/json
+          # would corrupt the body.
+          upload_headers = {"Authorization": H["Authorization"]}
+          files = {
+              "file": (filename,
+                       toml_content.encode("utf-8"),
+                       "application/octet-stream"),
+          }
+          try:
+              r = session.post(url, headers=upload_headers,
+                               files=files, timeout=60)
+          except Exception as e:
+              sys.exit("raw_c2_config upload exception: %s: %s"
+                       % (type(e).__name__, short(str(e), 300)))
+          if r.status_code != 200:
+              sys.exit("raw_c2_config upload HTTP %d: %s"
+                       % (r.status_code, short(r.text, 400)))
+          try:
+              j = r.json() or {}
+          except ValueError:
+              sys.exit("raw_c2_config upload non-JSON: %s"
+                       % short(r.text, 400))
+          if j.get("status") != "success":
+              sys.exit("raw_c2_config upload status!=success: %s"
+                       % short(json.dumps(j), 400))
+          uid = j.get("agent_file_id") or j.get("uuid") or j.get("file_id")
+          if not uid:
+              sys.exit("raw_c2_config upload returned no agent_file_id: %s"
+                       % short(json.dumps(j), 400))
+          log("[+] raw_c2_config uploaded: agent_file_id=%s" % uid)
+          return uid
+
+      RAW_C2_CONFIG_UUID = upload_raw_c2_config_file()
+
+      def build_c2_params(via, port):
+          """httpx C2-profile parameter set for this listener via.
+
+          Schema matches the parameter inventory dumped by the preflight
+          step (9 params for httpx). httpx does NOT have callback_host /
+          callback_port — those are the simpler `http` profile's params.
+          httpx uses `callback_domains` (an Array of URLs) plus a
+          `raw_c2_config` File reference for any per-instance details.
+          """
+          return {
+              # Array required by schema. One URL per build keeps the
+              # implant focused on a single via; failover_threshold +
+              # domain_rotation cover multi-URL scenarios if extended.
+              "callback_domains":         ["https://%s:%d" % (TS_HOST, port)],
+              # File UUID returned by createFile, NOT raw TOML content.
+              "raw_c2_config":            RAW_C2_CONFIG_UUID,
+              "callback_interval":        10,
+              "callback_jitter":          23,
+              "encrypted_exchange_check": True,
+              "AESPSK":                   "aes256_hmac",
+              "domain_rotation":          "fail-over",
+              "failover_threshold":       5,
+              # killdate is type=Date with default=365 (days from now);
+              # the integer form is the simplest valid value.
+              "killdate":                 365,
+          }
+
+      def create_payload(label, agent, build, via, port):
+          """POST /api/v1.4/payloads/create + poll until success/error.
+
+          Returns (uuid, None) on success, (None, err) on terminal
+          failure. Retries on transient errors (network/5xx). Does NOT
+          retry on config-class errors; the same request will fail the
+          same way and the operator just gets log noise.
+          """
+          # Inner PayloadConfiguration. Mythic's webhook wraps this in
+          # `input.payloadDefinition` (a JSON-encoded STRING) per
+          # BuildPayloadInput / BuildPayloadPayloadDefinition structs
+          # in mythic-docker/src/webserver/controllers/payload_create_webhook.go.
+          #
+          # selected_arch: each agent uses different arch tokens. The
+          # matrix can override per-build via build['arch']; otherwise
+          # we fall through to the agent-level default passed by the
+          # outer loop (build['_agent_arch']).
+          payload_config = {
+              "payload_type":   agent,
+              "selected_os":    build["os"],
+              "filename":       "build.%s" % build["format"],
+              "tag":            "auto-built by terra-range mythic_payload",
+              "c2_profiles": [{
+                  "c2_profile": C2_PROFILE,
+                  "c2_profile_parameters": build_c2_params(via, port),
+              }],
+              "commands": [],     # rely on payload defaults
+              "build_parameters": [
+                  {"name": "output_format", "value": build.get("output_format", "")}
+              ] if build.get("output_format") else [],
+              "wrapper": False,
+              "selected_arch": build.get("arch") or build.get("_agent_arch", "x64"),
+          }
+          body = {"input": {"payloadDefinition": json.dumps(payload_config)}}
+          # Endpoint changed in Mythic 3.x:
+          #   OLD: /api/v1.4/payloads/create     (returned 404 page not found)
+          #   NEW: /api/v1.4/createpayload_webhook
+          # Route registration: webserver/initialize.go:248
+          #   noSpectators.POST("createpayload_webhook", CreatePayloadWebhook)
+          url = BASE + "/api/v1.4/createpayload_webhook"
+          log("[*] %s POST %s" % (label, url))
+          log("      payload_config: %s" % short(json.dumps(payload_config), 500))
+          uuid = None
+          last_err = None
+          for attempt in range(1, BUILD_RETRY + 1):
+              try:
+                  r = session.post(url, headers=H, json=body, timeout=CREATE_TO)
+              except Exception as e:
+                  last_err = "%s: %s" % (type(e).__name__, short(str(e), 200))
+                  log("[!] %s create attempt %d/%d: %s"
+                      % (label, attempt, BUILD_RETRY, last_err))
+                  time.sleep(BUILD_RDELAY); continue
+              if r.status_code >= 500:
+                  last_err = "create HTTP %d: %s" % (r.status_code, short(r.text))
+                  log("[!] %s create attempt %d/%d: %s"
+                      % (label, attempt, BUILD_RETRY, last_err))
+                  time.sleep(BUILD_RDELAY); continue
+              if r.status_code != 200:
+                  err = "create HTTP %d: %s" % (r.status_code, short(r.text))
+                  log("[!] %s: %s" % (label, err))
+                  return None, err
+              try:
+                  j = r.json() or {}
+              except ValueError as e:
+                  err = "create non-JSON body: %s: %s" % (e, short(r.text))
+                  log("[!] %s: %s" % (label, err))
+                  return None, err
+              if j.get("status") != "success":
+                  err_msg = j.get("error") or j.get("message") or ""
+                  err = "create not success: status=%r error=%r full=%s" % (
+                      j.get("status"), err_msg, short(json.dumps(j)))
+                  if is_non_retryable(err_msg) or is_non_retryable(json.dumps(j)):
+                      log("[!] %s: %s (config error, not retrying)" % (label, err))
+                      return None, err
+                  last_err = err
+                  log("[!] %s create attempt %d/%d: %s"
+                      % (label, attempt, BUILD_RETRY, last_err))
+                  time.sleep(BUILD_RDELAY); continue
+              uuid = j.get("uuid") or j.get("payload_uuid")
+              if not uuid:
+                  err = "no uuid in create response: %s" % short(json.dumps(j))
+                  log("[!] %s: %s" % (label, err))
+                  return None, err
+              # Successful create — exit the retry loop; uuid is set,
+              # polling block below picks it up.
+              break
+          if not uuid:
+              return None, last_err or "exhausted %d create retries" % BUILD_RETRY
+          log("[+] %s created uuid=%s, polling for build..." % (label, uuid))
+          # Poll build status via Hasura GraphQL. Mythic 3.x doesn't
+          # expose a GET /api/v1.4/payloads/<uuid> endpoint anymore;
+          # status lives in the `payload` table and the web UI uses a
+          # GraphQL subscription. We use a polling query instead.
+          # NOTE: `build_message` is often empty on container-side
+          # failures (e.g. agent's build.py raises an unhandled
+          # exception). The actual diagnostic output lands in the
+          # `build_stderr` / `build_stdout` columns. We query all
+          # three so the failure log carries real information.
+          gql_query = (
+              "query GetPayload($uuid: String!) {\n"
+              "  payload(where: {uuid: {_eq: $uuid}}) {\n"
+              "    uuid build_phase build_message\n"
+              "    build_stderr build_stdout build_container\n"
+              "  }\n}"
+          )
+          deadline = time.time() + POLL_MAX
+          last_status = None
+          while time.time() < deadline:
+              try:
+                  s = session.post(GQL_URL, headers=GQL_HDRS,
+                                   json={"query": gql_query,
+                                         "variables": {"uuid": uuid}},
+                                   timeout=15)
+              except Exception as e:
+                  log("[~] %s poll transient error: %s: %s"
+                      % (label, type(e).__name__, short(str(e), 200)))
+                  time.sleep(POLL_DELAY); continue
+              if s.status_code != 200:
+                  log("[~] %s poll HTTP %d: %s"
+                      % (label, s.status_code, short(s.text)))
+                  time.sleep(POLL_DELAY); continue
+              try:
+                  pj = s.json() or {}
+              except ValueError:
+                  log("[~] %s poll non-JSON, retrying" % label)
+                  time.sleep(POLL_DELAY); continue
+              rows = (pj.get("data") or {}).get("payload") or []
+              if not rows:
+                  # Row not yet visible to Hasura (replication lag).
+                  time.sleep(POLL_DELAY); continue
+              p = rows[0]
+              status = (p.get("build_phase") or "").lower()
+              if status != last_status:
+                  log("[~] %s build_phase=%s" % (label, status or "<empty>"))
+                  last_status = status
+              if status in ("success", "complete"):
+                  return uuid, None
+              if status in ("error", "failed"):
+                  bmsg   = p.get("build_message") or ""
+                  bstderr = p.get("build_stderr") or ""
+                  bstdout = p.get("build_stdout") or ""
+                  bcont  = p.get("build_container") or ""
+                  err = (
+                      "build %s\n"
+                      "      build_container: %s\n"
+                      "      build_message  : %s\n"
+                      "      build_stderr   : %s\n"
+                      "      build_stdout   : %s"
+                      % (status, bcont, short(bmsg, 400),
+                         short(bstderr, 1200), short(bstdout, 1200))
+                  )
+                  log("[!] %s: %s (server-side build failure, not retrying)"
+                      % (label, err))
+                  return None, err
+              time.sleep(POLL_DELAY)
+          err = "poll timeout after %ds (last_status=%s)" % (POLL_MAX, last_status)
+          log("[!] %s: %s" % (label, err))
+          return None, err
+
+      def download_payload(label, uuid):
+          """GET /direct/download/<uuid> -> bytes, with retry."""
+          url = BASE + "/direct/download/" + uuid
+          last_err = None
+          for attempt in range(1, BUILD_RETRY + 1):
+              log("[*] %s GET %s (attempt %d/%d)" % (label, url, attempt, BUILD_RETRY))
+              try:
+                  r = session.get(url, headers=H, timeout=DOWNLOAD_TO, stream=True)
+              except Exception as e:
+                  last_err = "%s: %s" % (type(e).__name__, short(str(e), 200))
+                  log("[!] %s download attempt %d/%d: %s"
+                      % (label, attempt, BUILD_RETRY, last_err))
+                  time.sleep(BUILD_RDELAY); continue
+              if r.status_code == 200:
+                  return r.content, None
+              if r.status_code >= 500:
+                  last_err = "download HTTP %d: %s" % (r.status_code, short(r.text))
+                  log("[!] %s download attempt %d/%d: %s"
+                      % (label, attempt, BUILD_RETRY, last_err))
+                  time.sleep(BUILD_RDELAY); continue
+              err = "download HTTP %d: %s" % (r.status_code, short(r.text))
+              log("[!] %s: %s (non-retryable)" % (label, err))
+              return None, err
+          return None, last_err or "exhausted %d download retries" % BUILD_RETRY
+
+      def human_bytes(n):
+          """Format byte counts like '1.2 MB' for the summary line."""
+          for unit in ("B", "KB", "MB", "GB"):
+              if n < 1024 or unit == "GB":
+                  return "%.1f %s" % (n, unit) if unit != "B" else "%d B" % n
+              n /= 1024.0
+
+      os.makedirs(OUT_DIR, exist_ok=True)
+      built, failed, skipped = [], [], []
+      per_agent_built = {}
+      per_via_built   = {}
+      total_bytes     = 0
+      planned = 0
+      for agent, spec in MATRIX.items():
+          arch   = spec.get("arch", "x64")
+          builds = spec.get("builds", []) or []
+          log("")
+          if agent not in installed_pts:
+              skip_msg = ("agent %r is not installed on this teamserver "
+                          "(installed: %s); skipping all %d cells."
+                          % (agent, sorted(installed_pts),
+                             len(builds) * len(VIAS)))
+              log("[~] SKIP %s" % skip_msg)
+              skipped.append(skip_msg)
+              continue
+          log("==== agent=%s arch=%s builds=%d ====" % (agent, arch, len(builds)))
+          for build in builds:
+              # Thread the agent-level arch default down to create_payload
+              # so per-build `arch` overrides win cleanly. Mutating the
+              # build dict in place is fine — MATRIX is JSON-decoded per
+              # run and isn't reused.
+              build.setdefault("_agent_arch", arch)
+              fmt = build["format"]
+              for v in VIAS:
+                  planned += 1
+                  via  = v["via"]
+                  port = v["port"]
+                  label = "%s/%s-%s/%s:%d" % (agent, build["os"], fmt, via, port)
+                  try:
+                      uuid, err = create_payload(label, agent, build, via, port)
+                      if err:
+                          failed.append("%s: %s" % (label, err))
+                          continue
+                      blob, err = download_payload(label, uuid)
+                      if err:
+                          failed.append("%s: %s" % (label, err))
+                          continue
+                      ext   = EXT_MAP.get(fmt, "." + fmt)
+                      outname = "%s_HTTPS-%s-%s%s" % (via, agent, arch, ext)
+                      outpath = os.path.join(OUT_DIR, outname)
+                      fd, tmpname = tempfile.mkstemp(prefix=".mythic-",
+                                                     suffix=".tmp",
+                                                     dir=OUT_DIR)
+                      try:
+                          with os.fdopen(fd, "wb") as f:
+                              f.write(blob)
+                          os.chmod(tmpname, OUT_MODE)
+                          os.replace(tmpname, outpath)
+                      except Exception:
+                          try: os.unlink(tmpname)
+                          except OSError: pass
+                          raise
+                      built.append(outpath)
+                      per_agent_built[agent] = per_agent_built.get(agent, 0) + 1
+                      per_via_built[via]     = per_via_built.get(via, 0) + 1
+                      total_bytes += len(blob)
+                      log("[+] %s -> %s (%d bytes)" % (label, outpath, len(blob)))
+                  except Exception as e:
+                      tb = traceback.format_exc()
+                      failed.append("%s: %s: %s"
+                                    % (label, type(e).__name__, short(str(e), 200)))
+                      log("[!] %s: %s: %s"
+                          % (label, type(e).__name__, short(str(e), 200)))
+                      log("      traceback: %s" % short(tb, 600))
+
+      log("")
+      log("---- summary ----")
+      log("[+] %d built, %d failed, %d agent(s) skipped (of %d planned)"
+          % (len(built), len(failed), len(skipped), planned))
+      log("[+] total size on disk : %s across %d file(s)"
+          % (human_bytes(total_bytes), len(built)))
+      log("[+] per-agent breakdown:")
+      for agent in MATRIX.keys():
+          log("      %-12s %3d built" % (agent, per_agent_built.get(agent, 0)))
+      log("[+] per-via breakdown:")
+      for v in VIAS:
+          via = v["via"]
+          log("      %-12s %3d built" % (via, per_via_built.get(via, 0)))
+      if built:
+          log("[+] built files (sorted by name):")
+          for outpath in sorted(built):
+              try:    sz = os.path.getsize(outpath)
+              except OSError: sz = 0
+              log("      %-50s %s"
+                  % (os.path.basename(outpath), human_bytes(sz)))
+      if skipped:
+          log("---- skipped agents ----")
+          for s_msg in skipped:
+              log("  - " + s_msg)
+      if failed:
+          log("---- failed builds ----")
+          for f in failed:
+              log("  - " + f)
+      if not built:
+          sys.exit("0 Mythic payloads built — see [!] / failed list above")
+      PY
+    executable: /bin/bash
+  environment:
+    MYTHIC_URL:                "{{ mythic_url }}"
+    MYTHIC_USER:               "{{ mythic_admin_user }}"
+    MYTHIC_PASS:               "{{ mythic_admin_password }}"
+    MYTHIC_OUT_DIR:            "{{ mythic_payload_run_dir }}"
+    MYTHIC_OUT_MODE:           "{{ mythic_payload_output_mode }}"
+    MYTHIC_MATRIX:             "{{ mythic_payload_matrix | to_json }}"
+    MYTHIC_VIAS:               "{{ mythic_payload_listener_vias | to_json }}"
+    MYTHIC_EXT_MAP:            "{{ mythic_payload_ext_for_format | to_json }}"
+    MYTHIC_C2_PROFILE:         "{{ mythic_payload_c2_profile }}"
+    MYTHIC_LOGIN_RETRIES:      "{{ mythic_payload_login_retries }}"
+    MYTHIC_LOGIN_DELAY:        "{{ mythic_payload_login_delay_seconds }}"
+    MYTHIC_POLL_DELAY:         "{{ mythic_payload_build_poll_seconds }}"
+    MYTHIC_POLL_MAX:            "{{ mythic_payload_build_poll_max_seconds }}"
+    MYTHIC_TS_HOST:            "{{ mythic_teamserver_host }}"
+    MYTHIC_BUILD_RETRIES:      "{{ mythic_payload_build_retries }}"
+    MYTHIC_BUILD_RETRY_DELAY:  "{{ mythic_payload_build_retry_delay_seconds }}"
+    MYTHIC_CREATE_TIMEOUT:     "{{ mythic_payload_create_timeout_seconds }}"
+    MYTHIC_DOWNLOAD_TIMEOUT:   "{{ mythic_payload_download_timeout_seconds }}"
+    MYTHIC_HASURA_SECRET:      "{{ mythic_hasura_secret }}"
+  become: true
+  become_user: "{{ ansible_user }}"
+  register: mythic_build
+  changed_when: "'built,' in (mythic_build.stdout | default(''))"
+
+# ---------- Phase 5: update `latest` symlink + surface the summary ----------
+- name: Update `latest` symlink to point at this run
+  ansible.builtin.file:
+    src: "{{ mythic_payload_build_timestamp }}"
+    dest: "{{ mythic_payload_output_dir }}/latest"
+    state: link
+    force: true
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+  become: true
+
+# ---------- Phase 6: retention sweep (keep latest N run dirs) ----------
+# Each run is a self-contained timestamped subdir. Prune older ones so
+# disk usage stays bounded. `find` with file_type=directory + recurse=false
+# lists only immediate subdirs of the base output dir; the `latest`
+# symlink is excluded by file_type AND by the explicit name reject below
+# (belt-and-suspenders against future ansible find behavior changes).
+- name: Retention sweep — list existing run directories
+  ansible.builtin.find:
+    paths: "{{ mythic_payload_output_dir }}"
+    file_type: directory
+    recurse: false
+  register: mythic_payload_existing_runs
+
+- name: Retention sweep — compute prune list (keep latest {{ mythic_payload_retention_runs }})
+  ansible.builtin.set_fact:
+    # Lexicographic sort over YYYYMMDDTHHMMSSZ stems is identical to
+    # chronological sort. `[:-N]` is "everything except the last N";
+    # combined with ascending sort that's "everything older than the
+    # newest N" — exactly the prune set.
+    mythic_payload_runs_to_prune: >-
+      {{ (mythic_payload_existing_runs.files
+          | map(attribute='path')
+          | reject('search', '/latest$')
+          | sort
+          | list)[:-(mythic_payload_retention_runs | int)] }}
+
+- name: Retention sweep — report plan
+  ansible.builtin.debug:
+    msg: "{{
+      [
+        '---- mythic_payload retention ----',
+        'keep latest : ' ~ (mythic_payload_retention_runs | string) ~ ' run(s)',
+        'total runs  : ' ~ (mythic_payload_existing_runs.files | length | string),
+        'to prune    : ' ~ (mythic_payload_runs_to_prune | length | string),
+      ] + (mythic_payload_runs_to_prune | map('basename') | list)
+    }}"
+
+- name: Retention sweep — prune old run directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop: "{{ mythic_payload_runs_to_prune }}"
+  loop_control:
+    label: "{{ item | basename }}"
+  become: true
+
+- name: Report build summary
+  ansible.builtin.debug:
+    msg: "{{ [
+      '---- mythic_payload build summary ----',
+      'run dir : ' + mythic_payload_run_dir,
+      'latest  : ' + mythic_payload_output_dir + '/latest -> ' + mythic_payload_build_timestamp,
+    ] + (mythic_build.stdout_lines | default([])) }}"

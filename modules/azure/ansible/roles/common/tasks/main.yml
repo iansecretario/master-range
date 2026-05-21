@@ -1,0 +1,94 @@
+---
+# Baseline tooling every Linux VM in the range needs. Some of these
+# WOULD have been installed by cloud-init's `packages:` block, but
+# we keep this role idempotent so a VM that lost an apt mirror mid
+# first-boot can still be brought to the right state.
+- name: Wait for VM to be SSH-reachable
+  ansible.builtin.wait_for_connection:
+    timeout: 180
+    delay: 0
+
+- name: Gather minimal facts
+  ansible.builtin.setup:
+    gather_subset: ["!all", "!min", "distribution", "pkg_mgr"]
+
+# `cache_valid_time` alone isn't enough: ansible only checks the
+# /var/lib/apt/lists/ DIRECTORY mtime, not whether the cache files
+# inside actually exist. Debian Marketplace VMs have come up with the
+# dir mtime touched within the last hour but the *_Packages index
+# files wiped — apt-daily.timer race, cloud-init's package_update
+# half-completed, or unattended-upgrades hit `apt clean` mid-build.
+# ansible's `cache_valid_time: 3600` then sees "fresh" and skips the
+# real update; the next `apt install` fails with "No package matching
+# <X> is available" because the cache is empty.
+#
+# Two-step probe:
+#   1. find *_Packages files (the actual cache content)
+#   2. force apt update when none exist (cache_valid_time = 0);
+#      otherwise honor the normal 1h freshness window.
+- name: Probe apt cache for Packages index files
+  ansible.builtin.find:
+    paths: /var/lib/apt/lists/
+    patterns: "*_Packages"
+  register: apt_cache_files
+  become: true
+  when: ansible_pkg_mgr == "apt"
+
+- name: Ensure apt cache is populated (force update if empty, else max 1h old)
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: "{{ 0 if (apt_cache_files.matched | default(0)) == 0 else 3600 }}"
+  become: true
+  when: ansible_pkg_mgr == "apt"
+
+- name: Install baseline packages
+  ansible.builtin.apt:
+    name:
+      - curl
+      - jq
+      - openssl
+      - ca-certificates
+      - git
+      - make
+      - build-essential
+      - python3
+      - python3-requests   # used by adaptix's configure_listeners.py
+    state: present
+  become: true
+  when: ansible_pkg_mgr == "apt"
+
+# Harden sshd to absorb ansible's parallel-fork handshake burst. Default
+# Debian/Kali sshd:
+#   MaxStartups 10:30:100   → start dropping at 10 concurrent unauthed
+#                              connections, 30% loss rate up to 100.
+#   MaxSessions 10           → max channels per TCP connection (pipelining
+#                              uses one channel per task).
+# When ./range repair fans out 12 forks × ~50 tasks/role, this throttles
+# and sshd starts dropping handshakes. The drops surface as
+# `banner exchange: ... invalid format` in /var/log/auth.log and as
+# `UNREACHABLE! ... Operation timed out` on the ansible side — same
+# class of failure that motivated disabling ControlMaster in
+# ansible.cfg. Bumping these absorbs the burst without protocol-level
+# weirdness.
+- name: Raise sshd handshake limits (absorb ansible burst)
+  ansible.builtin.copy:
+    dest: /etc/ssh/sshd_config.d/99-terra-range.conf
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # terra-range: raise sshd limits so ansible-from-guac repair runs
+      # don't trigger "banner exchange: invalid format" rate-limiting.
+      MaxStartups 60:30:200
+      MaxSessions 32
+      LoginGraceTime 30
+  become: true
+  register: sshd_terra_drop
+  when: ansible_pkg_mgr == "apt"
+
+- name: Reload sshd if the drop-in changed
+  ansible.builtin.systemd:
+    name: ssh
+    state: reloaded
+  become: true
+  when: sshd_terra_drop is changed

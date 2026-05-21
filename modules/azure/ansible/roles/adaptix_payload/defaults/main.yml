@@ -1,0 +1,168 @@
+---
+# Run-directory retention on Kali. Each invocation drops a fresh
+# timestamped subdir under adaptix_payload_output_dir. Without retention
+# these accumulate forever on the 128 GB Kali disk.
+#
+# Default keeps the freshest 6 runs. Older runs can always be reproduced
+# from the matrix; they're not load-bearing. Set to 1 to keep only the
+# current run, or bump higher if you want more history. The role leaves
+# the `latest` symlink alone — it always points at the most recent run.
+adaptix_payload_retention_runs: 6
+# =============================================================================
+# adaptix_payload role defaults
+# =============================================================================
+# Variables are intentionally simple — most operators won't touch them.
+# Override per-range in group_vars/all.yml or host_vars if needed.
+
+# ---- Output (on the target Kali host) ----
+# `ansible_user` is the per-host SSH user emitted by inventory.py; it is
+# NEVER hardcoded as `kali`. The roles/kali role pre-creates this tree
+# (kali/tasks/main.yml:805-817) so this role's `file: state=directory`
+# is a no-op on a healthy range.
+adaptix_payload_output_dir: "/home/{{ ansible_user }}/Desktop/payloads/adaptix"
+adaptix_payload_output_mode: "0700"
+
+# ---- Operator login on the Adaptix teamserver ----
+# `ranger` is the value c2-server.sh:69 bakes into every teamserver's
+# profile.yaml (${operator_user} terraform template variable). The role
+# reads the password from the teamserver's /opt/adaptix/profile.yaml at
+# runtime — there is no vault, no inventory-side secret.
+adaptix_payload_operator_username: "ranger"
+
+# ---- Build matrix ----
+# Cartesian product is (agents) × (formats per agent) × (compatible listeners).
+#
+# IMPORTANT: `format` values must EXACTLY match the strings the agent
+# extender checks for. These are NOT arbitrary — they come straight
+# from each extender's AxScript GenerateUI() combobox items, which is
+# what the extender's Go side switches on:
+#
+#   beacon_agent/pl_main.go: case "Exe" | "DLL" | "Shellcode" | "Service Exe"
+#                            else -> errors.New("unknown file format")
+#
+# Mismatched case = HTTP 200 with ok:false + message "unknown file format".
+#
+# `arch` is also exact-match against the extender's combo ("x64" | "x86").
+#
+# `config_extra` is merged into every entry's config dict for that agent.
+# Use it for fields the extender REQUIRES (beacon needs `sleep` to parse
+# successfully via parseDurationToSeconds — empty string fails the build).
+#
+# `compatible_listener_types` filters which live listeners this agent
+# can be built against. The role reads `l_type` from /listener/list and
+# silently skips agent×listener pairs where the type isn't in this list.
+# This is what keeps the gopher agent from trying to build against a
+# BeaconHTTP listener (the gopher extender requires protocol == "tcp"
+# and returns "protocol unknown" against anything else).
+adaptix_payload_matrix:
+  beacon:
+    arch: x64
+    formats: ["Exe", "DLL", "Shellcode", "Service Exe"]
+    compatible_listener_types: ["BeaconHTTP", "BeaconSMB", "BeaconTCP", "BeaconDNS"]
+    config_extra:
+      # Sleep is parsed by parseDurationToSeconds on the server; empty
+      # string or invalid duration fails the build. "4s" matches the
+      # GenerateUI() default.
+      sleep: "4s"
+      jitter: 0
+      # Service name only matters when format == "Service Exe", but the
+      # field is read unconditionally; harmless to default.
+      svcname: "AdaptixSvc"
+      is_killdate: false
+      is_workingtime: false
+      is_sideloading: false
+  gopher:
+    # Gopher uses the rich per-build schema (`builds:` list of
+    # {os, arch, format}) rather than beacon's flat {arch, formats[]}.
+    # The role's matrix expansion detects whichever schema each agent
+    # uses (presence of `builds:` switches to the rich path).
+    #
+    # Gopher coverage matrix (per upstream docs):
+    #   OS:    windows / linux / macos (darwin)
+    #   Arch:  amd64 / arm64
+    #   Format: per-OS
+    #     - linux   -> elf
+    #     - windows -> exe   (-H=windowsgui baked in by gopher_agent)
+    #     - macos   -> exe   (Mach-O; gopher_agent maps os=darwin)
+    # Validation: gopher_agent/pl_main.go ~L397 only accepts
+    #   Arch  ∈ {"amd64", "arm64"}
+    # so x64/x86 in matrix → ok:false "unknown architecture".
+    # Six variants × N GopherTCP listeners = 6N gopher payloads.
+    builds:
+      - { os: linux,   arch: amd64, format: elf }
+      - { os: linux,   arch: arm64, format: elf }
+      - { os: windows, arch: amd64, format: exe }
+      - { os: windows, arch: arm64, format: exe }
+      - { os: macos,   arch: amd64, format: exe }
+      - { os: macos,   arch: arm64, format: exe }
+    compatible_listener_types: ["GopherTCP"]
+    config_extra:
+      # parseDurationToSeconds on the server requires a non-empty value.
+      reconn_timeout: "5s"
+      reconn_count: 0
+      win7_support: false
+
+# ---- Listener selection ----
+# Listed by `via` prefix; the role resolves each entry against the
+# teamserver's live `GET /listener/list` response, prefix-matching the
+# `via` string against `l_name`. So `via: azure` -> `azure_HTTPS` once
+# the existing adaptix role has registered the listeners.
+#
+# The first five entries match the per-CDN BeaconHTTP listeners (one
+# per CDN front). The last four match the per-student singleton
+# listeners registered for the other Adaptix listener kinds:
+#   `dns`    -> `dns_BeaconDNS`     (BeaconDNS)
+#   `smb`    -> `smb_BeaconSMB`     (BeaconSMB)
+#   `tcp`    -> `tcp_BeaconTCP`     (BeaconTCP)
+#   `gopher` -> `gopher_GopherTCP`  (GopherTCP — unblocks gopher builds)
+#
+# `tcp` and `gopher` don't collide because the prefix-match is
+# anchored at the start of the listener name (`name.startswith(via)`):
+# `gopher_GopherTCP`.startswith("tcp") -> False.
+#
+# Per-agent `compatible_listener_types` (see matrix above) ensures
+# the role only attempts builds against listener kinds the agent
+# actually supports — e.g. gopher won't try BeaconHTTP, beacon won't
+# try GopherTCP. Incompatible pairs are silently skipped.
+adaptix_payload_listener_vias:
+  - azure
+  - cloudfront
+  - workers
+  - fastly
+  - other
+  - dns
+  - smb
+  - tcp
+  - gopher
+  - alt
+
+# ---- Format -> extension mapping ----
+# Applied when constructing the output filename. Keys MUST match the
+# `formats` values above exactly (same case). Override here if a new
+# payload format is added upstream.
+adaptix_payload_ext_for_format:
+  Exe: ".exe"
+  DLL: ".dll"
+  Shellcode: ".bin"
+  "Service Exe": ".svc.exe"
+  elf: ".elf"
+
+# ---- Login retry / timeouts ----
+# Teamserver cold-boot from a fresh `terraform apply` can take 15-30 min
+# (mingw cross-compile of the beacon objects tree on first run). The role
+# retries /login this many times with this delay before giving up.
+adaptix_payload_login_retries: 12
+adaptix_payload_login_delay_seconds: 5
+# Per-build HTTP timeout. Beacon builds run mingw-w64 cross-compile on
+# the teamserver, which is slow on a cold cache; gopher is faster.
+adaptix_payload_build_timeout_seconds: 120
+
+# ---- Per-build retry on transient failures ----
+# Each individual /agent/generate call retries this many times when it
+# hits a transient error (network, timeout, 5xx). Config-class errors
+# ("unknown file format", "protocol unknown", "ok":false) are NOT
+# retried — they'd just fail the same way every time, and we want the
+# operator to see them once with a clear message instead of N times.
+adaptix_payload_build_retries: 3
+# Backoff between build retries.
+adaptix_payload_build_retry_delay_seconds: 4

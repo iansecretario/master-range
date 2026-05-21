@@ -1,0 +1,123 @@
+---
+# Run-directory retention on Kali. Each invocation drops a fresh
+# timestamped subdir under brc4_payload_output_dir. Without retention
+# these accumulate forever on the 128 GB Kali disk.
+#
+# Default keeps the freshest 6 runs. Older runs can always be reproduced
+# from the matrix; they're not load-bearing. Set to 1 to keep only the
+# current run, or bump higher if you want more history. The role leaves
+# the `latest` symlink alone — it always points at the most recent run.
+brc4_payload_retention_runs: 6
+# =============================================================================
+# brc4_payload role defaults
+# =============================================================================
+# BRC4's API server is a WebSocket endpoint on the same `:9000` port the
+# Commander GUI uses. Auth is 2-stage:
+#   1. HTTP POST https://<srv>:9000/   body={creds:{user,pass}}  → {token}
+#   2. WS connect wss://<srv>:9000     send={creds:{user,token}, task:0}
+# Subsequent requests are JSON task messages over the WS:
+#   task: 8  → list listeners
+#   task: 31 → list badger profiles
+#   task: 36 → build badger → returns base64 shellcode in `payload_dat`
+#
+# To avoid kicking the operator's Commander GUI off `:9000`, we log in as
+# a SECOND operator account (`automation`) that lives alongside `admin`
+# in the BRC4 profile's user_list. Terraform's listeners.tf renders both
+# operators; inventory.py surfaces the automation password as the
+# `terra_brc4_automation_password` hostvar.
+
+# ---- Output (on the target Kali host) ----
+brc4_payload_output_dir: "/home/{{ ansible_user }}/Desktop/payloads/brc4"
+brc4_payload_output_mode: "0700"
+
+# ---- BRC4 teamserver connection ----
+# Commander/API port baked into the profile (c2_handler = 0.0.0.0:9000).
+# Kali → :9000 is permitted by NSG; everyone else is denied.
+brc4_payload_commander_port: 9000
+
+# Automation operator username. Must match listeners.tf
+# `brc4_profile.user_list` key. If you ever rename this, also update
+# both ends or the WS login will get rejected.
+brc4_payload_automation_user: "automation"
+
+# ---- Build matrix ----
+# 5 listeners × 18 variants = 90 binaries (full `api_build_badger.py --dump`
+# coverage). The 18 variants per listener decompose as:
+#   x86 + etw     × {full, min-bin, net-bin} × {rtl, wait}  =  6 variants
+#   x64 + etw     × {full, min-bin, net-bin} × {rtl, wait}  =  6 variants
+#   x64 + stealth × {full, min-bin, net-bin} × {rtl, wait}  =  6 variants
+# stealth is x64-only (per bruteratel.py — there is no payload_type
+# enum value for x86+stealth).
+#
+# `payload_type` enum values come from bruteratel.py:225-283. Don't
+# touch unless BRC4 ships a new release that renumbers them.
+brc4_payload_build_variants:
+  # x86 + etw
+  - { arch: x86, evasion: etw,     sub_type: full,    exit_method: rtl,  payload_arch: 0, payload_type: 1  }
+  - { arch: x86, evasion: etw,     sub_type: full,    exit_method: wait, payload_arch: 0, payload_type: 2  }
+  - { arch: x86, evasion: etw,     sub_type: min-bin, exit_method: rtl,  payload_arch: 0, payload_type: 11 }
+  - { arch: x86, evasion: etw,     sub_type: min-bin, exit_method: wait, payload_arch: 0, payload_type: 12 }
+  - { arch: x86, evasion: etw,     sub_type: net-bin, exit_method: rtl,  payload_arch: 0, payload_type: 15 }
+  - { arch: x86, evasion: etw,     sub_type: net-bin, exit_method: wait, payload_arch: 0, payload_type: 16 }
+  # x64 + etw
+  - { arch: x64, evasion: etw,     sub_type: full,    exit_method: rtl,  payload_arch: 1, payload_type: 1  }
+  - { arch: x64, evasion: etw,     sub_type: full,    exit_method: wait, payload_arch: 1, payload_type: 2  }
+  - { arch: x64, evasion: etw,     sub_type: min-bin, exit_method: rtl,  payload_arch: 1, payload_type: 11 }
+  - { arch: x64, evasion: etw,     sub_type: min-bin, exit_method: wait, payload_arch: 1, payload_type: 12 }
+  - { arch: x64, evasion: etw,     sub_type: net-bin, exit_method: rtl,  payload_arch: 1, payload_type: 15 }
+  - { arch: x64, evasion: etw,     sub_type: net-bin, exit_method: wait, payload_arch: 1, payload_type: 16 }
+  # x64 + stealth (x64-only)
+  - { arch: x64, evasion: stealth, sub_type: full,    exit_method: rtl,  payload_arch: 1, payload_type: 8  }
+  - { arch: x64, evasion: stealth, sub_type: full,    exit_method: wait, payload_arch: 1, payload_type: 9  }
+  - { arch: x64, evasion: stealth, sub_type: min-bin, exit_method: rtl,  payload_arch: 1, payload_type: 13 }
+  - { arch: x64, evasion: stealth, sub_type: min-bin, exit_method: wait, payload_arch: 1, payload_type: 14 }
+  - { arch: x64, evasion: stealth, sub_type: net-bin, exit_method: rtl,  payload_arch: 1, payload_type: 17 }
+  - { arch: x64, evasion: stealth, sub_type: net-bin, exit_method: wait, payload_arch: 1, payload_type: 18 }
+
+# Listener vias. Resolves against the live `task: 8` response (BRC4
+# returns listener names — same `<region>_HTTPS` convention as the
+# other frameworks, baked by listeners.tf brc4_listener_block).
+brc4_payload_listener_vias:
+  - azure
+  - cloudfront
+  - workers
+  - fastly
+  - other
+
+# ---- Output filename + format ----
+# BRC4's task:36 returns raw SHELLCODE (not EXE/DLL/Service-EXE — the
+# Commander GUI wraps shellcode in a loader on the client side; the API
+# doesn't). So every output is a .bin. The operator can wrap with
+# Donut/ScareCrow/their own loader post-build if they need PE files.
+brc4_payload_output_extension: ".bin"
+
+# ---- Login + build tunables ----
+# BRC4 teamserver cold-boot from a fresh terraform apply involves
+# binary download + cert generation + activation + profile load —
+# typically completes in 60-180s. login_retries × login_delay_seconds
+# governs the patience budget on the WS auth.
+brc4_payload_login_retries: 12
+brc4_payload_login_delay_seconds: 5
+
+# Per-build retry on transient errors (network / WS reset / timeout).
+# Config-class errors ("invalid payload name or configuration", missing
+# profile, etc.) are NOT retried — they'd fail the same way and burn
+# operator time. See NON_RETRYABLE_SUBSTRINGS in tasks/main.yml.
+brc4_payload_build_retries: 3
+brc4_payload_build_retry_delay_seconds: 4
+
+# Per-build wait-for-response budget. Each task:36 returns one message
+# (or a stream of B_CONTINUE async events the helper ignores). The
+# bruteratel.py reference uses a hard cap of 10 inner-loop reads;
+# we expose it for tuning.
+brc4_payload_build_recv_attempts: 30
+
+# WS connect timeout (initial TLS+handshake).
+brc4_payload_ws_connect_timeout_seconds: 15
+
+# ---- TLS verification ----
+# BRC4 generates a self-signed cert at /opt/bruteratel/cert.pem during
+# bootstrap; we don't have a trust chain to validate against, so we
+# disable verification. The connection is still encrypted; the NSG
+# already enforces who can reach :9000.
+brc4_payload_validate_certs: false

@@ -1,0 +1,118 @@
+---
+# Run-directory retention on Kali. Each invocation drops a fresh
+# timestamped subdir under mythic_payload_output_dir. Without retention
+# these accumulate forever on the 128 GB Kali disk.
+#
+# Default keeps the freshest 6 runs. Older runs can always be reproduced
+# from the matrix; they're not load-bearing. Set to 1 to keep only the
+# current run, or bump higher if you want more history. The role leaves
+# the `latest` symlink alone — it always points at the most recent run.
+mythic_payload_retention_runs: 6
+# =============================================================================
+# mythic_payload role defaults
+# =============================================================================
+
+# ---- Output (on the target Kali host) ----
+mythic_payload_output_dir: "/home/{{ ansible_user }}/Desktop/payloads/mythic"
+mythic_payload_output_mode: "0700"
+
+# ---- Mythic server connection ----
+# Web UI / API port (c2-mythic.sh:61 -> MYTHIC_SERVER_PORT=7443). Differs
+# from Adaptix/BRC4's commander port (:9000) — Mythic is the asymmetric
+# one. /opt/mythic-env's MYTHIC_ADMIN_USER/PASSWORD are the seed creds.
+mythic_payload_server_port: 7443
+mythic_payload_validate_certs: false
+
+# ---- C2 profile ----
+# httpx is the 5-instance profile we pre-configure in c2-mythic.sh (5
+# HTTPS listener ports 8443-8447). Override if a scenario uses a
+# different default profile.
+mythic_payload_c2_profile: "httpx"
+
+# ---- Build matrix ----
+# Three payload types ("agents" in our cross-framework terminology),
+# each with its supported OS/format combos. The cartesian product with
+# `mythic_payload_listener_vias` expands at runtime.
+#
+# Mythic's `selected_os` accepts (per agent): Windows, Linux, macOS.
+# Each agent's `filename` field controls the produced filename inside
+# Mythic; we override that with our canonical
+# `<via>_HTTPS-<agent>-<arch>.<ext>` scheme post-build.
+# `arch` at the agent level is the default; each build entry MAY
+# override with its own `arch` value. This matters because the valid
+# arch tokens are agent-specific:
+#   apollo / athena (.NET Roslyn):  x64 | x86
+#   poseidon       (Go cross-compile): amd64 | arm64
+# Mixing them (e.g. passing x64 to poseidon) makes Mythic accept the
+# create, queue a build, and then the build container fails with no
+# build_message — exactly the symptom apollo/poseidon hit on the
+# first run before this matrix was split.
+mythic_payload_matrix:
+  apollo:
+    arch: x64
+    builds:
+      - { os: Windows, format: exe,       output_format: "WinExe" }
+      - { os: Windows, format: dll,       output_format: "WinDll" }
+      - { os: Windows, format: shellcode, output_format: "Raw" }
+  poseidon:
+    arch: amd64
+    builds:
+      - { os: Linux,  format: elf, output_format: "default" }
+      - { os: macOS,  format: bin, output_format: "default" }
+  # athena is intentionally excluded from defaults: it's an extra
+  # MythicAgents container that's NOT installed by c2-mythic.sh. The
+  # preflight in tasks/main.yml will auto-skip uninstalled agents
+  # anyway, but leaving athena out of defaults avoids 9 wasted POST
+  # retries per run. To re-enable, install on the teamserver with
+  #   sudo /opt/mythic/mythic-cli install github \
+  #        https://github.com/MythicAgents/athena
+  # then add the agent block back here.
+
+# ---- Listener selection ----
+# Each `via` maps to a single httpx listener instance via its port.
+# The build embeds the per-via callback host:port in the payload's
+# httpx C2 profile parameters.
+mythic_payload_listener_vias:
+  - { via: azure,      port: 8443 }
+  - { via: cloudfront, port: 8444 }
+  - { via: workers,    port: 8445 }
+  - { via: fastly,     port: 8446 }
+  - { via: other,      port: 8447 }
+
+# ---- Format -> extension mapping ----
+mythic_payload_ext_for_format:
+  exe: ".exe"
+  dll: ".dll"
+  shellcode: ".bin"
+  elf: ".elf"
+  bin: ".bin"
+
+# ---- Login + build polling tunables ----
+# Initial /auth retry budget; Mythic can take 60-120s after boot to
+# accept logins.
+mythic_payload_login_retries: 12
+mythic_payload_login_delay_seconds: 5
+# Each createPayload returns a UUID; we poll until build completes.
+# Apollo + Athena builds run a docker container per build (Roslyn .NET
+# compile) — can be 30-180s. Poseidon is faster.
+mythic_payload_build_poll_seconds: 5
+mythic_payload_build_poll_max_seconds: 600
+
+# ---- Per-build retry on transient failures ----
+# Each individual payload create/download retries this many times on
+# transient errors (network, timeout, 5xx, auth-class). Config-class
+# errors (missing payload_type, bad c2_profile, build container error)
+# are NOT retried — the script logs them once with full context and
+# moves on.
+mythic_payload_build_retries: 3
+# Backoff between build retries.
+mythic_payload_build_retry_delay_seconds: 4
+
+# ---- HTTP timeout for the create call ----
+# The /api/v1.4/payloads/create call returns quickly with a UUID; the
+# actual build runs async on the server. 30s is plenty for the create
+# RPC itself; the build wait is governed by mythic_payload_build_poll_max_seconds.
+mythic_payload_create_timeout_seconds: 30
+# Download timeout (per attempt). Most payloads are <10MB but cold
+# disk + cold container can stretch this.
+mythic_payload_download_timeout_seconds: 120

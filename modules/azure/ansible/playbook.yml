@@ -1,0 +1,275 @@
+---
+# =============================================================================
+# terra-range — main configure / repair playbook
+# =============================================================================
+# Run from `./range repair`. Re-running this is safe — every role is
+# idempotent.
+#
+# Invoke directly:
+#   cd modules/azure/ansible
+#   TERRA_ENV=/abs/path/to/envs/azure ansible-playbook playbook.yml
+#
+# Limit to a single role:
+#   ansible-playbook playbook.yml --limit adaptix
+#   ansible-playbook playbook.yml --limit redteam-lab-mythic
+
+# Common baseline (package install) — runs first on the boxes WE manage
+# (teamservers, redirectors, guacamole). Skips lab targets (Kali, linux01)
+# which may not be reachable from the controller.
+- name: Baseline tooling on terra-range-managed VMs
+  hosts: teamservers:redirectors:guacamole
+  gather_facts: false
+  any_errors_fatal: false
+  strategy: free
+  tags: [common]
+  roles:
+    - role: common
+
+# Redirectors first — most teamservers don't expose their listeners
+# externally, so getting the redirectors healthy means downstream port
+# probes can use the redirector's public IP as a real reachability check.
+- name: Configure C2 redirectors
+  hosts: redirectors
+  gather_facts: false
+  strategy: free
+  tags: [redirector]
+  roles:
+    - role: redirector
+
+# Guacamole — refresh connection manifest + install custom login-page
+# branding (CWR logo) + LE wildcard TLS. The role idempotently rebuilds
+# the cwr-branding extension JAR whenever files/login-bg.png changes
+# and recreates the guacamole container with the GUACAMOLE_HOME mount.
+#
+# ORDER NOTE: Guacamole runs IMMEDIATELY after the redirectors and
+# BEFORE any teamserver / kali play. Empirically we've seen the
+# teamserver plays (adaptix's `wait_for: port 9000`, kali's gather_facts)
+# fail in ways that terminate the rest of the playbook under
+# strategy:free — even though each play is independent on paper. When
+# that happens, the operator-facing Guacamole UI stays untouched (no
+# branding, no real TLS). Running Guacamole first guarantees the
+# operator can ALWAYS get a usable browser-trusted login page, even
+# when a teamserver is mid-rebuild / mid-bootstrap further down.
+- name: Configure Guacamole (connections + branding)
+  hosts: guacamole
+  gather_facts: false
+  strategy: linear
+  tags: [guacamole]
+  roles:
+    - role: guacamole
+
+# AdaptixC2 teamservers.
+- name: Configure AdaptixC2 teamservers
+  hosts: adaptix
+  gather_facts: false
+  strategy: free
+  tags: [adaptix]
+  roles:
+    - role: adaptix
+
+# Mythic teamservers.
+- name: Configure Mythic teamservers
+  hosts: mythic
+  gather_facts: false
+  strategy: free
+  tags: [mythic]
+  roles:
+    - role: mythic
+
+# Sliver teamservers.
+- name: Configure Sliver teamservers
+  hosts: sliver
+  gather_facts: false
+  strategy: free
+  tags: [sliver]
+  roles:
+    - role: sliver
+
+# Brute Ratel C4 teamservers. License-gated: the generator drops
+# c2-brc4 machines entirely when no BRC4 license is configured, so
+# this play simply matches zero hosts on an unlicensed range. When a
+# licensed c2-brc4 box IS present, the c2-brc4.sh userdata does the
+# boot-time install/activation and this role is the idempotent repair
+# layer (verify install, sync c2.profile, assure service + ports).
+- name: Configure Brute Ratel C4 teamservers
+  hosts: brc4
+  gather_facts: false
+  strategy: free
+  tags: [brc4]
+  roles:
+    - role: brc4
+
+# Ghostwriter reporting platform. Docker-compose stack (Django + Hasura +
+# PostgreSQL + nginx). The role pulls ghostwriter-cli, runs `install`,
+# provisions admin user, and mints an API token for the oplog pipeline.
+# Skip-if-baked: ~3 min on a baked image vs ~15-20 min cold install.
+- name: Configure Ghostwriter reporting platform
+  hosts: ghostwriter
+  gather_facts: false
+  any_errors_fatal: false
+  strategy: free
+  tags: [ghostwriter]
+  roles:
+    - role: ghostwriter
+
+# Stepping Stones activity logger. Django + Postgres docker-compose stack.
+# Operators log SOCs / commands / red-team activity into it; oplog pipeline
+# can ingest from it later. ~2-3 min on a baked image.
+- name: Configure Stepping Stones activity logger
+  hosts: stepping_stones
+  gather_facts: false
+  any_errors_fatal: false
+  strategy: free
+  tags: [stepping-stones, stepping_stones]
+  roles:
+    - role: stepping_stones
+
+# RedELK red-team telemetry SIEM. ES + Kibana + Logstash + nginx
+# docker-compose stack. The role runs install-elkserver.sh once,
+# patches the .env for the lab-supplied passwords, and waits for ES +
+# Kibana to come up. ~5 min on a baked image (ES cold-start dominates).
+- name: Configure RedELK red-team telemetry SIEM
+  hosts: redelk
+  gather_facts: false
+  any_errors_fatal: false
+  strategy: free
+  tags: [redelk]
+  roles:
+    - role: redelk
+
+# Kali attacker workstations. The Azure marketplace Kali image is
+# headless; this play installs XFCE + xrdp + the kali-linux-default
+# metapackage (~2.5 GB of offensive tools) so the operator can RDP
+# into a real Kali desktop via Guacamole. First-time apt install
+# takes ~15-30 min; gather_facts: true lets the role distinguish
+# fresh vs already-configured VMs cheaply.
+- name: Configure Kali attacker workstations (GUI + tools)
+  hosts: kali
+  # gather_facts: false so the SSH-handshake-race we keep seeing on
+  # this VM can be absorbed by an explicit wait_for_connection task at
+  # the top of the play (gather_facts has no retry semantics). The kali
+  # role calls setup explicitly later if it needs facts.
+  gather_facts: false
+  # serial: 1 forces strict sequential SSH connections to this host —
+  # eliminates the concurrent-handshake burst that triggers Kali sshd's
+  # "banner exchange: invalid format" rejections during a fresh play
+  # start. With one Kali per range this is the same speed in practice;
+  # in multi-student deploys it trades a bit of wall time for
+  # reliability.
+  serial: 1
+  ignore_unreachable: true
+  pre_tasks:
+    # Belt-and-suspenders: the first thing we do is wait for SSH to be
+    # actually usable. Two pass strategy that's empirically reliable:
+    #
+    #   1. wait_for_connection — internal retry every `sleep` seconds
+    #      using ansible's own connection plugin (=== module). Times
+    #      out after 10 min total. Catches:
+    #        - cloud-init still finishing (kali-linux-default install
+    #          can take 15-30 min on first boot)
+    #        - apt locks held by unattended-upgrades
+    #        - sshd reloading in response to MaxStartups drop-in
+    #        - the ~40-90 second connection-blackout window we keep
+    #          hitting (suspected Azure peering forwarding-table eviction)
+    #   2. Sleep 5 seconds — small jitter so 'serial: 1' doesn't burst-
+    #      reconnect on the next task right after wait_for_connection
+    #      returns.
+    #
+    # ignore_errors keeps the play running even if the wait expires —
+    # downstream tasks will still hit individual UNREACHABLE failures,
+    # but ignore_unreachable on the play lets the operator re-run
+    # `./range repair --limit kali` instead of one terrifying abort.
+    - name: Wait for Kali to be SSH-reachable (retries up to 10 min)
+      ansible.builtin.wait_for_connection:
+        timeout: 600
+        delay: 0
+        sleep: 5
+      ignore_errors: true
+
+    - name: Small jitter before first real task (lets sshd settle)
+      ansible.builtin.pause:
+        seconds: 5
+      delegate_to: localhost
+      run_once: false
+  tags: [kali]
+  roles:
+    - role: kali
+
+# Windows hosts (DC + member servers + workstations + FLARE-VM analyst).
+# Connects via WinRM (HTTP/5985, set up in each VM's PowerShell
+# userdata). The `windows-base` role today applies the CWR desktop
+# wallpaper machine-wide via the HKLM Policies\System key; future
+# Windows config tasks layer in here without spinning up new roles
+# per-task.
+#
+# Requires `ansible.windows` + `community.windows` collections on the
+# from-guac controller. See modules/azure/ansible/requirements.yml.
+# `./range repair` installs them via `ansible-galaxy collection install
+# -r requirements.yml` during the guac-side bootstrap.
+- name: Configure Windows hosts (wallpaper + baseline)
+  hosts: windows
+  gather_facts: false
+  any_errors_fatal: false
+  strategy: free
+  tags: [windows]
+  roles:
+    - role: windows-base
+
+# Build Adaptix payloads onto Kali. Deliberately the LAST play in this
+# file: runs only after every teamserver play (adaptix, mythic, sliver,
+# brc4) AND the kali play have finished. That ordering guarantees:
+#   - Adaptix teamserver is built, listeners are registered, /endpoint
+#     /login responds (adaptix play).
+#   - AdaptixClient has finished its async Qt6 build on Kali, the
+#     ~/Desktop/payloads/adaptix tree exists, and the storage-v1.db
+#     seed has run (kali play).
+# Only when both are true is it meaningful to generate payloads.
+#
+# The role auto-skips on scenarios without Adaptix (e.g. vulhub) via a
+# `meta: end_host` guard, so this play is safe to add unconditionally.
+- name: Build Adaptix payloads on Kali (final play)
+  hosts: kali
+  gather_facts: false
+  strategy: free
+  # `payloads` is the umbrella tag that runs ALL four payload plays
+  # (adaptix + sliver + mythic + brc4) in one go via
+  #   ./range repair --tags payloads
+  # `adaptix_payload` keeps the per-stack invocation working:
+  #   ./range repair --tags adaptix_payload
+  tags: [adaptix_payload, payloads]
+  roles:
+    - role: adaptix_payload
+
+# Build Sliver implants on Kali via `sliver-client --rc <file>`. Auto-
+# skips on scenarios without a Sliver teamserver. Filename format:
+# <via>_HTTPS-<agent>-<transport>-<arch>.<ext>.
+- name: Build Sliver payloads on Kali (final play)
+  hosts: kali
+  gather_facts: false
+  strategy: free
+  tags: [sliver_payload, payloads]
+  roles:
+    - role: sliver_payload
+
+# Build Mythic payloads on Kali via the REST API (POST /auth -> JWT,
+# then /api/v1.4/payloads/create + poll + download). Auto-skips on
+# scenarios without a Mythic teamserver. Filename format:
+# <via>_HTTPS-<agent>-<arch>.<ext>.
+- name: Build Mythic payloads on Kali (final play)
+  hosts: kali
+  gather_facts: false
+  strategy: free
+  tags: [mythic_payload, payloads]
+  roles:
+    - role: mythic_payload
+
+# BRC4 (Brute Ratel C4) is GUI-only — stub role that drops a manual-
+# procedure README into ~/Desktop/payloads/brc4/. Auto-skips on
+# scenarios without a BRC4 teamserver.
+- name: BRC4 payload procedure docs on Kali (final play; GUI-only — stub)
+  hosts: kali
+  gather_facts: false
+  strategy: free
+  tags: [brc4_payload, payloads]
+  roles:
+    - role: brc4_payload

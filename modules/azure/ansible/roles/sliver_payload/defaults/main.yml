@@ -1,0 +1,170 @@
+---
+# =============================================================================
+# sliver_payload role defaults
+# =============================================================================
+
+# ---- Output (on the target Kali host) ----
+sliver_payload_output_dir: "/home/{{ ansible_user }}/Desktop/payloads/sliver"
+sliver_payload_output_mode: "0700"
+
+# ---- sliver-client invocation ----
+# Path to the sliver-client binary on Kali. The kali role downloads it
+# to ~/Desktop/Tools/sliver-client and the operator.cfg is auto-imported
+# into ~/.sliver-client/configs/operator.cfg.
+sliver_payload_client_path: "/home/{{ ansible_user }}/Desktop/Tools/sliver-client"
+
+# Working directory for the build run. The Python wrapper writes the RC
+# file here, invokes sliver-client, then walks this dir for produced
+# binaries and renames them into the output dir.
+sliver_payload_workdir: "/tmp/sliver-build"
+
+# Per-run log subdirectory NAME (not full path). Each run lives at
+#   <run_dir>/<sliver_payload_log_subdir>/
+# i.e. the timestamped run dir contains its own _logs folder, so
+# stdout/stderr/rc for that run are self-contained next to its binaries.
+sliver_payload_log_subdir: "_logs"
+
+# How long to wait for sliver-client to finish ALL builds in this run.
+# Acts as an upper bound on the entire batch. With per-cell invocations
+# (see sliver_payload_per_cell_timeout_seconds), the effective worst
+# case is min(this, N_cells × per_cell_timeout). 3600s (60 min) is
+# generous-but-not-silly headroom for the default 50-cell matrix on a
+# typical lab teamserver.
+#
+# Trim-matrix shortcut for fast iteration: override in inventory
+# (group_vars/all.yml or per-host) with the minimal coverage you want:
+#
+#   sliver_payload_matrix:
+#     sliver_session:
+#       mode: session
+#       arch: amd64
+#       builds: [{ os: windows, format: exe }]
+#     sliver_beacon:
+#       mode: beacon
+#       arch: amd64
+#       builds: [{ os: windows, format: exe }]
+#   sliver_payload_transports: [http]    # drop mtls duplicate set
+#   sliver_payload_listener_vias:        # only azure-fronted, drop 4 placeholders
+#     - { via: azure, port: 8443 }
+#
+# That cuts the matrix from 50 cells to 2, ~1-2 min wall time.
+sliver_payload_client_timeout_seconds: 3600
+
+# Per-cell timeout. Each `generate` invocation gets its own sliver-client
+# subprocess so a single hung compile can't block the rest of the batch.
+# A typical un-obfuscated Sliver compile is 30-60s on a 2-vCPU teamserver;
+# 240s gives 4x headroom for a cold Go module cache or transient network
+# slowness. If you turn on garble/UPX (--evasion-style obfuscation in a
+# custom matrix), bump this to 600+.
+sliver_payload_per_cell_timeout_seconds: 240
+
+# Sliver pre-flight — before running the big batch, run a single
+# `version` command via sliver-client --rc to verify operator.cfg works.
+# If this fails (cert expired, teamserver not listening, etc.) we fail
+# fast with a clear message instead of running the full batch and
+# returning 0 builds.
+sliver_payload_preflight_enabled: true
+sliver_payload_preflight_timeout_seconds: 60
+
+# Run-directory retention on Kali. Each invocation drops a fresh ~1.5 GB
+# timestamped subdir under sliver_payload_output_dir (50 implants × ~30 MB).
+# Without retention these accumulate forever on the 128 GB Kali disk — 100
+# runs would consume the whole disk and wedge the box in I/O-wait.
+#
+# Default keeps the freshest 6 runs (~9 GB ceiling). Older runs can always
+# be reproduced from the matrix; they're not load-bearing. Set to 1 to keep
+# only the run that just finished, or bump higher if you want more history
+# at the cost of disk. The role leaves the `latest` symlink alone — it
+# always points at the most recent successful run.
+#
+# This ONLY prunes Kali-local run directories; server-side implant cleanup
+# (sliver_payload_cleanup_server_implants below) is independent.
+sliver_payload_retention_runs: 6
+
+# Server-side implant cleanup. The sliver-server stores a copy of every
+# generated implant under ~/.sliver/slivers/<name>/ on the teamserver
+# (~30 MB each). Without cleanup, a 50-cell run consumes ~1.5 GB on the
+# teamserver — enough to fill a small disk and trip the SQLite
+# "database or disk is full (13)" error mid-batch, which manifests as
+# all subsequent builds failing with rc=1.
+#
+# When enabled (default), the role:
+#   1. PRE-BUILD: lists current implants on the teamserver and removes
+#      any matching the names this run will generate (idempotent for
+#      re-runs of the same matrix).
+#   2. POST-CELL: immediately after a successful local-copy, sends
+#      `implants rm <name>` to free the server-side artifact + DB row
+#      for that implant. The binary is already saved locally on Kali,
+#      so the server copy is redundant.
+#
+# Cleanup failures are non-fatal — they only spam the log; the run
+# continues. Disable this if you want operators to be able to re-use
+# the same server-side implants for tasking/sessions later.
+sliver_payload_cleanup_server_implants: true
+sliver_payload_cleanup_timeout_seconds: 60
+
+# ---- Build matrix ----
+# Cartesian product is:
+#   (agents) × (per-agent OS/format/arch combos) × (transports) × (listener vias)
+# The role expands this into one `generate ...` line per cell in the
+# sliver-client RC file.
+#
+# Default matrix covers the "all" set:
+#   - session implants (long-lived interactive) over http + mtls
+#   - beacon implants (callback-and-go) over http + mtls
+#   - windows-exe, windows-shellcode, linux-shared
+#
+# Per-agent `mode` selects sliver-client subcommand:
+#   session  -> `generate ...`
+#   beacon   -> `generate beacon ...`
+sliver_payload_matrix:
+  sliver_session:
+    mode: session
+    arch: amd64
+    builds:
+      - { os: windows, format: exe }
+      - { os: windows, format: shellcode }
+      - { os: linux,   format: shared }
+  sliver_beacon:
+    mode: beacon
+    arch: amd64
+    builds:
+      - { os: windows, format: exe }
+      - { os: linux,   format: shared }
+
+# ---- Listener selection ----
+# Each `via` becomes a single payload entry per matrix build, with the
+# callback URL resolved at runtime against `sliver_payload_via_callback`
+# (see tasks/main.yml). The five vias mirror the other C2 frameworks'
+# CDN-fronted port layout.
+sliver_payload_listener_vias:
+  - { via: azure,      port: 8443 }
+  - { via: cloudfront, port: 8444 }
+  - { via: workers,    port: 8445 }
+  - { via: fastly,     port: 8446 }
+  - { via: other,      port: 8447 }
+
+# ---- Transports ----
+# `http`  -> `generate --http <callback-url>`
+# `mtls`  -> `generate --mtls <host:port>`  (uses teamserver direct;
+#            does not go through redirectors / CDN fronts)
+#
+# For the mtls case, the matrix `port` from sliver_payload_listener_vias
+# is repurposed as the mTLS target port on the teamserver. (In practice
+# the operator may want to register a dedicated mTLS listener on the
+# teamserver first; this default produces binaries that work against
+# any future mTLS listener bound to those ports.)
+sliver_payload_transports:
+  - http
+  - mtls
+
+# ---- Format -> extension mapping ----
+# Sliver's `--format` accepts: exe, shared, shellcode, service.
+# We add `elf` for clarity in filenames even though Sliver itself calls
+# linux shared-libs `shared`.
+sliver_payload_ext_for_format:
+  exe: ".exe"
+  shared: ".so"
+  shellcode: ".bin"
+  service: ".svc.exe"
+  elf: ".elf"

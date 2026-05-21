@@ -1,0 +1,366 @@
+---
+# =============================================================================
+# Sliver C2 teamserver
+# =============================================================================
+# Idempotent setup of:
+#   - /root/sliver-server binary (latest release, with fallback pin)
+#   - sliver.service (daemon on :31337)
+#   - 5 HTTPS listeners on :8443-:8447, persisted via `--persistent`
+#
+# Replaces the bash repair script that drove sliver-server's interactive
+# console through `timeout 60` wrappers. Ansible can keep state between
+# tasks cleanly, so we just probe + act.
+
+# ---------- Phase 1: binary ----------
+- name: Probe sliver-server binary
+  ansible.builtin.stat:
+    path: /root/sliver-server
+  register: sliver_bin
+  become: true
+
+- name: Resolve latest sliver-server URL via GitHub API
+  ansible.builtin.uri:
+    url: https://api.github.com/repos/BishopFox/sliver/releases/latest
+    return_content: true
+    timeout: 30
+  register: sliver_release
+  when: not sliver_bin.stat.exists or sliver_bin.stat.size == 0
+
+- name: Pick a download URL from the release assets
+  ansible.builtin.set_fact:
+    sliver_url: >-
+      {{ (sliver_release.json.assets
+            | selectattr('browser_download_url', 'search', '/sliver[-_]server[-_]linux($|[-_]amd64)$')
+            | rejectattr('browser_download_url', 'search', '\.(asc|sig|sha)$')
+            | map(attribute='browser_download_url')
+            | first
+          )
+          | default('https://github.com/BishopFox/sliver/releases/download/v1.5.42/sliver-server_linux') }}
+  when: not sliver_bin.stat.exists or sliver_bin.stat.size == 0
+
+- name: Download sliver-server
+  ansible.builtin.get_url:
+    url: "{{ sliver_url }}"
+    dest: /root/sliver-server
+    mode: "0755"
+    timeout: 600
+  become: true
+  when: not sliver_bin.stat.exists or sliver_bin.stat.size == 0
+
+- name: Run sliver-server unpack (downloads embedded assets on first boot)
+  ansible.builtin.command:
+    cmd: /root/sliver-server unpack --force
+    creates: /root/.sliver/last-update
+  become: true
+
+# ---------- Phase 1b: sliver-client binary ----------
+# `sliver-server` no longer has a `console` subcommand (Sliver 1.7+).
+# The interactive console moved entirely to `sliver-client`, a SEPARATE
+# binary in the GitHub release. We download it alongside the server
+# and use it (with an auto-generated operator.cfg + an RC file) to
+# drive the 5 listener creates over the multiplayer gRPC endpoint.
+- name: Probe sliver-client binary
+  ansible.builtin.stat:
+    path: /root/sliver-client
+  register: sliver_client_bin
+  become: true
+
+# Use GitHub's /releases/latest/download/ redirect — always serves
+# the latest release's asset without an API roundtrip. Avoids the
+# "sliver_release.json undefined" failure when the server-binary task
+# was skipped (already downloaded) so we never called the API.
+- name: Download sliver-client (latest amd64)
+  ansible.builtin.get_url:
+    url: https://github.com/BishopFox/sliver/releases/latest/download/sliver-client_linux-amd64
+    dest: /root/sliver-client
+    mode: "0755"
+    timeout: 600
+  become: true
+  when: not sliver_client_bin.stat.exists or sliver_client_bin.stat.size == 0
+
+# ---------- Phase 2: daemon ----------
+# The c2-sliver.sh cloud-init template normally plants this unit during
+# first boot (write_files: /etc/systemd/system/sliver.service). When
+# cloud-init partially fails (we've seen non-deterministic write_files
+# losses on this image — same template, different luck per VM), the
+# systemd task below fails with "Could not find the requested service
+# sliver". Planting the unit here too makes the role idempotent against
+# that failure mode and lets `./range repair --tags sliver` recover the
+# host without re-running cloud-init. Same unit body as c2-sliver.sh:61.
+- name: Plant sliver.service systemd unit (idempotent recovery if cloud-init dropped it)
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/sliver.service
+    mode: "0644"
+    owner: root
+    group: root
+    content: |
+      [Unit]
+      Description=Sliver C2 teamserver
+      After=network.target
+
+      [Service]
+      Type=simple
+      User=root
+      ExecStart=/root/sliver-server daemon --lhost 0.0.0.0 --lport {{ sliver_grpc_port }}
+      Restart=on-failure
+      RestartSec=5
+      LimitNOFILE=65536
+
+      [Install]
+      WantedBy=multi-user.target
+  register: sliver_unit
+  become: true
+
+- name: Ensure sliver.service is enabled + running
+  ansible.builtin.systemd:
+    name: sliver
+    enabled: true
+    state: started
+    # daemon_reload is unconditional so we pick up either a fresh-planted
+    # unit (above) OR any in-place edit applied via `./range repair`.
+    daemon_reload: true
+  become: true
+
+- name: Wait for daemon gRPC port {{ sliver_grpc_port }}
+  ansible.builtin.wait_for:
+    port: "{{ sliver_grpc_port }}"
+    host: 0.0.0.0
+    timeout: 90
+
+# ---------- Phase 3: operator config ----------
+- name: Ensure /opt/sliver-cfg exists
+  ansible.builtin.file:
+    path: /opt/sliver-cfg
+    state: directory
+    mode: "0700"
+  become: true
+
+# Pick the LHost we want baked into every cfg. Use the sliver VM's
+# private IP so a config dropped onto Kali (or any other operator box
+# on the same vnet) connects to the teamserver directly — `127.0.0.1`
+# only worked for the on-host sliver-client invocation, broke
+# remote use. Falls back to 127.0.0.1 when we don't have a private IP
+# (e.g. running this role outside terra-range's inventory).
+- name: Pick effective LHost for operator cfgs
+  ansible.builtin.set_fact:
+    sliver_cfg_lhost: "{{ terra_private_ip | default('127.0.0.1') }}"
+
+# Detect stale cfgs (old runs baked in `127.0.0.1`) and delete them so
+# the generate task fires again with the right LHost. The cfg is JSON;
+# the field name is `lhost` (lowercased by Sliver's JSON marshaller).
+- name: Probe existing operator cfgs for stale lhost
+  ansible.builtin.shell:
+    cmd: |
+      for f in /opt/sliver-cfg/*.cfg; do
+        [ -f "$f" ] || continue
+        # Print "<file>:<lhost>" so we can act on each one separately.
+        host=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('lhost', json.load(open(sys.argv[1])).get('LHost','')))" "$f" 2>/dev/null || echo "")
+        echo "$f:$host"
+      done
+  register: existing_cfgs
+  changed_when: false
+  failed_when: false
+  become: true
+
+- name: Delete cfgs with the wrong lhost (forces regen below)
+  ansible.builtin.file:
+    path: "{{ item.split(':')[0] }}"
+    state: absent
+  loop: "{{ existing_cfgs.stdout_lines | default([]) }}"
+  loop_control:
+    label: "{{ item.split(':')[0] | basename }}"
+  when:
+    - item.split(':') | length >= 2
+    - (item.split(':')[1] | default('')) != sliver_cfg_lhost
+    - (item.split(':')[1] | default('')) | length > 0
+  become: true
+
+- name: Generate operator config (idempotent — only if missing)
+  # `--permissions all` is REQUIRED in Sliver 1.7+. Earlier versions
+  # generated a config with implicit-all permissions; the new CLI exits
+  # silently with "Must specify --permissions" otherwise.
+  ansible.builtin.command:
+    cmd: >
+      /root/sliver-server operator
+        --name operator
+        --lhost {{ sliver_cfg_lhost }}
+        --lport {{ sliver_grpc_port }}
+        --permissions all
+        --save /opt/sliver-cfg/operator.cfg
+    creates: /opt/sliver-cfg/operator.cfg
+  become: true
+
+- name: Lock operator.cfg permissions
+  ansible.builtin.file:
+    path: /opt/sliver-cfg/operator.cfg
+    mode: "0600"
+  become: true
+
+# Generate a SECOND operator config for user "ian" (sliver auth is
+# cert-based; the .cfg file IS the credential, no password). The Kali
+# role auto-imports operator.cfg into ~/.sliver-client/configs/;
+# ian.cfg is kept here for operators who want to bring up a separate
+# named login for audit-trail purposes.
+- name: Generate sliver operator config for {{ terra_operator_ian_username }}
+  ansible.builtin.command:
+    cmd: >
+      /root/sliver-server operator
+        --name {{ terra_operator_ian_username }}
+        --lhost {{ sliver_cfg_lhost }}
+        --lport {{ sliver_grpc_port }}
+        --permissions all
+        --save /opt/sliver-cfg/{{ terra_operator_ian_username }}.cfg
+    creates: /opt/sliver-cfg/{{ terra_operator_ian_username }}.cfg
+  become: true
+
+- name: Lock {{ terra_operator_ian_username }}.cfg permissions
+  ansible.builtin.file:
+    path: "/opt/sliver-cfg/{{ terra_operator_ian_username }}.cfg"
+    mode: "0600"
+  become: true
+
+# ---------- Phase 4: listeners via sliver-client + RC file ----------
+- name: Probe which listener ports are already bound
+  ansible.builtin.shell:
+    cmd: "ss -lntp 2>/dev/null | grep -cE ':844[3-7][[:space:]]'"
+  register: bound_count
+  changed_when: false
+  failed_when: false
+  become: true
+
+# Write the RC script the client will execute. Each `https --lport N`
+# registers a listener that persists across daemon restarts (saved to
+# BoltDB). Earlier versions required an explicit `--persistent` flag;
+# that flag was removed in Sliver 1.7+ and persistence is now the
+# default behavior. The final `exit` is required or the client waits
+# for stdin forever.
+- name: Write sliver-client RC file with listener commands
+  ansible.builtin.copy:
+    dest: /opt/sliver-cfg/listeners.rc
+    mode: "0600"
+    content: |
+      https --lport 8443
+      https --lport 8444
+      https --lport 8445
+      https --lport 8446
+      https --lport 8447
+      jobs
+      exit
+  become: true
+  when: (bound_count.stdout | int) < 5
+
+- name: Drive sliver-client to create the 5 HTTPS listeners
+  # --import loads the operator.cfg; sliver-client then connects to the
+  # local daemon via gRPC and replays the RC script. `timeout 60`
+  # guards against the rare "client waits for terminal capabilities"
+  # hang when stdin isn't a TTY.
+  ansible.builtin.shell:
+    cmd: |
+      /root/sliver-client import /opt/sliver-cfg/operator.cfg >/dev/null 2>&1 || true
+      timeout 60 /root/sliver-client --rc /opt/sliver-cfg/listeners.rc 2>&1 | tail -40
+    executable: /bin/bash
+  register: listener_create
+  become: true
+  changed_when: true
+  failed_when: false
+  when: (bound_count.stdout | int) < 5
+
+- name: Verify each expected listener port is now listening
+  ansible.builtin.wait_for:
+    port: "{{ item }}"
+    host: 0.0.0.0
+    timeout: 30
+  loop: "{{ c2_listener_ports }}"
+
+# ---------- Phase 4b: DNS listener for the DoH C2 leg ----------
+# When terra_doh_listener is set (inventory hostvar, populated by the
+# generator from advanced_c2.dns_listeners.sliver), sliver-server runs
+# an extra listener — a DNS listener bound on UDP 5353 for the DoH
+# stealth domain. nginx + dnsdist on the assigned redirector unwrap
+# DoH POSTs from beacons (which ride AFD anycast) and forward the
+# raw DNS queries here. Beacons never connect directly: NSG allows
+# UDP 5353 only from the redirector subnet, and the C2 has no
+# public IP.
+#
+# Uses :5353 instead of :53 so systemd-resolved keeps owning 53 on
+# this debian host (avoids fighting the stub resolver and leaves
+# DNS-from-the-box working for normal apt/curl/etc.).
+
+- name: Probe whether sliver DNS listener is already bound on :5353/udp
+  ansible.builtin.shell:
+    cmd: "ss -lnup 2>/dev/null | grep -cE ':5353[[:space:]]'"
+  register: dns_bound
+  changed_when: false
+  failed_when: false
+  become: true
+  when: (terra_doh_listener | default('') | length) > 0
+
+- name: Write sliver-client RC file for the DNS listener
+  ansible.builtin.copy:
+    dest: /opt/sliver-cfg/dns-listener.rc
+    mode: "0600"
+    content: |
+      dns --domains {{ terra_doh_listener }} --lport 5353 --no-canaries
+      jobs
+      exit
+  become: true
+  when:
+    - (terra_doh_listener | default('') | length) > 0
+    - (dns_bound.stdout | default('0') | int) < 1
+
+- name: Drive sliver-client to register the DNS listener
+  # Same pattern as the HTTPS listener creation above — replays an RC
+  # script against the local daemon over gRPC. `timeout 60` guards
+  # against the TTY-cap stall when stdin isn't a terminal.
+  ansible.builtin.shell:
+    cmd: |
+      timeout 60 /root/sliver-client --rc /opt/sliver-cfg/dns-listener.rc 2>&1 | tail -20
+    executable: /bin/bash
+  register: dns_listener_create
+  become: true
+  changed_when: true
+  failed_when: false
+  when:
+    - (terra_doh_listener | default('') | length) > 0
+    - (dns_bound.stdout | default('0') | int) < 1
+
+- name: Verify sliver DNS listener is up on :5353/udp
+  ansible.builtin.shell:
+    cmd: "ss -lnup 2>/dev/null | grep -E ':5353[[:space:]]' || exit 1"
+  register: dns_listener_check
+  changed_when: false
+  retries: 5
+  delay: 2
+  until: dns_listener_check.rc == 0
+  become: true
+  when: (terra_doh_listener | default('') | length) > 0
+
+# ---------- Phase 4: diagnostics ----------
+- name: Always dump quick diagnostics
+  block:
+    - name: Diagnostic marker
+      ansible.builtin.debug:
+        msg: "Emitting diagnostic dump (always-run)"
+      changed_when: false
+  always:
+    - name: Snapshot listening ports
+      ansible.builtin.command: ss -lntp
+      register: ss_dump
+      changed_when: false
+      become: true
+    - name: Snapshot sliver journal
+      ansible.builtin.command: journalctl -u sliver --no-pager -n 40
+      register: sliver_journal
+      changed_when: false
+      failed_when: false
+      become: true
+    # List-form msg renders each entry on its own line; block-scalar
+    # `msg: |` collapses into one JSON-escaped string with "\n" literals.
+    - name: Report — listening ports
+      ansible.builtin.debug:
+        msg: "{{ ['---- sliver listening ports ----'] +
+                 (ss_dump.stdout_lines | select('search', ':(31337|844[3-7])') | list) }}"
+    - name: Report — sliver journal (last 40)
+      ansible.builtin.debug:
+        msg: "{{ ['---- sliver journal (last 40) ----'] +
+                 (sliver_journal.stdout_lines | default(['(empty)'])) }}"

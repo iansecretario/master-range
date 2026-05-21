@@ -1,0 +1,70 @@
+# Scenario: class
+# Purpose: 20-student red-team class. Each student gets a full estate
+#          (DC + members + workstations + linux + Kali + C2 + redirector).
+#          Shared hub runs Ghostwriter + SteppingStones + RedELK.
+# Cost   : ~$2-3k/mo (drop NAT after build by flipping lockdown=true)
+# Boxes  : 200 per-student + 3 shared
+
+range_name: class-2026q1
+provider: azure
+azure_region: eastus
+
+students:
+  count: 20
+  tenancy: shared
+  name_format: "s{n:02d}"
+
+lockdown: false
+guacamole_ingress_cidrs:
+  - "203.0.113.0/24"              # training facility
+  - "198.51.100.5/32"             # instructor home
+
+domain:
+  enabled: true
+  fqdn: corp.local
+  netbios: CORP
+  admin_user: rangeadmin
+  admin_password: "Cl4ssr00m!Adm1n"
+  safemode_password: "Cl4ssr00m!SafeM0de"
+
+default_credentials:
+  windows_local_admin: rangeadmin
+  windows_local_password: "Cl4ssr00m!Local"
+  linux_user: ranger
+  linux_password: "Cl4ssr00m!Linux"
+
+machines:
+  - { name: dc01,    role: windows-dc,          os: windows-server-2022, size: medium, static_ip: "10" }
+  - { name: srv01,   role: windows-member,      os: windows-server-2019, size: small,  domain_join: true }
+  - { name: srv02,   role: windows-member,      os: windows-server-2025, size: small,  domain_join: true }
+  - { name: ws01,    role: windows-workstation, os: windows-11,          size: small,  domain_join: true }
+  - { name: ws02,    role: windows-workstation, os: windows-10,          size: small,  domain_join: true }
+  - { name: linux01, role: linux-target,        os: ubuntu-22,           size: small }
+  - { name: linux02, role: linux-target,        os: debian-12,           size: small }
+  - { name: kali01,  role: attacker,            os: kali,                size: medium }
+  - { name: c2,      role: c2-server,           os: debian-12,           size: medium }
+  - { name: redir,   role: c2-redirector, fronts: c2-server,       os: debian-12,           size: small }
+
+shared_infrastructure:
+  - { name: ghostwriter,     role: ghostwriter,     os: debian-12, size: medium }
+  - { name: stepping-stones, role: stepping-stones, os: debian-12, size: medium }
+  - { name: redelk,          role: redelk,          os: debian-12, size: large }
+
+services:
+  guacamole:
+    enabled: true
+    admin_user: guacadmin
+    admin_password: "Cl4ssr00m!Guac"
+    autoregister: true
+    student_user_prefix: student-
+    student_password_template: "Student!{n:02d}"
+  elk:
+    enabled: true
+    kibana_user: elastic
+    kibana_password: "Cl4ssr00m!Elastic"
+    deploy_agents: true
+  adaptix:
+    enabled: true
+    ssh_pubkey: "ssh-ed25519 AAAA... instructor@class"
+  redirector:
+    enabled: true
