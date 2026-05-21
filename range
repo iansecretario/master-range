@@ -4178,7 +4178,78 @@ for h in d.get('guacamole', {}).get('hosts', []):
     # Opt-out: --no-ssh-heal flag below skips this. Useful if the
     # operator has already verified SSH works and wants to save the
     # ~1-2 min, or if `az` CLI isn't installed locally.
-    if [[ "${skip_ssh_heal:-0}" -ne 1 ]] && command -v az >/dev/null 2>&1; then
+    # Provider dispatch: Azure uses `az vm run-command invoke`. GCP uses
+    # `gcloud compute instances add-metadata ssh-keys=...` (which Google's
+    # OS Login + Compute Engine handle out-of-band, no SSH needed).
+    # Both paths achieve the same end state: operator pubkey present in
+    # each VM's ssh_authorized_keys, independent of the SSH-during-boot
+    # race condition. AWS path is not yet wired.
+    if [[ "${skip_ssh_heal:-0}" -ne 1 ]] && [[ "$PROVIDER" == "gcp" ]] && command -v gcloud >/dev/null 2>&1; then
+      bold "  [ssh-heal/gcp] planting operator pubkey on every Linux VM via gcloud metadata add ..."
+      ssh_pubkey_path="$ssh_key.pub"
+      if [[ ! -f "$ssh_pubkey_path" ]]; then
+        warn "  [ssh-heal/gcp] no .pub at $ssh_pubkey_path — skipping heal pass"
+      else
+        pubkey_content=$(awk '{print $1" "$2}' "$ssh_pubkey_path")
+        # Walk terraform state for google_compute_instance.linux entries.
+        gcp_linux_vms_json=$(python3 - <<'PY'
+import json, subprocess
+r = subprocess.run(['terraform', 'show', '-json'], capture_output=True, text=True, check=False)
+try:
+    state = json.loads(r.stdout)
+except Exception:
+    print('[]'); raise SystemExit(0)
+out = []
+def walk(node):
+    if not isinstance(node, dict): return
+    for res in node.get('resources', []) or []:
+        if res.get('type') == 'google_compute_instance':
+            v = res.get('values') or {}
+            name = v.get('name', '')
+            zone = v.get('zone', '')
+            project = v.get('project', '')
+            # Skip Windows instances — different metadata key.
+            # Heuristic: GCP doesn't expose os in the resource; check name.
+            # The vms.tf module's split into .linux/.windows means only
+            # the .linux name pattern lands here in practice.
+            if 'guac' in name.lower():
+                continue
+            if not name or not zone or not project:
+                continue
+            out.append({'name': name, 'zone': zone, 'project': project})
+    for c in node.get('child_modules', []) or []:
+        walk(c)
+walk((state.get('values') or {}).get('root_module') or {})
+print(json.dumps(out))
+PY
+)
+        # For each Linux VM, `gcloud compute instances add-metadata
+        # ssh-keys=<user>:<key>`. Idempotent — re-running with the same
+        # key value is a no-op.
+        echo "$gcp_linux_vms_json" | python3 -c "
+import json, sys
+for vm in json.load(sys.stdin):
+    print(f'{vm[\"name\"]}\t{vm[\"zone\"]}\t{vm[\"project\"]}')
+" | while IFS=$'\t' read -r vm zone project; do
+          [[ -z "$vm" ]] && continue
+          (
+            # Build the new ssh-keys metadata. Format: "user:ssh-rsa AAAA...".
+            # We use 'ranger' as the default Linux user (mirrors Azure).
+            new_key="ranger:${pubkey_content}"
+            if gcloud compute instances add-metadata "$vm" \
+                 --zone="$zone" --project="$project" \
+                 --metadata="ssh-keys=${new_key}" >/dev/null 2>&1; then
+              echo "    ✓ $vm: metadata updated"
+            else
+              echo "    ! $vm: add-metadata failed (check IAM / disabled-OS-Login)"
+            fi
+          ) &
+          while [[ $(jobs -r | wc -l) -ge 6 ]]; do sleep 1; done
+        done
+        wait
+        bold "  [ssh-heal/gcp] done."
+      fi
+    elif [[ "${skip_ssh_heal:-0}" -ne 1 ]] && [[ "$PROVIDER" == "azure" ]] && command -v az >/dev/null 2>&1; then
       bold "  [ssh-heal] planting operator pubkey on every Linux VM (~5-10s each, idempotent) ..."
       ssh_pubkey_path="$ssh_key.pub"
       if [[ ! -f "$ssh_pubkey_path" ]]; then
@@ -4624,6 +4695,81 @@ for v in vms:
       server-2025|win-server-2025|server-2022|win-server-2022|server-2019|win-server-2019|win-10|win10|win-11|win11|kali|kali-minimal|elk|redelk|debian-redirector|redirector|guacamole|guac|adaptix|mythic|sliver|ghostwriter|stepping-stones|stepping_stones|all) ;;
       *) die "unknown bake target: $target (supported: server-2025, server-2022, server-2019, win-10, win-11, kali, kali-minimal, elk, redelk, debian-redirector, guacamole, adaptix, mythic, sliver, ghostwriter, stepping-stones, all)" ;;
     esac
+
+    # ----- Provider dispatch for the bake subcommand -----
+    # GCP path: use `packer build <image>.gcp.pkr.hcl`, no SIG-slot
+    # bootstrap (GCP images are flat in projects/<host>/global/images).
+    # Bail early with a GCP-specific code path; Azure logic continues
+    # below as before.
+    if [[ "$PROVIDER" == "gcp" ]]; then
+      command -v gcloud >/dev/null 2>&1 || die "gcloud not on PATH — install Google Cloud SDK + 'gcloud auth application-default login' before baking GCP images"
+      command -v packer >/dev/null 2>&1 || die "packer not installed — brew install packer / https://developer.hashicorp.com/packer/install"
+
+      host_project="${TERRARANGE_GCP_HOST_PROJECT_ID:-}"
+      [[ -n "$host_project" ]] || die "TERRARANGE_GCP_HOST_PROJECT_ID env var not set — baked images need a long-lived host project (see docs/GCP_PARITY_ROADMAP.md)"
+      gcp_region="${TERRARANGE_GCP_REGION:-asia-southeast1}"
+
+      # Resolve target → (template dir, image family) pair. Mirror of
+      # the Azure dispatch below but routes to the .gcp.pkr.hcl files.
+      case "$target" in
+        server-2022|win-server-2022)    pkr_dir="win-server-2022";   pkr_file="win-server-2022-ad.gcp.pkr.hcl";   img_family="win-server-2022-ad" ;;
+        server-2025|win-server-2025)    pkr_dir="win-server-2025";   pkr_file="win-server-2025.gcp.pkr.hcl";      img_family="win-server-2025" ;;
+        server-2019|win-server-2019)    pkr_dir="win-server-2019";   pkr_file="win-server-2019.gcp.pkr.hcl";      img_family="win-server-2019" ;;
+        win-10|win10)                   pkr_dir="win-10";            pkr_file="win-10.gcp.pkr.hcl";               img_family="win-10" ;;
+        win-11|win11)                   pkr_dir="win-11";            pkr_file="win-11.gcp.pkr.hcl";               img_family="win-11" ;;
+        kali)                           pkr_dir="kali";              pkr_file="kali-redteam.gcp.pkr.hcl";         img_family="kali-redteam" ;;
+        kali-minimal)                   pkr_dir="kali-minimal";      pkr_file="kali-minimal.gcp.pkr.hcl";         img_family="kali-minimal" ;;
+        elk)                            pkr_dir="elk";               pkr_file="elk.gcp.pkr.hcl";                  img_family="elk" ;;
+        redelk)                         pkr_dir="redelk";            pkr_file="redelk.gcp.pkr.hcl";               img_family="redelk" ;;
+        debian-redirector|redirector)   pkr_dir="debian-redirector"; pkr_file="debian-redirector.gcp.pkr.hcl";    img_family="debian-redirector" ;;
+        guacamole|guac)                 pkr_dir="guacamole";         pkr_file="guacamole.gcp.pkr.hcl";            img_family="guacamole" ;;
+        adaptix)                        pkr_dir="adaptix";           pkr_file="adaptix.gcp.pkr.hcl";              img_family="adaptix" ;;
+        mythic)                         pkr_dir="mythic";            pkr_file="mythic.gcp.pkr.hcl";               img_family="mythic" ;;
+        sliver)                         pkr_dir="sliver";            pkr_file="sliver.gcp.pkr.hcl";               img_family="sliver" ;;
+        ghostwriter)                    pkr_dir="ghostwriter";       pkr_file="ghostwriter.gcp.pkr.hcl";          img_family="ghostwriter" ;;
+        stepping-stones|stepping_stones) pkr_dir="stepping-stones";  pkr_file="stepping-stones.gcp.pkr.hcl";      img_family="stepping-stones" ;;
+        all)                            die "[bake] 'all' on GCP not yet wired — bake one target at a time" ;;
+        *)                              die "[bake] unknown GCP target: $target" ;;
+      esac
+
+      pkr_path="$REPO/packer/$pkr_dir"
+      [[ -f "$pkr_path/$pkr_file" ]] || die "[bake] template not found: $pkr_path/$pkr_file"
+
+      bold "  [bake/gcp] target=$target  host_project=$host_project  region=$gcp_region"
+      bold "  [bake/gcp] family=$img_family  template=$pkr_path/$pkr_file"
+      echo
+
+      # Probe whether the image family already has a non-deprecated image.
+      # Informational only; we always bake (deprecating older versions
+      # at end of bake is handled by Packer's googlecompute builder).
+      latest=$(gcloud compute images describe-from-family "$img_family" \
+        --project="$host_project" --format='value(name)' 2>/dev/null || true)
+      if [[ -n "$latest" ]]; then
+        bold "  [bake/gcp] existing latest in family: $latest"
+        bold "  [bake/gcp]   (Packer will publish a NEW version + deprecate this one)"
+      else
+        bold "  [bake/gcp] family '$img_family' has no images yet — first bake"
+      fi
+      echo
+
+      version="$(date +%Y%m%d-%H%M%S)"
+      bold "  [bake/gcp] packer init ..."
+      packer init "$pkr_path/$pkr_file" || die "packer init failed"
+
+      bold "  [bake/gcp] packer build (~20-45 min depending on target) ..."
+      packer build -force \
+        -var "gcp_project_id=$host_project" \
+        -var "gcp_region=$gcp_region" \
+        -var "image_family=$img_family" \
+        -var "image_version=$version" \
+        "$pkr_path/$pkr_file" \
+        || die "packer build failed for $target"
+
+      bold ""
+      bold "[bake/gcp] complete — new image published to family '$img_family' in project '$host_project'"
+      bold "  Next: flip use_baked_$target → true in the baking: block of your scenario YAML, then ./range --provider gcp apply <scenario>"
+      exit 0
+    fi
 
     sub_id=$(az account show --query id -o tsv)
     [[ -n "$sub_id" ]] || die "az account show failed — run 'az login' first"

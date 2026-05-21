@@ -188,17 +188,277 @@ def query_network_quotas(region: str) -> dict[str, tuple[str, int, int]]:
 # Main
 # -----------------------------------------------------------------------------
 
+# ============================================================================
+# GCP pricing + quota check
+# ============================================================================
+# Rough USD/month estimates for asia-southeast1, on-demand. Sustained-use
+# discount (auto-applied by GCP for >25%-of-month usage) is NOT factored
+# in — actual bills are typically 5-30% lower than these numbers.
+# Windows VMs carry a per-vCPU license premium (~$0.046/vCPU-hour for
+# 2 vCPU+) bundled into the price below.
+GCP_MACHINE_PRICE_USD_MO = {
+    "e2-small":       8,    # 2 vCPU / 2  GB — bursty
+    "e2-medium":      24,   # 2 vCPU / 4  GB
+    "e2-standard-2":  48,   # 2 vCPU / 8  GB
+    "e2-standard-4":  98,   # 4 vCPU / 16 GB — default workhorse
+    "e2-standard-8":  196,  # 8 vCPU / 32 GB
+    "n2-standard-2":  70,   # 2 vCPU / 8  GB — for AD targets
+    "n2-standard-4":  140,  # 4 vCPU / 16 GB — DC/members
+    "n2-standard-8":  280,  # 8 vCPU / 32 GB — fast windows / large
+}
+# Windows VMs on GCP carry an additional ~$25-50/mo per vCPU. Approximate.
+GCP_WINDOWS_LICENSE_ADD = {
+    "n2-standard-2": 45,
+    "n2-standard-4": 90,
+    "n2-standard-8": 180,
+    "e2-medium":     22,
+    "e2-standard-4": 90,
+}
+GCP_MACHINE_CORES = {
+    "e2-small": 2, "e2-medium": 2, "e2-standard-2": 2,
+    "e2-standard-4": 4, "e2-standard-8": 8,
+    "n2-standard-2": 2, "n2-standard-4": 4, "n2-standard-8": 8,
+}
+# GCP machine_type → quota family (matches `gcloud compute project-info
+# describe` metric names). E2 + N2 share the "CPUS" regional quota.
+GCP_REGIONAL_QUOTAS = {
+    "CPUS":                  "all vCPU (regional)",
+    "IN_USE_ADDRESSES":      "Static public IPs",
+    "STATIC_ADDRESSES":      "Reserved public IPs",
+    "NETWORKS":              "VPCs",
+    "FIREWALLS":             "Firewall rules per VPC",
+    "SUBNETWORKS":           "Subnets",
+}
+
+GCP_SIZE_MAP = {
+    "small":  "e2-small",
+    "medium": "e2-standard-4",
+    "large":  "e2-standard-8",
+}
+
+GCP_SPOT_PINNED_ROLES = {"windows-dc", "c2-redirector"}
+
+
+def _gcp_vm_size(m: dict) -> str:
+    """Replicate modules/gcp/images.tf:local.vm_size logic."""
+    role = m["role"]
+    if role == "windows-dc":
+        return "n2-standard-4"   # ignoring fast_windows for simplicity
+    if role in ("windows-member", "windows-workstation", "windows-blank", "windows-analyst"):
+        return "n2-standard-4"
+    if role == "linux-target":
+        return "n2-standard-2"
+    return GCP_SIZE_MAP[m["size"]]
+
+
+def _gcp_is_windows(m: dict) -> bool:
+    return m.get("os", "").startswith("windows")
+
+
+def _main_gcp(cfg: dict, tfvars_path: Path) -> int:
+    machines = cfg.get("machines", [])
+    shared   = cfg.get("shared_machines", [])
+    region   = cfg.get("gcp_region") or cfg.get("azure_region", "asia-southeast1")
+    project  = cfg.get("gcp_project_id", "")
+    create_project = cfg.get("gcp_create_project", True)
+    lockdown = cfg.get("lockdown", False)
+    range_name = cfg.get("range_name", "<unknown>")
+    services = cfg.get("services", {})
+    advanced_c2 = cfg.get("advanced_c2", {}).get("enabled", False)
+    vm_priority = cfg.get("vm_priority", "Regular")
+    spot_multiplier = 0.30 if vm_priority == "Spot" else 1.0
+    # GCP Spot is typically 60-91% off — we use 70% off as conservative.
+
+    # ---- bucket VMs by machine_type ---------------------------------------
+    type_count = defaultdict(int)
+    type_count_spot = defaultdict(int)
+    type_count_pinned = defaultdict(int)
+    type_is_windows = {}
+    total_cores = 0
+
+    def add(mt: str, is_win: bool, eligible_for_spot: bool) -> None:
+        nonlocal total_cores
+        type_count[mt] += 1
+        type_is_windows[mt] = type_is_windows.get(mt, False) or is_win
+        total_cores += GCP_MACHINE_CORES.get(mt, 2)
+        if vm_priority == "Spot":
+            if eligible_for_spot:
+                type_count_spot[mt] += 1
+            else:
+                type_count_pinned[mt] += 1
+
+    for m in machines:
+        mt = _gcp_vm_size(m)
+        add(mt, _gcp_is_windows(m),
+            eligible_for_spot=m["role"] not in GCP_SPOT_PINNED_ROLES)
+    for s in shared:
+        mt = GCP_SIZE_MAP[s["size"]]
+        add(mt, False, eligible_for_spot=True)
+
+    # Hub services — same sizing as Azure side
+    if services.get("guacamole", {}).get("enabled"):
+        add("e2-medium", False, eligible_for_spot=True)
+    if services.get("elk", {}).get("enabled"):
+        add("e2-standard-4", False, eligible_for_spot=True)
+
+    # ---- compute cost -----------------------------------------------------
+    def vm_cost(mt: str, count: int, with_spot: bool) -> int:
+        base = GCP_MACHINE_PRICE_USD_MO.get(mt, 100)
+        if type_is_windows.get(mt):
+            base += GCP_WINDOWS_LICENSE_ADD.get(mt, 0)
+        if with_spot:
+            base = base * spot_multiplier
+        return round(base * count)
+
+    vm_total = 0
+    for mt, count in type_count.items():
+        if vm_priority == "Spot":
+            sp = type_count_spot.get(mt, 0)
+            pn = type_count_pinned.get(mt, 0)
+            vm_total += vm_cost(mt, sp, with_spot=True)
+            vm_total += vm_cost(mt, pn, with_spot=False)
+        else:
+            vm_total += vm_cost(mt, count, with_spot=False)
+
+    # ---- non-VM costs -----------------------------------------------------
+    n_disks = len(machines) + len(shared) + (1 if services.get("elk", {}).get("enabled") else 0) + (1 if services.get("guacamole", {}).get("enabled") else 0)
+    disk_cost = n_disks * 5  # pd-balanced ~$5/mo for 64-200GB
+
+    n_pip = 0
+    if services.get("guacamole", {}).get("enabled"):
+        n_pip += 1
+    n_pip += sum(1 for s in shared if s.get("public_ip", True))
+    if advanced_c2:
+        n_pip += 1  # single global anycast IP for the LB (cheaper than Azure AFD's per-endpoint)
+    pip_cost = n_pip * 3  # GCP static external IP ~$3-4/mo when in use
+
+    nat_cost = 0 if lockdown else 15  # Cloud NAT ~$15/mo for the gateway + ~$0.045/GB processed
+    cdn_cost = 25 if advanced_c2 else 0  # External HTTPS LB + Cloud CDN; rough
+
+    total = vm_total + disk_cost + pip_cost + nat_cost + cdn_cost
+
+    # ---- report -----------------------------------------------------------
+    print(f"Range: {range_name}   provider: GCP   region: {region}")
+    print(f"Project: {project or '(auto-derived at apply time)'}   create_project: {create_project}")
+    print()
+    pinned_total = sum(type_count_pinned.values())
+    spot_total = sum(type_count_spot.values())
+    if vm_priority == "Spot":
+        header = (f"VMs by machine_type ({sum(type_count.values())} total — "
+                  f"{spot_total} Spot, {pinned_total} pinned to Regular [DC + redirectors])")
+    else:
+        header = f"VMs by machine_type ({sum(type_count.values())} total)"
+    print(header)
+    for mt, count in sorted(type_count.items()):
+        win_tag = "  (Win+license)" if type_is_windows.get(mt) else ""
+        if vm_priority == "Spot":
+            sp = type_count_spot.get(mt, 0)
+            pn = type_count_pinned.get(mt, 0)
+            price = vm_cost(mt, sp, True) + vm_cost(mt, pn, False)
+            print(f"  {mt:18s}  count={count:<3d}  ~${price}/mo  (Spot×{sp}+Reg×{pn}){win_tag}")
+        else:
+            price = vm_cost(mt, count, False)
+            print(f"  {mt:18s}  count={count:<3d}  ~${price}/mo{win_tag}")
+    print()
+    print(f"Cost estimate (rough on-demand, USD/month — sustained-use discount NOT factored):")
+    print(f"  VMs               ${vm_total:>5}")
+    print(f"  Disks ({n_disks:<2d})       ${disk_cost:>5}")
+    print(f"  Public IPs ({n_pip:<2d}) ${pip_cost:>5}")
+    print(f"  Cloud NAT         ${nat_cost:>5}  ({'lockdown=true → no NAT' if lockdown else 'lockdown=false'})")
+    print(f"  Cloud CDN+LB      ${cdn_cost:>5}  ({'enabled' if advanced_c2 else 'disabled'})")
+    print(f"  ----- ")
+    print(f"  TOTAL          ~${total:>4}/mo")
+    print()
+    print("  (List price; sustained-use auto-discount typically saves 5-30%.")
+    print("   Run `gcloud beta billing` for actual billed amounts.)")
+    print()
+
+    # ---- quota probe via gcloud ------------------------------------------
+    print(f"GCP regional quota check (region: {region})")
+    if not shutil.which("gcloud"):
+        print("  [?] gcloud not on PATH — quota check skipped")
+        return 0
+    if not project:
+        print("  [?] no project ID yet (auto-derived at terraform apply time)")
+        print("  [?]   Re-run quota-cost.py AFTER terraform apply to use the live project.")
+        return 0
+
+    try:
+        proc = subprocess.run(
+            ["gcloud", "compute", "regions", "describe", region,
+             "--project=" + project, "--format=json"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if proc.returncode != 0:
+            err = (proc.stderr or "").strip()[:200]
+            print(f"  [?] gcloud describe failed: {err}")
+            return 0
+        region_data = json.loads(proc.stdout or "{}")
+        quotas = {q["metric"]: q for q in region_data.get("quotas", [])}
+    except (subprocess.SubprocessError, json.JSONDecodeError, KeyError) as e:
+        print(f"  [?] quota lookup failed: {e}")
+        return 0
+
+    needed = {
+        "CPUS":             total_cores,
+        "IN_USE_ADDRESSES": n_pip,
+        "FIREWALLS":        max(10, len(machines) // 2),  # conservative — see modules/gcp/firewall.tf
+        "SUBNETWORKS":      max(3, len({m.get("student_id", "") for m in machines})),
+    }
+    over_quota = False
+    for metric, want in needed.items():
+        q = quotas.get(metric)
+        if not q:
+            print(f"  [?] {metric}: not found in regional quota list")
+            continue
+        used = q.get("usage", 0)
+        limit = q.get("limit", 0)
+        available = limit - used
+        projected = used + want
+        pct = (projected / limit) if limit else 1.0
+        bar = f"{projected:.0f}/{limit:.0f} ({pct:.0%} projected)"
+        if available >= want:
+            print(f"  [+] {metric}: need {want}, available {available:.0f}  {bar}")
+        else:
+            shortfall = want - available
+            print(f"  [!] {metric}: NEED {want}, AVAILABLE {available:.0f}  {bar} — short by {shortfall:.0f}")
+            over_quota = True
+
+    if over_quota:
+        print()
+        print("  Auto-request via `gcloud alpha services quota update` is NOT yet wired.")
+        print("  Request increases via: https://console.cloud.google.com/iam-admin/quotas")
+        print("  Filter by service = 'Compute Engine API' and the metric above.")
+        return 2
+    return 0
+
+
 def main() -> int:
-    tfvars_path = Path(
-        sys.argv[1] if len(sys.argv) > 1
-        else "envs/azure/terraform.tfvars.json"
-    )
+    # Provider auto-detect: if envs/gcp/terraform.tfvars.json exists AND
+    # is newer than envs/azure/, use it. Operator can override with the
+    # positional arg pointing at a specific tfvars file.
+    if len(sys.argv) > 1:
+        tfvars_path = Path(sys.argv[1])
+    else:
+        az_p = Path("envs/azure/terraform.tfvars.json")
+        gcp_p = Path("envs/gcp/terraform.tfvars.json")
+        if gcp_p.exists() and (not az_p.exists() or gcp_p.stat().st_mtime > az_p.stat().st_mtime):
+            tfvars_path = gcp_p
+        else:
+            tfvars_path = az_p
+
     if not tfvars_path.exists():
         print(f"ERROR: {tfvars_path} not found. "
               f"Run `./range gen <scenario>` first.", file=sys.stderr)
         return 1
 
     cfg = json.loads(tfvars_path.read_text())
+    # Detect provider from tfvars shape: GCP variants have gcp_project_id,
+    # Azure variants don't. AWS not yet wired into this script.
+    is_gcp = "gcp_project_id" in cfg
+    if is_gcp:
+        return _main_gcp(cfg, tfvars_path)
+    # Falls through to the Azure pricing path below.
     machines = cfg.get("machines", [])
     shared   = cfg.get("shared_machines", [])
     region   = cfg.get("azure_region", "eastus")

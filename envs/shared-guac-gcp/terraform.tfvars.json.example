@@ -1,0 +1,29 @@
+{
+  "_comment_": "Doc-only example. Copy to terraform.tfvars.json and fill in the placeholders. NEVER commit the real terraform.tfvars.json (contains the admin_password fallback default + a real billing-account id).",
+
+  "cohort_name": "shared-guac",
+
+  "gcp_create_project": true,
+  "gcp_billing_account": "XXXXXX-XXXXXX-XXXXXX",
+  "gcp_parent_folder_id": "0123456789",
+
+  "gcp_region": "asia-southeast1",
+  "vm_size": "e2-standard-4",
+
+  "guacamole_admin_user": "guacadmin",
+  "guacamole_admin_password": "",
+  "login_title": "Guidem CWR — Shared Range Portal",
+
+  "guacamole_ingress_cidrs": ["0.0.0.0/0"],
+
+  "acme_email": "you@example.com",
+  "custom_hostname": "guac",
+  "dns_zone_name": "cyberwarrange.com",
+  "dns_zone_project_id": "cwr-host-project",
+
+  "vnet_cidr": "10.250.0.0/22",
+  "subnet_cidr": "10.250.0.0/24",
+  "static_ip": "10.250.0.20",
+
+  "operator_ssh_pubkey": ""
+}
