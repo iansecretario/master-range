@@ -30,15 +30,40 @@ personas/                   Themed lab scripts for linux-target + windows-member
   splunk-server.sh            Splunk Enterprise indexer + HEC + receivers
   splunk-uf.ps1               Splunk Universal Forwarder + Sysmon (Windows)
 modules/
-  azure/                    Full Azure implementation (priority)
+  azure/                    Full Azure implementation (production)
   aws/                      Stub — see modules/aws/README.md
+  gcp/                      Full GCP implementation (Phase A+B+C complete)
 envs/
-  azure/main.tf             `terraform init && apply` here
+  azure/main.tf             Azure — `terraform init && apply` here
   aws/                      Generated tfvars only; module pending
-range                       One-command CLI wrapper (./range list, apply, lock, ...)
+  gcp/main.tf               GCP — `terraform init && apply` here (see docs/QUICKSTART_GCP.md)
+  shared-guac-azure/        Cohort-shared Guacamole portal on Azure
+  shared-guac-gcp/          Cohort-shared Guacamole portal on GCP
+range                       One-command CLI wrapper — supports --provider azure|aws|gcp
 LUDUS-COVERAGE.md           Mapping of Ludus environment guides to our scenarios
 REVIEW.md                   In-depth audit + outstanding issues
+docs/
+  GCP_PARITY_ROADMAP.md     Azure→GCP construct mapping + phased plan (~64 KB)
+  QUICKSTART_GCP.md         Operator-facing GCP deploy guide
 ```
+
+## Provider selection
+
+Choose the cloud per command with `--provider`:
+
+```bash
+./range --provider azure apply redteam-lab   # default — full feature set
+./range --provider gcp   apply redteam-lab   # ~32% cheaper at list price, see docs/QUICKSTART_GCP.md
+./range --provider aws   gen   redteam-lab   # tfvars only; module pending
+```
+
+Or set `TERRA_PROVIDER` once in your shell rc for stickiness:
+```bash
+export TERRA_PROVIDER=gcp
+./range apply redteam-lab     # no flag needed
+```
+
+The short forms `--azure`, `--gcp`, `--aws` also work.
 
 ## How it works
 

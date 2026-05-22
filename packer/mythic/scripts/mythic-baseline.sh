@@ -109,6 +109,79 @@ curl -fsSL "https://artifacts.elastic.co/downloads/beats/filebeat/filebeat-${FIL
     && rm -f /tmp/filebeat.deb \
     || echo "  (filebeat install failed — deploy-time will retry)"
 
+# =============================================================================
+# Pre-install Mythic's extra payload types + C2 profiles at bake time.
+# =============================================================================
+# WHY: the mythic ansible role installs 5 services on every deploy via
+# `mythic-cli install github <url>` (see roles/mythic/defaults/main.yml).
+# Each `install` does a git clone + docker build of a per-service container
+# image, taking 2-10 min depending on the service. With 5 services, that's
+# 10-50 min of slow async work the role had to do on every deploy.
+#
+# Baking those installs here means /opt/mythic/InstalledServices/<name>
+# exists in the published SIG image, the per-service docker images are
+# pre-built in the local docker cache, and the role's
+# `stat /opt/mythic/InstalledServices/<name>` probe returns exists →
+# skips the install loop entirely. Cuts mythic deploy time by ~30-45 min.
+#
+# Constraint: `mythic-cli install` requires the mythic stack to be RUNNING
+# (it POSTs to the Hasura GraphQL admin endpoint). We start the stack,
+# install, then stop it. ~5-10 min of extra bake time for a much bigger
+# deploy-time saving.
+#
+# The list below MUST stay in sync with mythic_extra_services in
+# modules/azure/ansible/roles/mythic/defaults/main.yml. Update both when
+# adding a new payload/profile.
+MYTHIC_EXTRAS="\
+apfell    https://github.com/MythicAgents/apfell
+apollo    https://github.com/MythicAgents/apollo
+poseidon  https://github.com/MythicAgents/poseidon
+http      https://github.com/MythicC2Profiles/http
+websocket https://github.com/MythicC2Profiles/websocket"
+
+echo "[mythic-bake] starting mythic stack so we can mythic-cli install the 5 extras ..."
+cd /opt/mythic
+if ! ./mythic-cli start 2>&1 | tail -20; then
+    echo "  WARN: mythic-cli start failed at bake time — skipping extras install."
+    echo "  WARN: deploy-time mythic role will install them (adds ~30-45 min per deploy)."
+else
+    # Mythic services typically need 60-120 sec after `start` for the
+    # Hasura endpoint to be reachable. Poll the GraphQL endpoint until it
+    # responds with a 401 (unauthenticated GET — means it's UP), or give
+    # up after 5 min.
+    echo "[mythic-bake] waiting for mythic_graphql to come up (max 5 min) ..."
+    for i in $(seq 1 60); do
+        # Hasura's GraphQL endpoint returns 200 for OPTIONS or 401/200
+        # for unauthenticated GET. Either is "up".
+        if curl -sSf -o /dev/null --max-time 3 http://127.0.0.1:8080/ 2>/dev/null \
+           || curl -sS  -o /dev/null --max-time 3 http://127.0.0.1:8080/ 2>/dev/null | head -1 | grep -qE '40[0-9]|200'; then
+            echo "  [mythic-bake]   graphql reachable on attempt $i"
+            break
+        fi
+        sleep 5
+        [ "$i" -eq 60 ] && echo "  WARN: graphql never came up; extras may fail"
+    done
+
+    echo "[mythic-bake] installing extra payloads + C2 profiles ..."
+    echo "$MYTHIC_EXTRAS" | while read -r name url; do
+        [ -z "$name" ] && continue
+        echo "  → mythic-cli install github $url  (~2-10 min)"
+        if ./mythic-cli install github "$url" 2>&1 | tail -5; then
+            if [ -d "/opt/mythic/InstalledServices/$name" ]; then
+                echo "    ✓ /opt/mythic/InstalledServices/$name exists"
+            else
+                echo "    ! install reported success but dir missing — deploy-time role will retry"
+            fi
+        else
+            echo "    ! install failed for $name — deploy-time role will retry"
+        fi
+    done
+
+    echo "[mythic-bake] stopping mythic stack (so the baked image isn't running services) ..."
+    ./mythic-cli stop 2>&1 | tail -5 || true
+fi
+echo
+
 # Marker so deploy-time c2-mythic.sh can detect baked image + skip
 # Docker install / Go install / git clone / make.
 echo "$HEAD" > /opt/mythic/.baked

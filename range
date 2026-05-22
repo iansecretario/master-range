@@ -4871,8 +4871,27 @@ PY
     # azurerm_shared_image `name` in modules/azure/baking.tf so terraform
     # reads it back.
     _bake_one() {
+      # $1 = template subdir name (e.g. "win-server-2025", "kali")
+      # $2 = image_definition name AND base filename of the Azure template
+      #      (e.g. "win-server-2025", "kali-redteam") — they happen to be
+      #      the same except for the kali/win-server-2022 cases handled
+      #      by the dispatch case above.
+      #
+      # CRITICAL: pass the SPECIFIC .pkr.hcl file (not the directory) to
+      # packer init/build. Reason: when the GCP Phase B port landed, each
+      # template directory now contains BOTH `<base>.pkr.hcl` (Azure) AND
+      # `<base>.gcp.pkr.hcl` (GCP). Packer parses every `*.pkr.hcl` in a
+      # directory by default and emits "Duplicate variable" errors
+      # because both files declare `variable "vm_size"`, `image_version`,
+      # etc. Pointing at the SPECIFIC file restricts the parse to just
+      # the Azure template. The GCP bake branch (above) similarly passes
+      # only its `.gcp.pkr.hcl` filename. The .gcp variant doesn't break
+      # `packer init <file>` of the Azure variant because packer is
+      # explicitly told which file to parse.
+      local pkr_file="$1/$2.pkr.hcl"
+      [[ -f "$pkr_file" ]] || die "Azure packer template not found: $pkr_file (cwd=$PWD)"
       bold "  → packer init + build: $2  (~30-40 min)..."
-      packer init "$1" || die "packer init failed for $2"
+      packer init "$pkr_file" || die "packer init failed for $2"
       # -force: auto-delete stale temp managed image / VHD from a
       # previous run that failed mid-flight (e.g. SIG slot missing,
       # interrupted packer, transient Azure error). Without -force,
@@ -4888,7 +4907,7 @@ PY
         -var "sig_name=terra_range_images" \
         -var "image_definition=$2" \
         -var "image_version=$version" \
-        "$1" || die "packer build failed for $2"
+        "$pkr_file" || die "packer build failed for $2"
     }
 
     # Template-subdir → image-definition mapping. Each `_bake_one <dir>

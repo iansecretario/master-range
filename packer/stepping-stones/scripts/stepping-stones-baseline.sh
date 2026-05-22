@@ -1,17 +1,41 @@
 #!/bin/sh
 # Bake-time baseline for the Stepping Stones (Cyberveiligheid) image.
 #
-# Mirrors the structure of packer/mythic/scripts/mythic-baseline.sh: install
-# Docker + compose plugin + supporting tooling, clone the upstream repo,
-# pre-pull every container image referenced by the project's
-# docker-compose.yml, and drop a /opt/stepping-stones/.baked marker so the
-# Ansible role can short-circuit the slow install at deploy time.
+# Stepping-Stones is a Django + gunicorn + nginx + sqlite app (NOT a
+# docker-compose stack despite the name overlap with the upstream
+# `stepping-stones-cyberveiligheid` repo, which DOES ship a compose
+# file but the cloud-init userdata terra-range uses ignores it in
+# favor of the lighter-weight venv+systemd deploy path).
+#
+# This bake pre-stages the slow parts of that deploy path:
+#   - apt: python3-venv + pip + nginx + certbot + a few dev headers
+#     for native-extension wheels (psycopg2 / cryptography)
+#   - git clone of the repo to /opt/stepping-stones
+#   - python3 -m venv .venv + pip install -r requirements.txt (the
+#     SLOWEST piece — wheels for cryptography, pillow, etc.)
+#   - touch a `.baked` marker so the deploy-time ansible role + cloud-
+#     init userdata can skip the heavy install path.
+#
+# What's NOT done here (these stay deploy-time):
+#   - manage.py migrate    (needs SECRET_KEY from per-deploy random_password)
+#   - manage.py createsuperuser   (per-deploy operator credentials)
+#   - systemd unit install + start  (cloud-init writes the unit + service
+#                                    name needs the per-deploy hostname)
+#   - certbot --nginx + LE issuance  (needs the per-deploy DNS / IP)
+#
+# Time saved per deploy (target): ~5-7 min (the pip install on a fresh
+# VM is the dominant cost — ~3-5 min for the wheel builds + downloads).
 #
 # Upstream: https://github.com/stepping-stones-cyberveiligheid/Stepping-Stones
 # Final URL students hit at deploy time: http://<vm-private-ip>:8000/
+# (or http://<vm>/ via nginx reverse proxy when guacamole_dns + LE done)
 #
-# Time saved per deploy (target): ~5-8 min (apt + docker install ~1-2 min,
-# git clone ~10 s, compose image pulls ~3-5 min depending on egress).
+# History note: an earlier version of this script tried to install
+# Docker + pre-pull compose images. That was wrong — the deployed VM
+# doesn't use docker. The script was rewritten to match cloud-init's
+# venv path (this file). The corresponding ansible role under
+# modules/azure/ansible/roles/stepping_stones/ is now a health-verify
+# role, NOT a deployer (cloud-init owns deploy, ansible owns repair).
 set -eu
 
 SS_REPO="${SS_REPO:-https://github.com/stepping-stones-cyberveiligheid/Stepping-Stones.git}"
@@ -22,19 +46,24 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get -y update
 apt-get -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" upgrade
 
-echo "[ss-bake] base packages (nginx + certbot + helpers) ..."
-# Docker is installed SEPARATELY via get.docker.com below — NOT via
-# apt's docker.io. Reasons:
-#   1. `docker-compose-plugin` is ONLY available in Docker Inc.'s apt
-#      repo (download.docker.com), NOT in Debian's main repos. Trying
-#      to apt-install it on stock Debian 12 fails with
-#      "No package matching 'docker-compose-plugin' is available".
-#   2. The mythic + ghostwriter bakes also use get.docker.com — using
-#      it here keeps the install path identical → fewer surprises.
-#   3. docker.io (Debian's CE-equivalent) DOES exist and would work
-#      for the engine, but it ships docker-compose-v2 under a different
-#      binary name and we'd have to alias around it. Not worth the
-#      complexity.
+# Base packages — python venv + nginx + certbot + the libs Stepping-Stones'
+# pip requirements need to build wheels for cleanly on a fresh VM:
+#
+#   - python3-venv        : `python3 -m venv` support
+#   - python3-pip         : bootstrap pip outside the venv (only used to
+#                            install the venv-managed pip itself; the
+#                            venv has its own pip thereafter)
+#   - python3-dev         : Python.h for native-extension builds
+#   - build-essential     : gcc + make for wheel builds
+#   - libpq-dev           : psycopg2 (postgres adapter; some configs need
+#                            it even if the default backend is sqlite —
+#                            requirements.txt pins psycopg2 unconditionally)
+#   - libssl-dev libffi-dev : cryptography wheel build
+#   - libjpeg-dev zlib1g-dev : pillow wheel build (image attachments)
+#   - libxml2-dev libxslt1-dev : lxml wheel build (report rendering)
+#   - nginx + certbot + python3-certbot-nginx : reverse-proxy + LE TLS
+#   - git curl wget jq    : repo fetch + deploy-time misc
+echo "[ss-bake] base packages (python venv + django build deps + nginx + certbot) ..."
 apt-get -y install --no-install-recommends \
     ca-certificates \
     curl \
@@ -42,105 +71,84 @@ apt-get -y install --no-install-recommends \
     wget \
     jq \
     openssl \
-    gnupg \
-    apt-transport-https \
+    python3 \
+    python3-venv \
+    python3-pip \
+    python3-dev \
+    build-essential \
+    libpq-dev \
+    libssl-dev \
+    libffi-dev \
+    libjpeg-dev \
+    zlib1g-dev \
+    libxml2-dev \
+    libxslt1-dev \
     nginx \
     certbot \
     python3-certbot-nginx
 
-echo "[ss-bake] installing Docker via get.docker.com (includes docker-compose-plugin) ..."
-curl -fsSL https://get.docker.com | sh
-
-echo "[ss-bake] enable docker.service ..."
-systemctl enable --now docker || true
-
 echo "[ss-bake] cloning Stepping-Stones to ${SS_DEST} ..."
 if [ ! -d "${SS_DEST}/.git" ]; then
-    # Full clone (not --depth 1) so the deploy-time Ansible role can
-    # inspect git log if a hotfix pin is needed later. Stepping-Stones
-    # is a small repo — the full history is < 50 MB.
+    # Full clone (not --depth 1) so the ansible repair pass can inspect
+    # git log if a hotfix pin is needed later. Stepping-Stones is a
+    # small repo — the full history is < 50 MB.
     git clone "${SS_REPO}" "${SS_DEST}"
 fi
 HEAD=$(cd "${SS_DEST}" && git rev-parse --short HEAD 2>/dev/null || echo unknown)
 echo "[ss-bake]   Stepping-Stones HEAD: ${HEAD}"
 
-# --- pre-pull every docker image referenced by the compose stack ----
+# --- Create venv + install requirements ----------------------------------
 #
-# Stepping-Stones' canonical layout puts a docker-compose.yml at the
-# repo root. We walk it (plus any auxiliary compose files under the
-# tree — some forks split out a separate compose.override.yml for
-# postgres/redis/etc.) and pull each `image:` reference. We also walk
-# any Dockerfiles' `FROM` lines so that build-from-source services
-# have their base layers cached.
+# The SLOWEST part of a Stepping-Stones first-boot is `pip install -r
+# requirements.txt`. The package list pulls ~50 packages; cryptography +
+# pillow + lxml are wheel-built from source on Debian's ARM64 images
+# (which terra-range doesn't currently target, but the deps are the
+# same on amd64) — those three alone take 2-3 min on a fresh n2-standard-2.
 #
-# Same defensive shape as packer/mythic/scripts/mythic-baseline.sh —
-# parsing upstream compose files is fragile, so failures are non-fatal:
-# `docker compose up` at deploy time will fetch anything we missed.
-echo "[ss-bake] enumerating docker images from compose + Dockerfiles ..."
-ss_images=$(
-  {
-    find "${SS_DEST}" -maxdepth 4 -type f \
-        \( -name 'docker-compose*.yml' -o -name 'docker-compose*.yaml' \
-           -o -name 'compose*.yml' -o -name 'compose*.yaml' \) \
-        2>/dev/null \
-      | xargs -r grep -hE '^\s*image:\s*' 2>/dev/null \
-      | sed -E 's/^\s*image:\s*//; s/^["'"'"']//; s/["'"'"']$//; s/\s+#.*$//' \
-      | grep -vE '^\$\{|^\s*$'
-    find "${SS_DEST}" -maxdepth 4 -type f -name 'Dockerfile*' 2>/dev/null \
-      | xargs -r grep -hE '^\s*FROM\s+' 2>/dev/null \
-      | awk '{print $2}' \
-      | grep -vE '^scratch$|^\$\{'
-  } | sort -u
-)
-
-# Fallback: if the repo layout changed and we found zero images, still
-# pre-pull the well-known dependencies a Django + postgres stack uses,
-# so the baked image isn't useless. These are the same versions
-# Stepping-Stones has historically pinned.
-if [ -z "${ss_images}" ]; then
-    echo "[ss-bake]   WARN: no images discovered in compose/Dockerfile — falling back to stock set"
-    ss_images=$(printf '%s\n' \
-        postgres:15 \
-        postgres:14 \
-        redis:7 \
-        nginx:1.25 \
-        python:3.12-slim)
+# Baking the venv means deploy-time becomes "use the venv, run migrate
+# + createsuperuser, start gunicorn" — < 60 sec on a baked image.
+echo "[ss-bake] creating venv at ${SS_DEST}/.venv ..."
+if [ ! -d "${SS_DEST}/.venv" ]; then
+    python3 -m venv "${SS_DEST}/.venv"
 fi
 
-echo "[ss-bake] pre-pulling images:"
-printf '%s\n' "${ss_images}" | sed 's/^/  - /'
-printf '%s\n' "${ss_images}" | while IFS= read -r img; do
-    [ -z "${img}" ] && continue
-    echo "[ss-bake] pulling ${img}"
-    docker pull "${img}" 2>&1 | tail -2 || echo "  (pull failed for ${img} — deploy-time retry)"
-done
+echo "[ss-bake] upgrading pip + setuptools + wheel inside the venv ..."
+"${SS_DEST}/.venv/bin/pip" install --upgrade pip setuptools wheel \
+    2>&1 | tail -5
 
-# If the compose stack has any service that builds from source
-# (build: . blocks), do an offline `docker compose build` so the
-# resulting images are baked in too. Best-effort; non-fatal.
-COMPOSE_FILE=""
-for f in docker-compose.yml docker-compose.yaml compose.yml compose.yaml; do
-    [ -f "${SS_DEST}/${f}" ] && { COMPOSE_FILE="${SS_DEST}/${f}"; break; }
-done
-if [ -n "${COMPOSE_FILE}" ] && grep -qE '^\s*build:' "${COMPOSE_FILE}" 2>/dev/null; then
-    echo "[ss-bake] pre-building local compose services from ${COMPOSE_FILE} ..."
-    ( cd "${SS_DEST}" && docker compose -f "${COMPOSE_FILE}" build 2>&1 | tail -20 ) \
-        || echo "[ss-bake]   (compose build failed — deploy-time retry)"
+REQ="${SS_DEST}/requirements.txt"
+if [ -f "${REQ}" ]; then
+    echo "[ss-bake] pip install -r requirements.txt (~3-5 min for the cryptography + pillow + lxml wheels) ..."
+    "${SS_DEST}/.venv/bin/pip" install --no-cache-dir -r "${REQ}" 2>&1 | tail -10 \
+        || echo "[ss-bake]   WARN: pip install failed — deploy-time will retry"
+else
+    echo "[ss-bake]   WARN: ${REQ} not found in clone — Stepping-Stones repo layout may have changed"
 fi
 
-# Marker so the Ansible role can detect a baked image and skip the
-# Docker install / git clone / image pull phases. Same shape as
-# /opt/mythic/.baked.
+# Fix ownership of the venv + repo so the deploy-time `ranger` user
+# (created by cloud-init) can write its sqlite db + collect static files
+# under the same tree without sudo. cloud-init's users: block creates
+# ranger with uid 1000 on most Debian images; chown after the venv
+# install so the python-managed bytecode is owned correctly.
+echo "[ss-bake] chowning ${SS_DEST} to uid:gid 1000:1000 (matches the ranger user cloud-init will create) ..."
+chown -R 1000:1000 "${SS_DEST}" || echo "  (chown failed, deploy-time will fix)"
+
+# Marker for the deploy-time ansible role + cloud-init userdata to
+# detect a baked image and skip the apt/clone/venv path. Same shape as
+# /opt/mythic/.baked and /opt/adaptix/.baked.
 {
     echo "${HEAD}"
     date
+    echo "venv: ${SS_DEST}/.venv"
+    echo "requirements: ${REQ}"
 } > "${SS_DEST}/.baked"
 echo "[ss-bake] marker ${SS_DEST}/.baked written"
 
-echo "[ss-bake] cleaning apt cache (shrinks captured image) ..."
+echo "[ss-bake] cleaning apt cache + pip cache (shrinks captured image) ..."
 apt-get clean
 rm -rf /var/lib/apt/lists/*
+rm -rf /root/.cache/pip /home/*/.cache/pip 2>/dev/null || true
 
 echo "[ss-bake] baseline complete."
-echo "[ss-bake] cached docker images:"
-docker image ls 2>/dev/null | head -20
+echo "[ss-bake] venv site-packages summary:"
+"${SS_DEST}/.venv/bin/pip" list --format=columns 2>/dev/null | head -20 || true
