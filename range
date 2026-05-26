@@ -4191,7 +4191,16 @@ for h in d.get('guacamole', {}).get('hosts', []):
         warn "  [ssh-heal/gcp] no .pub at $ssh_pubkey_path — skipping heal pass"
       else
         pubkey_content=$(awk '{print $1" "$2}' "$ssh_pubkey_path")
-        # Walk terraform state for google_compute_instance.linux entries.
+        # Walk terraform state for google_compute_instance entries +
+        # also pull the module's `hosts` output (where the linux_user
+        # for each host is surfaced). The GCP resource itself doesn't
+        # carry the user (unlike Azure's admin_username); it lives in
+        # the ssh-keys metadata field, which we're about to OVERWRITE.
+        # So we read the desired user from the module's outputs.
+        #
+        # Mirrors Azure's `v.get('admin_username', 'ranger')` pattern,
+        # but the lookup goes via outputs (not resource attributes)
+        # because GCP doesn't expose the user as a first-class attribute.
         gcp_linux_vms_json=$(python3 - <<'PY'
 import json, subprocess
 r = subprocess.run(['terraform', 'show', '-json'], capture_output=True, text=True, check=False)
@@ -4199,6 +4208,19 @@ try:
     state = json.loads(r.stdout)
 except Exception:
     print('[]'); raise SystemExit(0)
+root = (state.get('values') or {}).get('root_module') or {}
+
+# Pull per-host linux_user from the module's `hosts` output.
+hosts_by_name = {}
+for out_key, out_val in (state.get('values') or {}).get('outputs', {}).items():
+    if out_key != 'hosts':
+        continue
+    val = out_val.get('value') or []
+    for h in val:
+        n = h.get('name', '')
+        if n:
+            hosts_by_name[n] = h.get('ssh_user') or h.get('linux_user') or 'ranger'
+
 out = []
 def walk(node):
     if not isinstance(node, dict): return
@@ -4208,18 +4230,23 @@ def walk(node):
             name = v.get('name', '')
             zone = v.get('zone', '')
             project = v.get('project', '')
-            # Skip Windows instances — different metadata key.
-            # Heuristic: GCP doesn't expose os in the resource; check name.
-            # The vms.tf module's split into .linux/.windows means only
-            # the .linux name pattern lands here in practice.
+            # The full instance name is `<range>-<host>` (set by
+            # vms.tf). The `hosts` output keys are just `<host>`.
+            # Strip the range prefix to match.
+            host_only = name
+            for prefix in (state.get('values') or {}).get('outputs', {}).get('range_name', {}).get('value', ''), '':
+                if prefix and host_only.startswith(prefix + '-'):
+                    host_only = host_only[len(prefix)+1:]
+                    break
+            user = hosts_by_name.get(host_only) or hosts_by_name.get(name) or 'ranger'
             if 'guac' in name.lower():
                 continue
             if not name or not zone or not project:
                 continue
-            out.append({'name': name, 'zone': zone, 'project': project})
+            out.append({'name': name, 'zone': zone, 'project': project, 'user': user})
     for c in node.get('child_modules', []) or []:
         walk(c)
-walk((state.get('values') or {}).get('root_module') or {})
+walk(root)
 print(json.dumps(out))
 PY
 )
@@ -4229,17 +4256,19 @@ PY
         echo "$gcp_linux_vms_json" | python3 -c "
 import json, sys
 for vm in json.load(sys.stdin):
-    print(f'{vm[\"name\"]}\t{vm[\"zone\"]}\t{vm[\"project\"]}')
-" | while IFS=$'\t' read -r vm zone project; do
+    print(f'{vm[\"name\"]}\t{vm[\"zone\"]}\t{vm[\"project\"]}\t{vm[\"user\"]}')
+" | while IFS=$'\t' read -r vm zone project user; do
           [[ -z "$vm" ]] && continue
           (
             # Build the new ssh-keys metadata. Format: "user:ssh-rsa AAAA...".
-            # We use 'ranger' as the default Linux user (mirrors Azure).
-            new_key="ranger:${pubkey_content}"
+            # `$user` comes from terraform's `hosts` output → linux_user
+            # for that machine (set per-host in the scenario YAML). Falls
+            # back to 'ranger' if the lookup fails.
+            new_key="${user:-ranger}:${pubkey_content}"
             if gcloud compute instances add-metadata "$vm" \
                  --zone="$zone" --project="$project" \
                  --metadata="ssh-keys=${new_key}" >/dev/null 2>&1; then
-              echo "    ✓ $vm: metadata updated"
+              echo "    ✓ $vm (user=${user:-ranger}): metadata updated"
             else
               echo "    ! $vm: add-metadata failed (check IAM / disabled-OS-Login)"
             fi

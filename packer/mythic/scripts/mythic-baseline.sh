@@ -151,15 +151,25 @@ else
     # up after 5 min.
     echo "[mythic-bake] waiting for mythic_graphql to come up (max 5 min) ..."
     for i in $(seq 1 60); do
-        # Hasura's GraphQL endpoint returns 200 for OPTIONS or 401/200
-        # for unauthenticated GET. Either is "up".
-        if curl -sSf -o /dev/null --max-time 3 http://127.0.0.1:8080/ 2>/dev/null \
-           || curl -sS  -o /dev/null --max-time 3 http://127.0.0.1:8080/ 2>/dev/null | head -1 | grep -qE '40[0-9]|200'; then
-            echo "  [mythic-bake]   graphql reachable on attempt $i"
-            break
-        fi
+        # Hasura's GraphQL endpoint returns 200 for an authenticated POST
+        # or 401/400/200 for an unauthenticated GET. Any of those means
+        # the server is UP. We use `-w '%{http_code}'` to print the
+        # response code to stdout (curl -o /dev/null sends the body to
+        # /dev/null so `-w` is the way to read status). Match 2xx/4xx as
+        # "alive"; 5xx or empty response (connection refused) = down.
+        #
+        # Previous version had a broken second `curl ... -o /dev/null |
+        # head -1 | grep` chain — `-o /dev/null` swallows stdout so the
+        # pipe was always empty. Fixed by using `-w '%{http_code}'`.
+        code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 3 http://127.0.0.1:8080/ 2>/dev/null || echo 000)
+        case "$code" in
+            2*|4*)
+                echo "  [mythic-bake]   graphql reachable on attempt $i (HTTP $code)"
+                break
+                ;;
+        esac
         sleep 5
-        [ "$i" -eq 60 ] && echo "  WARN: graphql never came up; extras may fail"
+        [ "$i" -eq 60 ] && echo "  WARN: graphql never came up (last code=$code); extras may fail"
     done
 
     echo "[mythic-bake] installing extra payloads + C2 profiles ..."
