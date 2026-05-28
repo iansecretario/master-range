@@ -1,6 +1,22 @@
 #!/usr/bin/env bash
 # range — one-command driver for cyber-range scenarios.
 #
+# Cloud provider selection (any subcommand):
+#   --provider azure|aws|gcp       long form, value as next token
+#   --provider=azure|aws|gcp       long form, value glued with =
+#   --azure | --aws | --gcp        short form (equivalent)
+#   TERRA_PROVIDER=gcp ./range ... env var (persistent across commands)
+#   default = azure
+#
+# Provider flag can appear before OR after the subcommand:
+#   ./range --provider gcp apply redteam-lab
+#   ./range apply --provider gcp redteam-lab
+#   ./range --gcp apply redteam-lab          # short form
+#
+# Per-provider tfvars live under envs/{azure,aws,gcp}/terraform.tfvars.json
+# and per-provider terraform modules live under modules/{azure,aws,gcp}/.
+# See README.md and docs/QUICKSTART_GCP.md for provider-specific setup.
+#
 # Usage:
 #   ./range list                   show available scenarios
 #   ./range gen <scenario>         generate tfvars from a scenario YAML
