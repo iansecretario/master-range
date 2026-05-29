@@ -149,32 +149,46 @@
   when: not redelk_env_tmpl.stat.exists
   tags: [redelk, redelk-config]
 
-# .env file — substitute our deterministic passwords for the {{...}}
+# .env file — substitute our deterministic passwords for the double-curly
 # placeholders that install-elkserver.sh would otherwise fill with
 # `openssl rand`. We use the SAME password for every internal ES user
 # (kibana_system, logstash_system, redelk_ingest, redelk, elastic) for
 # the lab — operators only ever log in as `elastic` or via Kibana, the
 # rest is internal plumbing. Production deployments should NOT do this.
+#
+# CRITICAL ansible gotcha (this task fataled with "'PLACEHOLDER' is
+# undefined" before the fix): the `shell` cmd is Jinja2-templated by
+# ansible BEFORE the shell runs it. The sed MATCH patterns are literal
+# double-curly markers (REDELKVERSION, CREDS_*, ELASTIC_PASSWORD, …)
+# that Jinja2 tries to evaluate as variables → undefined-variable fatal.
+# Two-part fix:
+#   1. {% raw %}…{% endraw %} around the cmd body so the literal
+#      double-curly sed patterns pass through to sed untouched.
+#   2. Inject the real password as a shell env var ($REDELK_PW) via
+#      `environment:` instead of inline Jinja, so no {{ }} interpolation
+#      is needed inside the raw block.
 - name: Render /opt/redelk/elkserver/.env from .env.tmpl
   ansible.builtin.shell:
     cmd: |
+      {% raw %}
       set -e
       cp -f .env.tmpl .env
-      # Substitute our deterministic creds. sed -i in-place; the
-      # template uses {{PLACEHOLDER}} double-curly markers.
       sed -i \
-        -e 's|{{REDELKVERSION}}|cwrlab|g' \
-        -e 's|{{CREDS_kibana_system}}|{{ redelk_es_password }}|g' \
-        -e 's|{{CREDS_logstash_system}}|{{ redelk_es_password }}|g' \
-        -e 's|{{CREDS_redelk_ingest}}|{{ redelk_es_password }}|g' \
-        -e 's|{{CREDS_redelk}}|{{ redelk_es_password }}|g' \
-        -e 's|{{ELASTIC_PASSWORD}}|{{ redelk_es_password }}|g' \
-        -e 's|{{POSTGRES_PASSWORD}}|{{ redelk_es_password }}|g' \
-        -e 's|{{NEO4J_PASSWORD}}|{{ redelk_es_password }}|g' \
-        -e 's|{{KBN_XPACK_ENCRYPTEDSAVEDOBJECTS}}|{{ redelk_es_password }}cwrlabkibanaencryptkey|g' \
+        -e "s|{{REDELKVERSION}}|cwrlab|g" \
+        -e "s|{{CREDS_kibana_system}}|${REDELK_PW}|g" \
+        -e "s|{{CREDS_logstash_system}}|${REDELK_PW}|g" \
+        -e "s|{{CREDS_redelk_ingest}}|${REDELK_PW}|g" \
+        -e "s|{{CREDS_redelk}}|${REDELK_PW}|g" \
+        -e "s|{{ELASTIC_PASSWORD}}|${REDELK_PW}|g" \
+        -e "s|{{POSTGRES_PASSWORD}}|${REDELK_PW}|g" \
+        -e "s|{{NEO4J_PASSWORD}}|${REDELK_PW}|g" \
+        -e "s|{{KBN_XPACK_ENCRYPTEDSAVEDOBJECTS}}|${REDELK_PW}cwrlabkibanaencryptkey|g" \
         .env
+      {% endraw %}
     chdir: "{{ redelk_elkserver_dir }}"
     creates: "{{ redelk_elkserver_dir }}/.env"
+  environment:
+    REDELK_PW: "{{ redelk_es_password }}"
   become: true
   tags: [redelk, redelk-config]
 
