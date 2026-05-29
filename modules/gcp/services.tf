@@ -309,8 +309,13 @@ resource "google_compute_instance" "elk" {
   # firewall.tf scopes ingress by these tags:
   #   - "elk"        : opens :5601 (Kibana) from operator CIDRs, :5044
   #                    (Filebeat ingest) from every spoke
+  #   - "hub"        : east-west among hub-tier boxes (allow_east_west_hub)
+  #   - "hub-infra"  : operator → Kibana + Filebeat → ELK ingest
+  #                    (allow_operator_hub_web + allow_logs_to_hub_infra).
+  #                    Without it the ELK box can't receive logs or serve
+  #                    the Kibana UI to the operator.
   #   - "allow-iap"  : fallback SSH path via IAP TCP forwarder
-  tags = ["elk", "allow-iap"]
+  tags = ["elk", "hub", "hub-infra", "allow-iap"]
 
   labels = merge(local.common_labels, {
     role    = "elk"
@@ -458,8 +463,13 @@ resource "google_compute_instance" "guacamole" {
 
   # firewall.tf scopes ingress by these tags:
   #   - "guacamole"  : opens :22/:80/:443 from var.guacamole_ingress_cidrs
+  #   - "hub"        : east-west among hub-tier boxes (allow_east_west_hub)
+  #                    so guac can reach ELK/Ghostwriter/etc. on the hub
   #   - "allow-iap"  : fallback SSH path via IAP TCP forwarder
-  tags = ["guacamole", "allow-iap"]
+  # (Guacamole reaches per-student spoke VMs by its hub-subnet SOURCE IP
+  # via allow_hub_to_spoke — that rule is CIDR-sourced, not tag-sourced,
+  # so guac doesn't need a spoke tag.)
+  tags = ["guacamole", "hub", "allow-iap"]
 
   labels = merge(local.common_labels, {
     role    = "guacamole"

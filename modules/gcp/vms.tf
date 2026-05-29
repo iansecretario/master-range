@@ -332,6 +332,72 @@ locals {
     m.name => "${var.azure_region}-a"
   }
 
+  # ==========================================================================
+  # Firewall network tags — MUST match the target_tags / source_tags the
+  # rules in firewall.tf reference. Computed here ONCE and consumed by both
+  # the linux + windows google_compute_instance tag blocks below.
+  #
+  # WHY this exists: GCP custom-mode VPCs deny intra-VPC ingress by default.
+  # Every functional firewall rule (hub→spoke, kali→C2 commander,
+  # redirector→listener, cross-student isolation, Filebeat→hub) is
+  # tag-scoped. If a VM doesn't carry the tag a rule targets, that rule
+  # matches nothing and the traffic is denied. An earlier version emitted
+  # only [allow-iap, role-<role>, student-<raw-sid>] which matched almost
+  # NONE of the firewall's expected tags — so the deployed range was
+  # firewalled off from itself (Guacamole couldn't reach VMs, AD join
+  # failed, no C2 channel, no logging). This local fixes that by emitting
+  # the complete tag vocabulary the firewall expects.
+  # ==========================================================================
+
+  # Redirector `fronts` field holds the ROLE of the C2 it fronts
+  # (c2-server / c2-mythic / c2-sliver / c2-brc4). The firewall's
+  # per-framework redirector tag uses the framework SHORT name
+  # (adaptix / mythic / sliver / brc4). Map between them.
+  _framework_of_role = {
+    "c2-server" = "adaptix" # adaptix's machine role is "c2-server"
+    "c2-mythic" = "mythic"
+    "c2-sliver" = "sliver"
+    "c2-brc4"   = "brc4"
+  }
+
+  firewall_tags = {
+    for m in var.machines : m.name => compact([
+      # --- always present ---
+      "allow-iap", # IAP TCP-forwarding ingress (operator :22/:3389)
+      "role-${m.role}",
+
+      # --- per-student spoke tags ---
+      # student-<sanitized> MUST match firewall.tf's student_meta[sid].tag:
+      #   sid=="" -> "single"; else lower(replace(sid,"_","-")).
+      # The old code used the RAW student_id (or nothing when empty),
+      # which broke the east_west_spoke rule whenever the sid was empty
+      # (single-student mode) or contained uppercase/underscores.
+      "student-${m.student_id == "" ? "single" : lower(replace(m.student_id, "_", "-"))}",
+      # Generic spoke marker — hub→spoke, cross-student-deny, and the
+      # lockdown egress rules all target "student-vm".
+      "student-vm",
+
+      # --- kali attacker box (firewall: kali -> c2 commander ports) ---
+      contains(["attacker", "kali"], m.role) ? "kali" : null,
+
+      # --- C2 teamserver framework tags ---
+      # firewall: redirector -> listener (target c2-<fw>); kali -> commander.
+      m.role == "c2-server" ? "c2-server" : null,  # generic catch-all
+      m.role == "c2-server" ? "c2-adaptix" : null, # adaptix specifically
+      m.role == "c2-mythic" ? "c2-mythic" : null,
+      m.role == "c2-sliver" ? "c2-sliver" : null,
+      m.role == "c2-brc4" ? "c2-brc4" : null,
+
+      # --- redirectors ---
+      # bare tag = internet->redirector ingress; lb-backend = LB health
+      # checks; per-framework = redirector->listener source tag.
+      m.role == "c2-redirector" ? "c2-redirector" : null,
+      m.role == "c2-redirector" ? "lb-backend" : null,
+      (m.role == "c2-redirector" && lookup(local._framework_of_role, m.fronts, "") != "")
+      ? "c2-redirector-${local._framework_of_role[m.fronts]}" : null,
+    ])
+  }
+
   # Convention for static IPs in attacker subnet:
   #   c2-server                          at 10.<n>.1.5   (Adaptix)
   #   c2-redirector fronts c2-server     at 10.<n>.1.6
@@ -486,14 +552,12 @@ resource "google_compute_instance" "linux" {
   #   - we lowercase + dash-replace role and student_id so values like
   #     "windows-dc" or "lab01" pass through cleanly
   #
-  # `allow-iap` is shared by every instance so the IAP-TCP-forwarding
-  # firewall rule (firewall.tf) opens :22 + :3389 from Google's IAP
-  # range to anything tagged it.
-  tags = compact([
-    "allow-iap",
-    "role-${each.value.role}",
-    each.value.student_id != "" ? "student-${each.value.student_id}" : null,
-  ])
+  # Firewall network tags — computed in local.firewall_tags (top of this
+  # file). Emits the COMPLETE vocabulary the rules in firewall.tf expect
+  # (student-vm, kali, c2-<framework>, c2-redirector[-<fw>], lb-backend,
+  # the sanitized student-<tag>, plus allow-iap + role-<role>). Sharing
+  # the local across the linux + windows resources keeps the two in sync.
+  tags = local.firewall_tags[each.key]
 
   # Labels drive billing reports and cost analysis. Same semantic content
   # as `tags` plus `range` and `os`, but in the GCP label format (lowercase,
@@ -623,7 +687,17 @@ resource "google_compute_instance" "linux" {
   # hatch when cloud-init breaks) from working. Most operators will
   # never use those, but they're a useful fallback.
   metadata = {
-    startup-script = local.bootstrap[each.key]
+    # CRITICAL: the bootstrap scripts are `#cloud-config` YAML (every
+    # userdata/*.sh begins with `#cloud-config`). On GCP, cloud-init's
+    # GCE datasource reads the `user-data` metadata key — NOT
+    # `startup-script`. `startup-script` is run by the guest agent's
+    # metadata-script-runner as a RAW shell script: a `#cloud-config`
+    # first line is just a comment and the YAML body is fed to /bin/sh,
+    # which fails instantly — so cloud-init never processes the config,
+    # no `ranger` user is created, no SSH key planted, no C2 installed.
+    # services.tf (ELK/Guacamole) and shared_infra.tf already use
+    # `user-data` correctly; this Linux path was the outlier. Fixed.
+    user-data      = local.bootstrap[each.key]
     enable-oslogin = "FALSE"
     ssh-keys       = local.ssh_keys_metadata
   }
@@ -653,7 +727,7 @@ resource "google_compute_instance" "linux" {
     # (image change, size change, NIC change), terraform will still
     # re-run the startup-script from scratch.  For ongoing config
     # drift, run `./range repair` (ansible).
-    ignore_changes = [metadata["startup-script"]]
+    ignore_changes = [metadata["user-data"]]
   }
 }
 
@@ -670,11 +744,12 @@ resource "google_compute_instance" "windows" {
   machine_type = local.vm_size[each.key]
   zone         = local.machine_zone[each.key]
 
-  tags = compact([
-    "allow-iap",
-    "role-${each.value.role}",
-    each.value.student_id != "" ? "student-${each.value.student_id}" : null,
-  ])
+  # Firewall network tags — see local.firewall_tags (top of file). Same
+  # complete vocabulary as the linux instances so windows-dc / members /
+  # workstations get hub→spoke + east-west + cross-student-isolation
+  # rules applied. (Windows roles never match the kali / c2-* branches,
+  # so they just get allow-iap + role-<role> + student-<tag> + student-vm.)
+  tags = local.firewall_tags[each.key]
 
   labels = {
     range      = var.range_name

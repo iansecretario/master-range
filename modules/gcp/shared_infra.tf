@@ -207,11 +207,17 @@ resource "google_compute_instance" "shared" {
   # Network tags drive every firewall rule in firewall.tf. Mirrors
   # azurerm_network_interface.shared's NSG association on the Azure side.
   #   - "shared"     : applies hub-infra default allow-out + log
+  #   - "hub"        : east-west among hub-tier boxes (allow_east_west_hub)
+  #   - "hub-infra"  : operator → ghostwriter/redelk/stepping-stones web
+  #                    (allow_operator_hub_web) + Filebeat/redirector logs
+  #                    → RedELK ingest (allow_logs_to_hub_infra). Without
+  #                    these the shared boxes are unreachable for both the
+  #                    operator UI and log ingestion.
   #   - <role>       : per-role rule (e.g. "ghostwriter" opens :443 from
   #                    operator CIDRs; "redelk" opens :5044 from spokes)
   #   - "allow-iap"  : opens 22/3389 to GCP IAP's TCP forwarder range
   #                    (35.235.240.0/20) — operator fallback path.
-  tags = ["shared", each.value.role, "allow-iap"]
+  tags = ["shared", "hub", "hub-infra", each.value.role, "allow-iap"]
 
   labels = merge(local.common_labels, {
     role = each.value.role
