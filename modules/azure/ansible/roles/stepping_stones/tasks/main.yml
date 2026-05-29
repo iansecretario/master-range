@@ -121,8 +121,15 @@
       - "---- Stepping Stones ----"
       - "URL (via nginx)        : http://{{ terra_private_ip | default('<host>') }}/"
       - "URL (via gunicorn)     : http://{{ terra_private_ip | default('<host>') }}:{{ stepping_stones_listen_port }}/"
-      - "Admin user             : {{ stepping_stones_admin_user }}"
-      - "Admin password         : (set at first-boot by userdata — see /opt/stepping-stones/.admin-password if cloud-init wrote it)"
+      # The Django superuser is created by userdata/stepping-stones.sh as
+      # DJANGO_SUPERUSER_USERNAME=<linux_user>, PASSWORD=<linux_pass> —
+      # i.e. the SAME credentials as SSH to this box. `ansible_user` is
+      # that linux_user. The password is owned by terraform
+      # (s.linux_password) and surfaced by `./range creds`, so we point
+      # the operator there rather than hardcoding a wrong default or
+      # reading /opt/stepping-stones/.admin-password off the box.
+      - "Web admin user         : {{ ansible_user }}   (= the box's linux/SSH user)"
+      - "Web admin password     : same as SSH password — run `./range creds` (look for the stepping-stones web_admin_pass line)"
       - "Service                : systemctl status stepping-stones"
       - "Probe                  : HTTP {{ ss_http_probe.status | default('n/a') }} from gunicorn"
   tags: [stepping_stones, ss_health]

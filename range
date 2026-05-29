@@ -2855,6 +2855,17 @@ for host in sorted(set(creds) | set(infra)):
         print(f'    web_url         : {i["web_url"]}')
     print(f'    ssh_user        : {c.get("ssh_user", i.get("ssh_user", "?"))}')
     print(f'    ssh_password    : {c.get("ssh_password", "?")}')
+    # Web-admin login for boxes that expose a UI (stepping-stones,
+    # ghostwriter, redelk). For stepping-stones these are deterministic
+    # (= the SSH creds, per the Django superuser created in userdata);
+    # for ghostwriter/redelk terraform doesn't own the password so we
+    # print the ansible-managed note instead.
+    if c.get("web_admin_user"):
+        print(f'    web_admin_user  : {c["web_admin_user"]}')
+    if c.get("web_admin_password"):
+        print(f'    web_admin_pass  : {c["web_admin_password"]}')
+    elif c.get("web_admin_note"):
+        print(f'    web_admin_pass  : ({c["web_admin_note"]})')
 PY
       echo
     fi

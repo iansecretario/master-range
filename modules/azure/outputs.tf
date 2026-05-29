@@ -114,13 +114,41 @@ output "shared_infra" {
 }
 
 output "shared_infra_credentials" {
-  description = "SSH passwords for shared infra boxes."
+  description = "SSH + web-admin credentials for shared infra boxes."
   sensitive   = true
   value = {
     for s in var.shared_machines :
     s.name => {
       ssh_user     = s.linux_user
       ssh_password = s.linux_password
+      # Web-admin login for the boxes that expose a web UI. For
+      # stepping-stones the cloud-init userdata creates the Django
+      # superuser as DJANGO_SUPERUSER_USERNAME=${linux_user},
+      # DJANGO_SUPERUSER_PASSWORD=${linux_pass} (see
+      # userdata/stepping-stones.sh) — i.e. the SAME credentials as SSH.
+      # So we can surface them deterministically here; no need to read
+      # /opt/stepping-stones/.admin-password off the box.
+      #
+      # ghostwriter + redelk web-admin passwords are set by their ANSIBLE
+      # roles (ghostwriter_admin_password / redelk_es_password defaults
+      # or vault overrides), NOT by terraform — so terraform can't surface
+      # them here. They're reported by the role's own "Report" task at the
+      # end of the repair/apply run. null here = "see role output".
+      web_admin_user = (
+        s.role == "stepping-stones" ? s.linux_user :
+        s.role == "ghostwriter" ? "admin" :
+        s.role == "redelk" ? "elastic" :
+        null
+      )
+      web_admin_password = (
+        s.role == "stepping-stones" ? s.linux_password :
+        null # ghostwriter/redelk: ansible-managed, see role report
+      )
+      web_admin_note = (
+        s.role == "ghostwriter" ? "password set by ansible (ghostwriter_admin_password); see ghostwriter role report" :
+        s.role == "redelk" ? "password set by ansible (redelk_es_password); see redelk role report" :
+        null
+      )
     }
   }
 }
@@ -178,12 +206,12 @@ output "sliver_connections" {
   value = {
     for m in var.machines :
     m.name => {
-      student_id      = m.student_id
-      private_ip      = azurerm_network_interface.machine[m.name].private_ip_address
+      student_id       = m.student_id
+      private_ip       = azurerm_network_interface.machine[m.name].private_ip_address
       multiplayer_port = 31337
-      operator_name   = "operator"
-      operator_cfg    = "/opt/sliver-cfg/operator.cfg"
-      seed_password   = local.effective_sliver_password[m.student_id]
+      operator_name    = "operator"
+      operator_cfg     = "/opt/sliver-cfg/operator.cfg"
+      seed_password    = local.effective_sliver_password[m.student_id]
     } if m.role == "c2-sliver"
   }
 }
@@ -313,12 +341,12 @@ output "ansible_inventory" {
       # and every playbook `hosts:` selector would silently mismatch.
       [
         for m in var.machines : {
-          name        = "${var.range_name}-${m.name}"
-          role        = m.role
-          student_id  = m.student_id
-          private_ip  = azurerm_network_interface.machine[m.name].private_ip_address
-          public_ip   = try(azurerm_public_ip.redirector[m.name].ip_address, null)
-          ssh_user    = m.linux_user
+          name       = "${var.range_name}-${m.name}"
+          role       = m.role
+          student_id = m.student_id
+          private_ip = azurerm_network_interface.machine[m.name].private_ip_address
+          public_ip  = try(azurerm_public_ip.redirector[m.name].ip_address, null)
+          ssh_user   = m.linux_user
           # Per-VM linux user password (set by chpasswd in cloud-init).
           # Mostly informational — ansible uses key-based auth.
           linux_password = m.linux_password
@@ -347,17 +375,17 @@ output "ansible_inventory" {
           # Per-role auth bundle. Ansible roles pick the fields they
           # need; missing fields are simply null on irrelevant VMs.
           adaptix_password = try(local.effective_adaptix_password[m.student_id], null)
-          mythic_password  = try(local.effective_mythic_password[m.student_id],  null)
-          brc4_password    = try(local.effective_brc4_password[m.student_id],    null)
+          mythic_password  = try(local.effective_mythic_password[m.student_id], null)
+          brc4_password    = try(local.effective_brc4_password[m.student_id], null)
           # BRC4 second operator ("automation") used by brc4_payload role
           # to drive the WebSocket API without kicking the Commander GUI.
           brc4_automation_password = try(local.effective_brc4_automation_password[m.student_id], null)
-          sliver_password  = try(local.effective_sliver_password[m.student_id],  null)
-          cdn_headers      = try(local.cdn_headers[
+          sliver_password          = try(local.effective_sliver_password[m.student_id], null)
+          cdn_headers = try(local.cdn_headers[
             m.role == "c2-server" ? "adaptix" :
-            m.role == "c2-mythic" ? "mythic"  :
-            m.role == "c2-brc4"   ? "brc4"    :
-            m.role == "c2-sliver" ? "sliver"  : "adaptix"
+            m.role == "c2-mythic" ? "mythic" :
+            m.role == "c2-brc4" ? "brc4" :
+            m.role == "c2-sliver" ? "sliver" : "adaptix"
           ][m.student_id], null)
           # Per-CDN beacon callback addresses for this teamserver. azure
           # resolves to the AFD-fronted redirector subdomain when
@@ -373,13 +401,13 @@ output "ansible_inventory" {
           # the listener applies ssl:true and uri:/endpoint separately.
           adaptix_callbacks = (m.role == "c2-server"
             ? {
-                for cdn in local.cdn_names :
-                cdn => (
-                  cdn == "azure"
-                  ? "${local.azure_callback_for["c2-server"][m.student_id]}:443"
-                  : "CHANGEME-${cdn}-${m.student_id}:443"
-                )
-              }
+              for cdn in local.cdn_names :
+              cdn => (
+                cdn == "azure"
+                ? "${local.azure_callback_for["c2-server"][m.student_id]}:443"
+                : "CHANGEME-${cdn}-${m.student_id}:443"
+              )
+            }
             : null
           )
           # Mythic-side equivalent. Mythic's http C2 profile params
@@ -405,34 +433,34 @@ output "ansible_inventory" {
             ? local.brc4_profile[m.student_id]
             : null
           )
-        # Include every role ansible-playbook targets. Two groups:
-        #
-        # (a) Linux roles managed end-to-end by ansible: the C2 stack
-        #     (server/mythic/brc4/sliver/redirector), kali (role=attacker
-        #     → groups [linux,kali]) and the generic linux-target.
-        #
-        # (b) Windows roles. Boot-time bring-up is still
-        #     `azurerm_virtual_machine_run_command.windows_*` (cheap WinRM
-        #     wasn't reachable before NSG + listener exist), so the
-        #     run-command layer enables WinRM and joins the domain. AFTER
-        #     boot, the `windows-base` ansible role applies the machine-
-        #     wide wallpaper policy + future Windows config via the WinRM
-        #     connection plugin. inventory.py maps each windows-* role
-        #     into the `windows` parent group (see WINDOWS_ROLES /
-        #     role_to_groups), and inventory swaps the SSH connection
-        #     vars for WinRM (port 5985, basic auth, http scheme).
-        #
-        # If you add a new Windows role (e.g. windows-fileshare), append
-        # it to BOTH the contains() list below AND inventory.py's
-        # role_to_groups + WINDOWS_ROLES sets — otherwise the host shows
-        # up in inventory but ansible can't connect, or the play matches
-        # zero hosts.
-        } if contains([
-            "c2-server","c2-mythic","c2-brc4","c2-sliver","c2-redirector",
-            "attacker","linux-target",
-            "windows-dc","windows-member","windows-workstation",
-            "windows-analyst","windows-blank","windows-persona",
-          ], m.role)
+          # Include every role ansible-playbook targets. Two groups:
+          #
+          # (a) Linux roles managed end-to-end by ansible: the C2 stack
+          #     (server/mythic/brc4/sliver/redirector), kali (role=attacker
+          #     → groups [linux,kali]) and the generic linux-target.
+          #
+          # (b) Windows roles. Boot-time bring-up is still
+          #     `azurerm_virtual_machine_run_command.windows_*` (cheap WinRM
+          #     wasn't reachable before NSG + listener exist), so the
+          #     run-command layer enables WinRM and joins the domain. AFTER
+          #     boot, the `windows-base` ansible role applies the machine-
+          #     wide wallpaper policy + future Windows config via the WinRM
+          #     connection plugin. inventory.py maps each windows-* role
+          #     into the `windows` parent group (see WINDOWS_ROLES /
+          #     role_to_groups), and inventory swaps the SSH connection
+          #     vars for WinRM (port 5985, basic auth, http scheme).
+          #
+          # If you add a new Windows role (e.g. windows-fileshare), append
+          # it to BOTH the contains() list below AND inventory.py's
+          # role_to_groups + WINDOWS_ROLES sets — otherwise the host shows
+          # up in inventory but ansible can't connect, or the play matches
+          # zero hosts.
+          } if contains([
+            "c2-server", "c2-mythic", "c2-brc4", "c2-sliver", "c2-redirector",
+            "attacker", "linux-target",
+            "windows-dc", "windows-member", "windows-workstation",
+            "windows-analyst", "windows-blank", "windows-persona",
+        ], m.role)
       ],
       # ---- Guacamole (1 VM, no Role tag, identified by name suffix) ----
       # ssh user/password live on the VM resource itself
@@ -440,19 +468,19 @@ output "ansible_inventory" {
       #   admin_username = "guacadmin"
       #   admin_password = local.effective_guacamole_admin_password
       var.services.guacamole.enabled ? [{
-        name           = "${var.range_name}-guac"
-        role           = "guacamole"
-        student_id     = "shared"
-        private_ip     = azurerm_network_interface.guacamole[0].private_ip_address
-        public_ip      = azurerm_public_ip.guacamole[0].ip_address
-        ssh_user       = "guacadmin"
-        linux_password = local.effective_guacamole_admin_password
-        adaptix_password = null
-        mythic_password  = null
-        brc4_password    = null
+        name                     = "${var.range_name}-guac"
+        role                     = "guacamole"
+        student_id               = "shared"
+        private_ip               = azurerm_network_interface.guacamole[0].private_ip_address
+        public_ip                = azurerm_public_ip.guacamole[0].ip_address
+        ssh_user                 = "guacadmin"
+        linux_password           = local.effective_guacamole_admin_password
+        adaptix_password         = null
+        mythic_password          = null
+        brc4_password            = null
         brc4_automation_password = null
-        sliver_password  = null
-        cdn_headers      = null
+        sliver_password          = null
+        cdn_headers              = null
       }] : [],
       # ---- Shared infra (RedELK / Ghostwriter / SteppingStones / ELK) ----
       # Only those with SSH access. Public_ip may be null when the operator
@@ -461,19 +489,19 @@ output "ansible_inventory" {
       # match the actual Azure VM names (see shared_infra.tf:67).
       [
         for s in var.shared_machines : {
-          name           = "${var.range_name}-${s.name}"
-          role           = s.role
-          student_id     = "shared"
-          private_ip     = azurerm_network_interface.shared[s.name].private_ip_address
-          public_ip      = s.public_ip ? azurerm_public_ip.shared[s.name].ip_address : null
-          ssh_user       = s.linux_user
-          linux_password = s.linux_password
-          adaptix_password = null
-          mythic_password  = null
-          brc4_password    = null
+          name                     = "${var.range_name}-${s.name}"
+          role                     = s.role
+          student_id               = "shared"
+          private_ip               = azurerm_network_interface.shared[s.name].private_ip_address
+          public_ip                = s.public_ip ? azurerm_public_ip.shared[s.name].ip_address : null
+          ssh_user                 = s.linux_user
+          linux_password           = s.linux_password
+          adaptix_password         = null
+          mythic_password          = null
+          brc4_password            = null
           brc4_automation_password = null
-          sliver_password  = null
-          cdn_headers      = null
+          sliver_password          = null
+          cdn_headers              = null
         }
       ],
     )
@@ -489,14 +517,14 @@ output "student_credentials" {
   value = {
     for sid in local.students :
     sid => {
-      domain_admin_user          = var.domain.admin_user
-      domain_admin_password      = local.effective_domain_password[sid]
-      adaptix_teamserver_pw      = local.effective_adaptix_password[sid]
-      mythic_admin_user          = "mythic_admin"
-      mythic_admin_password      = local.effective_mythic_password[sid]
-      brc4_teamserver_password   = local.effective_brc4_password[sid]
-      brc4_automation_password   = local.effective_brc4_automation_password[sid]
-      sliver_seed_password       = local.effective_sliver_password[sid]
+      domain_admin_user        = var.domain.admin_user
+      domain_admin_password    = local.effective_domain_password[sid]
+      adaptix_teamserver_pw    = local.effective_adaptix_password[sid]
+      mythic_admin_user        = "mythic_admin"
+      mythic_admin_password    = local.effective_mythic_password[sid]
+      brc4_teamserver_password = local.effective_brc4_password[sid]
+      brc4_automation_password = local.effective_brc4_automation_password[sid]
+      sliver_seed_password     = local.effective_sliver_password[sid]
     }
   }
 }

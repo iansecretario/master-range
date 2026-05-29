@@ -147,13 +147,33 @@ output "shared_infra" {
 }
 
 output "shared_infra_credentials" {
-  description = "SSH passwords for shared infra boxes."
+  description = "SSH + web-admin credentials for shared infra boxes."
   sensitive   = true
   value = {
     for s in var.shared_machines :
     s.name => {
       ssh_user     = s.linux_user
       ssh_password = s.linux_password
+      # Web-admin login for boxes exposing a UI. stepping-stones creates
+      # its Django superuser as linux_user/linux_password in userdata,
+      # so those ARE the web-admin creds (deterministic, terraform-owned).
+      # ghostwriter/redelk web passwords are ansible-managed (see their
+      # role reports), so terraform surfaces null + a note here.
+      web_admin_user = (
+        s.role == "stepping-stones" ? s.linux_user :
+        s.role == "ghostwriter" ? "admin" :
+        s.role == "redelk" ? "elastic" :
+        null
+      )
+      web_admin_password = (
+        s.role == "stepping-stones" ? s.linux_password :
+        null
+      )
+      web_admin_note = (
+        s.role == "ghostwriter" ? "password set by ansible (ghostwriter_admin_password); see ghostwriter role report" :
+        s.role == "redelk" ? "password set by ansible (redelk_es_password); see redelk role report" :
+        null
+      )
     }
   }
 }
